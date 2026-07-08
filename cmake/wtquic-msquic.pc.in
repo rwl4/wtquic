@@ -1,0 +1,11 @@
+prefix=@WTQ_PC_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: wtquic-msquic
+Description: wtquic WebTransport backend for MsQuic
+Version: @PROJECT_VERSION@
+Requires: wtquic
+Libs: -L${libdir} -lwtquic-msquic
+Libs.private: @WTQ_MSQUIC_PC_LIBDIR@-lmsquic -lpthread
+Cflags: -I${includedir}
