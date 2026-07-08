@@ -1,0 +1,302 @@
+{
+  "draft": "wt-h3-15",
+  "vectors": [
+    {
+      "file": "settings_default_ecp.bin",
+      "type": "settings",
+      "description": "wtquic default outgoing SETTINGS payload (explicit QPACK zeros, ECP, H3_DATAGRAM, WT_ENABLED)",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 13,
+      "wire_hex": "0100070008013301ac7cf00001"
+    },
+    {
+      "file": "settings_minimal_noecp.bin",
+      "type": "settings",
+      "description": "outgoing SETTINGS without ENABLE_CONNECT_PROTOCOL",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 11,
+      "wire_hex": "010007003301ac7cf00001"
+    },
+    {
+      "file": "settings_legacy_send.bin",
+      "type": "settings",
+      "description": "legacy send-compat adds both old max-sessions codepoints",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 27,
+      "wire_hex": "010007000801330194e9cd2901ac7cf00001c0000000c671706a01"
+    },
+    {
+      "file": "settings_with_grease.bin",
+      "type": "settings",
+      "description": "grease id interleaved; decode ignores and counts it",
+      "expect_error": false,
+      "decode_only": true,
+      "wire_len": 10,
+      "wire_hex": "4040073301ac7cf00001"
+    },
+    {
+      "file": "settings_reserved_h2.bin",
+      "type": "settings",
+      "description": "HTTP/2-reserved id 0x02 rejected",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 2,
+      "wire_hex": "0200"
+    },
+    {
+      "file": "settings_dup_id.bin",
+      "type": "settings",
+      "description": "duplicate identifier rejected",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 4,
+      "wire_hex": "33013301"
+    },
+    {
+      "file": "frame_data_len0.bin",
+      "type": "frame",
+      "description": "DATA frame header, empty payload",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 2,
+      "wire_hex": "0000"
+    },
+    {
+      "file": "frame_headers_len1.bin",
+      "type": "frame",
+      "description": "HEADERS frame header, 1-byte payload present",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 3,
+      "wire_hex": "0101aa"
+    },
+    {
+      "file": "frame_settings_hdr.bin",
+      "type": "frame",
+      "description": "SETTINGS frame header for the default payload length",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 2,
+      "wire_hex": "040d"
+    },
+    {
+      "file": "frame_goaway_len8.bin",
+      "type": "frame",
+      "description": "GOAWAY frame header announcing 8 bytes",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 2,
+      "wire_hex": "0708"
+    },
+    {
+      "file": "frame_grease_type.bin",
+      "type": "frame",
+      "description": "grease frame type 0x21 with payload length",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 2,
+      "wire_hex": "2105"
+    },
+    {
+      "file": "frame_max_header.bin",
+      "type": "frame",
+      "description": "maximal 16-byte header (8-byte varints for type and length)",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 16,
+      "wire_hex": "ffffffffffffffffffffffffffffffff"
+    },
+    {
+      "file": "capsule_drain.bin",
+      "type": "capsule",
+      "description": "WT_DRAIN_SESSION, empty payload",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 5,
+      "wire_hex": "800078ae00"
+    },
+    {
+      "file": "capsule_close_zero.bin",
+      "type": "capsule",
+      "description": "WT_CLOSE_SESSION, code 0, empty reason",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 7,
+      "wire_hex": "68430400000000"
+    },
+    {
+      "file": "capsule_close_code_msg.bin",
+      "type": "capsule",
+      "description": "WT_CLOSE_SESSION, code 0x1234, reason 'bye'",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 10,
+      "wire_hex": "68430700001234627965"
+    },
+    {
+      "file": "capsule_close_max_reason.bin",
+      "type": "capsule",
+      "description": "WT_CLOSE_SESSION with the 1024-byte reason boundary",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 1032,
+      "wire_hex": "68434404ffffffff72727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272"
+    },
+    {
+      "file": "capsule_unknown_skip.bin",
+      "type": "capsule",
+      "description": "unknown capsule type with payload is skipped",
+      "expect_error": false,
+      "decode_only": true,
+      "wire_len": 7,
+      "wire_hex": "17050102030405"
+    },
+    {
+      "file": "capsule_drain_bad_len.bin",
+      "type": "capsule",
+      "description": "DRAIN with nonzero length is malformed",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 6,
+      "wire_hex": "800078ae01aa"
+    },
+    {
+      "file": "preamble_bidi_sid0.bin",
+      "type": "preamble_bidi",
+      "description": "bidi stream preamble, session 0",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 3,
+      "wire_hex": "404100"
+    },
+    {
+      "file": "preamble_uni_sid0.bin",
+      "type": "preamble_uni",
+      "description": "uni stream preamble, session 0",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 3,
+      "wire_hex": "405400"
+    },
+    {
+      "file": "preamble_bidi_64bit_sid.bin",
+      "type": "preamble_bidi",
+      "description": "bidi preamble with an 8-byte session id",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 10,
+      "wire_hex": "4041c000000100000000"
+    },
+    {
+      "file": "preamble_uni_nonminimal.bin",
+      "type": "preamble_uni",
+      "description": "non-minimal type varint accepted with wire header_len",
+      "expect_error": false,
+      "decode_only": true,
+      "wire_len": 5,
+      "wire_hex": "8000005405"
+    },
+    {
+      "file": "preamble_wrong_direction.bin",
+      "type": "preamble_bidi",
+      "description": "uni codepoint on a bidi stream is unexpected",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 3,
+      "wire_hex": "405407"
+    },
+    {
+      "file": "connect_req_basic.bin",
+      "type": "connect_req",
+      "description": "minimal extended CONNECT request",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 49,
+      "wire_hex": "0000cfd7500b6578616d706c652e636f6d51032f777427023a70726f746f636f6c0f7765627472616e73706f72742d6833"
+    },
+    {
+      "file": "connect_req_subprotocols.bin",
+      "type": "connect_req",
+      "description": "request offering moqt-18, moqt-16",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 95,
+      "wire_hex": "0000cfd7500b6578616d706c652e636f6d51042f6d6f7127023a70726f746f636f6c0f7765627472616e73706f72742d6833270f77742d617661696c61626c652d70726f746f636f6c7314226d6f71742d3138222c20226d6f71742d313622"
+    },
+    {
+      "file": "connect_req_origin.bin",
+      "type": "connect_req",
+      "description": "request with an origin header",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 69,
+      "wire_hex": "0000cfd7500b6578616d706c652e636f6d51032f777427023a70726f746f636f6c0f7765627472616e73706f72742d68335f4b1168747470733a2f2f6f2e6578616d706c65"
+    },
+    {
+      "file": "connect_req_no_protocol.bin",
+      "type": "connect_req",
+      "description": "CONNECT without :protocol is rejected",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 14,
+      "wire_hex": "0000cfd7500377747151032f7774"
+    },
+    {
+      "file": "connect_resp_200.bin",
+      "type": "connect_resp",
+      "description": "200 response, no subprotocol",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 3,
+      "wire_hex": "0000d9"
+    },
+    {
+      "file": "connect_resp_200_wt_protocol.bin",
+      "type": "connect_resp",
+      "description": "200 response selecting moqt-18",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 26,
+      "wire_hex": "0000d9270477742d70726f746f636f6c09226d6f71742d313822"
+    },
+    {
+      "file": "connect_resp_404.bin",
+      "type": "connect_resp",
+      "description": "404 rejection decodes, is not success",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 3,
+      "wire_hex": "0000db"
+    },
+    {
+      "file": "connect_resp_huffman_ignored.bin",
+      "type": "connect_resp",
+      "description": "Huffman wt-protocol value decodes via QPACK but is not a quoted SF string, so the field is ignored (RFC 7541 C.6.1 'private' bytes)",
+      "expect_error": false,
+      "decode_only": true,
+      "wire_len": 22,
+      "wire_hex": "0000d9270477742d70726f746f636f6c85aec3771a4b"
+    },
+    {
+      "file": "sf_list_two.bin",
+      "type": "sf_list",
+      "description": "canonical WT-Available-Protocols value",
+      "expect_error": false,
+      "decode_only": false,
+      "wire_len": 20,
+      "wire_hex": "226d6f71742d3138222c20226d6f71742d313622"
+    },
+    {
+      "file": "sf_list_trailing_comma.bin",
+      "type": "sf_list",
+      "description": "trailing comma malforms the field",
+      "expect_error": true,
+      "decode_only": true,
+      "wire_len": 4,
+      "wire_hex": "2261222c"
+    }
+  ]
+}

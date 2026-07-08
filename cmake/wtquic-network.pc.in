@@ -1,0 +1,11 @@
+prefix=@WTQ_PC_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: wtquic-network
+Description: wtquic WebTransport backend for Apple Network.framework
+Version: @PROJECT_VERSION@
+Requires: wtquic
+Libs: -L${libdir} -lwtquic-network
+Libs.private: -framework Network -framework Security -framework Foundation -lpthread
+Cflags: -I${includedir}

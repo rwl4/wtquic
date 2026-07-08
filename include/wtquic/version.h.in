@@ -1,0 +1,22 @@
+#ifndef WTQ_VERSION_H
+#define WTQ_VERSION_H
+
+#include <wtquic/export.h>
+
+#define WTQ_VERSION_MAJOR @wtquic_VERSION_MAJOR@
+#define WTQ_VERSION_MINOR @wtquic_VERSION_MINOR@
+#define WTQ_VERSION_PATCH @wtquic_VERSION_PATCH@
+#define WTQ_VERSION_STRING "@wtquic_VERSION@"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Returns the compiled-in version string ("major.minor.patch"). */
+WTQ_API const char *wtq_version(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* WTQ_VERSION_H */

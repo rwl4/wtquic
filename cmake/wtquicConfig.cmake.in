@@ -1,0 +1,40 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+include("${CMAKE_CURRENT_LIST_DIR}/wtquicTargets.cmake")
+
+# Backend find-modules are installed next to this config so a component's
+# transitive transport dependency resolves the same way it did at build.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+
+# Optional backend components (msquic, picoquic) install their own targets
+# files alongside this one when built. Each component's imported targets
+# carry a transport dependency (e.g. wtq::msquic -> msquic::msquic) that
+# must be re-established before the targets file is loaded.
+foreach(_wtq_comp ${wtquic_FIND_COMPONENTS})
+    set(_wtq_comp_file "${CMAKE_CURRENT_LIST_DIR}/wtquic-${_wtq_comp}Targets.cmake")
+    if(EXISTS "${_wtq_comp_file}")
+        if(_wtq_comp STREQUAL "msquic")
+            find_dependency(MsQuic)
+            # backend-internal (blocking env_close synchronization);
+            # surfaces in the static link interface
+            find_dependency(Threads)
+        endif()
+        # `network` (Apple) needs no find_dependency: its framework
+        # link interface travels as plain flags in the targets file.
+        include("${_wtq_comp_file}")
+        set(wtquic_${_wtq_comp}_FOUND TRUE)
+    else()
+        set(wtquic_${_wtq_comp}_FOUND FALSE)
+        if(wtquic_FIND_REQUIRED_${_wtq_comp})
+            set(wtquic_FOUND FALSE)
+            set(wtquic_NOT_FOUND_MESSAGE
+                "wtquic component '${_wtq_comp}' was not installed")
+        endif()
+    endif()
+endforeach()
+
+list(REMOVE_ITEM CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+
+check_required_components(wtquic)

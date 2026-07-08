@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-matrix:
+    name: core ${{ matrix.os }} ${{ matrix.cc }} ${{ matrix.build_type }}
+    strategy:
+      fail-fast: false
+      # Explicit rows only: with no base matrix axis, every include entry
+      # is its own job. (A build_type axis + os/cc includes collapses to
+      # the last include — includes without an original-key conflict merge
+      # into every combination.)
+      matrix:
+        include:
+          - { os: macos-14, cc: clang, build_type: Debug }
+          - { os: macos-14, cc: clang, build_type: Release }
+          - { os: ubuntu-24.04, cc: gcc-13, build_type: Debug }
+          - { os: ubuntu-24.04, cc: gcc-13, build_type: Release }
+          - { os: ubuntu-24.04, cc: clang-18, build_type: Debug }
+          - { os: ubuntu-24.04, cc: clang-18, build_type: Release }
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DWTQ_BUILD_MSQUIC=OFF
+          -DWTQ_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  shared-symbols:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure (shared)
+        run: >
+          cmake -B build -DBUILD_SHARED_LIBS=ON
+          -DWTQ_BUILD_MSQUIC=OFF -DWTQ_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test (incl. symbol_policy)
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-18
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install libFuzzer runtime
+        run: sudo apt-get update && sudo apt-get install -y libclang-rt-18-dev
+      - name: Configure (fuzz, runtime required)
+        run: cmake --preset fuzz
+      - name: Build
+        run: cmake --build --preset fuzz --parallel
+      - name: Test (smoke + corpus replay)
+        run: ctest --preset fuzz
