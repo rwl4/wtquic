@@ -1,0 +1,9 @@
+prefix=@WTQ_PC_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: wtquic
+Description: WebTransport over HTTP/3, purpose-built for performance
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lwtquic
+Cflags: -I${includedir}
