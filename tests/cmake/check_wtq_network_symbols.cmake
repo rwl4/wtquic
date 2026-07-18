@@ -11,6 +11,7 @@ set(ALLOWED_SYMBOLS
     wtq_nw_conn_retain
     wtq_nw_conn_release
     wtq_nw_conn_post
+    wtq_nw_conn_doorbell_ring
     wtq_nw_conn_is_on_domain
     wtq_nw_conn_session
     wtq_nw_conn_stop_begin
