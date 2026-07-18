@@ -286,7 +286,20 @@ declaration in `include/wtquic/`.
 - **No held-buffer receive API yet**: received data is borrowed for the
   duration of the callback; copy what must outlive it. Receive
   pause/resume exists (`wtq_stream_pause_receive` /
-  `wtq_stream_resume_receive`).
+  `wtq_stream_resume_receive`) and **arrests application delivery**: pause
+  stops arming *future* receives, but because Network.framework's receive
+  is a pull, one `nw_connection_receive` is always outstanding, so the
+  completion queued behind a pause can still fire. That one completion is
+  held backend-local — its transport buffer is RETAINED (zero-copy, never
+  copied) and, for a pure FIN, remembered — and is never delivered to the
+  application while paused; resume replays it exactly once, in order (FIN
+  included), then arms the next receive. **Transport-level peer
+  backpressure is NOT guaranteed on this backend**: the public
+  initial-window setters are values Network.framework auto-tunes upward,
+  and it buffers/ACKs past them, so a paused peer is bounded only by the
+  framework's internal receive buffering, not by the advertised window (a
+  documented parity exception — see `COMPATIBILITY.md`; the MsQuic backend
+  does throttle the peer).
 - The bundled `examples/` are stubs pending the convenience-layer
   ergonomics pass.
 

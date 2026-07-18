@@ -116,6 +116,25 @@ struct wtq_dstream {
                                 engine pool slot — backend-parked only  */
     bool recv_enabled;
     bool recv_pending;       /* a receive block is outstanding          */
+    /*
+     * Bounded backend-local deferred receive (pause contract). A receive
+     * completion that arrives while the app has paused the stream is held
+     * here instead of reaching the engine: op_recv_enable(false) only
+     * stops FUTURE arms, so the ONE already-outstanding receive can still
+     * complete after pause returned. At most one completion is ever held —
+     * only one nw_connection_receive is armed at a time — so this is a
+     * single slot, never a queue; a second deferral is an invariant
+     * failure. Resume replays it to the engine exactly once, in order,
+     * then releases it. Zero-copy: the transport dispatch_data_t is
+     * RETAINED, never copied.
+     */
+    bool recv_deferred;      /* a completion is held (paused)            */
+    bool recv_deferred_fin;  /* the held completion carried the FIN      */
+    bool recv_deferred_errored; /* the held completion carried a receive
+                                   error (NW may deliver data received
+                                   before the error): resume delivers the
+                                   content once but never re-arms          */
+    dispatch_data_t recv_deferred_data; /* retained buffer; NULL = pure FIN */
     bool send_blocked;       /* a gather was refused WOULD_BLOCK; the
                                 writable edge is armed until capacity
                                 frees (edge semantics are the backend's) */
@@ -397,6 +416,42 @@ extern int wtq_nw_test_dgram_reap_src[WTQ_NW_REAP_SRC__N];
  * before-child-terminal teardown order (children are then torn down
  * from the group-terminal path). */
 void wtq_nw_test_cancel_group(struct wtq_driver *drv);
+
+/*
+ * TEST SEAM: run the receive-completion body directly on the serialization
+ * domain — the production path is Apple's nw_connection_receive callback,
+ * not externally schedulable, so this lets a test inject a completion
+ * (bytes / FIN / error / cancel) at a controlled moment and prove the
+ * pause deferral deterministically. `content` is borrowed for the call
+ * (retained internally when deferred). NOT a production seam.
+ */
+void wtq_nw_test_deliver_recv(struct wtq_dstream *ds, dispatch_data_t content,
+                             bool fin, bool errored, bool cancelled);
+
+/* TEST-VISIBLE invariant counter: a completion was deferred while one was
+ * already held (the single-outstanding-receive invariant was violated). It
+ * fails the connection; the counter only records that it fired. */
+extern int wtq_nw_test_recv_defer_overflow;
+
+/* TEST-VISIBLE: nw_connection_receive arms actually issued (cumulative). */
+extern int wtq_nw_test_recv_arms;
+
+/*
+ * TEST SEAM: drive the peer-reset (stream `failed`) transition on the
+ * domain — sets failed_seen, runs the failure handler (which emits
+ * on_stream_reset), and converges to cancelled — so the reset-reentrancy
+ * path (a resume attempted from inside on_stream_reset) is testable
+ * without a cooperating peer.
+ */
+void wtq_nw_test_stream_fail(struct wtq_driver *drv, struct wtq_dstream *ds);
+
+/*
+ * TEST SEAM: call op_recv_enable directly on the domain, bypassing the
+ * session/engine layers, so the backend's reject-without-mutation guard
+ * (failed/cancelled/terminal/handleless) can be proven on its own.
+ */
+wtq_result_t wtq_nw_test_recv_enable(struct wtq_driver *drv,
+                                     struct wtq_dstream *ds, bool enabled);
 
 #else /* !WTQ_NW_TESTING */
 #define WTQ_NW_TEST(stmt) ((void)0)

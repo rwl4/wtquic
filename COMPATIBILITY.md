@@ -211,6 +211,21 @@ transport events that Network.framework did not report.
 - A peer's `STOP_SENDING` and its application code have no public receive
   signal. The backend never infers one. Local stream cancellation retires
   blocked sends and supplies the bounded cleanup path.
+- **Receive pause arrests application delivery, not transport-level peer
+  backpressure.** `wtq_stream_pause_receive()` stops the engine and the
+  application from seeing further bytes (the one already-armed receive
+  completion is held in the backend and replayed on resume; no new receive
+  is armed). It does NOT impose a hard flow-control bound on the peer: the
+  public initial-window setters (`nw_quic_set_initial_max_data`,
+  `nw_quic_set_initial_max_stream_data_*`) are *initial* values that
+  Network.framework auto-tunes upward, and the framework buffers and ACKs
+  received data well past them. Measured: with a 64 KiB advertised
+  connection window and a paused stream that delivered nothing to the app,
+  a ~500 KiB peer response still completed (was fully ACKed) at the
+  transport. So a paused wtquic peer is bounded only by Network.framework's
+  internal receive buffering, not by the advertised window. This is a
+  documented parity exception (the MsQuic backend, whose receive window is
+  a hard bound, does throttle the peer); no private API is used to close it.
 - Stamping group metadata and cancelling the group did not put an
   application-level CONNECTION_CLOSE code on the wire; the peer observed
   a transport close with code zero. The backend therefore does not claim

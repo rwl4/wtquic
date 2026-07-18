@@ -244,6 +244,8 @@ static void ds_synthesize_completions(struct wtq_dstream *ds)
  * until it retires, the stream (and through it the connection root)
  * simply stays alive. Correctness never depends on when.
  */
+static void ds_drop_deferred(struct wtq_dstream *ds);
+
 static bool ds_reap_eligible(const struct wtq_dstream *ds)
 {
     return ds->terminal && !ds->recv_pending &&
@@ -266,6 +268,10 @@ static void ds_reap_phase2(struct wtq_dstream *ds)
     if (wtq_nw_test_park_reaps)
         return; /* diagnostic: hold every object forever */
 #endif
+    /* backstop: a deferred receive is normally released at the terminal,
+     * but the destruction path releases it too so no retained buffer can
+     * ever outlive the shell (idempotent) */
+    ds_drop_deferred(ds);
     if (ds->conn != NULL) {
         WTQ_NW_TEST(if (drv->callback_depth != 0)
                         wtq_nw_test_release_in_cb++);
@@ -732,44 +738,119 @@ static void ds_deliver_bytes(struct wtq_dstream *ds, dispatch_data_t content,
     nw_leave_and_poll(drv);
 }
 
+/* Release a held deferred receive, if any. Idempotent: safe to call from
+ * every terminal/reset/detach/reap path, so the retained transport buffer
+ * is released exactly once with no stale delivery. */
+static void ds_drop_deferred(struct wtq_dstream *ds)
+{
+    if (ds->recv_deferred_data != NULL) {
+        dispatch_release(ds->recv_deferred_data);
+        ds->recv_deferred_data = NULL;
+    }
+    ds->recv_deferred = false;
+    ds->recv_deferred_fin = false;
+    ds->recv_deferred_errored = false;
+}
+
+/*
+ * The receive-completion body, confined to the serialization domain. Runs
+ * for Apple's nw_connection_receive completion (and, in tests, the
+ * injection seam). `errored`/`cancelled` fold the callback's error and
+ * local-cancel state.
+ *
+ * While the app has the stream PAUSED, the one already-outstanding
+ * completion is retained here instead of reaching the engine — pause only
+ * stops FUTURE arms, so without this the queued completion would deliver
+ * data or FIN after pause returned. At most one completion is ever held
+ * (only one receive is armed at a time); a second is an invariant failure,
+ * not an unbounded queue. Otherwise the bytes are delivered and, unless a
+ * FIN or error ended the receive side, a new receive is armed.
+ */
+static void ds_receive_completed(struct wtq_dstream *ds,
+                                 dispatch_data_t content, bool fin,
+                                 bool errored, bool cancelled)
+{
+    ds->recv_pending = false;
+    if (cancelled) {
+        /* locally-cancelled: this is the cancel FLUSH, not peer data —
+         * nothing from a dead stream reaches the engine */
+        ds_maybe_free(ds, WTQ_NW_REAP_SRC_RECV);
+        return;
+    }
+    if (!ds->recv_enabled && (content != NULL || fin)) {
+        /* PAUSED: hold this one completion. Network.framework may deliver
+         * data received BEFORE an error in the same completion (see
+         * connection.h), so a data-bearing errored completion is held too,
+         * with its error preserved — otherwise its bytes would reach the
+         * engine while paused. Bounded to a single slot: a second deferral
+         * would mean two receives were outstanding, which the arm gate
+         * forbids. */
+        if (ds->recv_deferred) {
+            /* Backend invariant failure: with one completion already held,
+             * a second means two receives were outstanding — impossible by
+             * the arm gate. Never silently drop the peer's bytes; stage a
+             * local backend error and fail the CONNECTION, the same
+             * deterministic outcome the missing-metadata invariant takes. */
+            struct wtq_driver *drv = ds->drv;
+
+            WTQ_NW_TEST(wtq_nw_test_recv_defer_overflow++);
+            if (!drv->err_staged) {
+                drv->err_staged = true;
+                drv->err_kind = WTQ_ERR_KIND_LOCAL;
+                drv->err_domain = WTQ_ERRDOM_BACKEND;
+                drv->err_code = 0;
+            }
+            (void)op_conn_close(drv, 0);
+            return;
+        }
+        ds->recv_deferred = true;
+        ds->recv_deferred_fin = fin;
+        ds->recv_deferred_errored = errored;
+        if (content != NULL) {
+            dispatch_retain(content); /* zero-copy: retain, never copy */
+            ds->recv_deferred_data = content;
+        }
+        /* no engine delivery and no re-arm while paused: the app sees
+         * nothing until resume. This arrests APPLICATION delivery only —
+         * it is NOT transport backpressure: Network.framework keeps
+         * buffering and ACKing received data past the advertised window,
+         * so a paused peer is not flow-control-bounded here (see
+         * COMPATIBILITY.md). */
+        return;
+    }
+    if (content != NULL || fin)
+        ds_deliver_bytes(ds, content, fin);
+    /* errors surface through the state handler (failed), which owns reset
+     * attribution — never double-report here */
+    if (!errored && !fin)
+        ds_arm_receive(ds);
+    ds_maybe_free(ds, WTQ_NW_REAP_SRC_RECV); /* schedules only */
+}
+
 static void ds_arm_receive(struct wtq_dstream *ds)
 {
     if (ds->recv_pending || ds->terminal || ds->conn == NULL ||
         !ds->recv_enabled || ds->fin_delivered)
         return;
     ds->recv_pending = true;
+    WTQ_NW_TEST(wtq_nw_test_recv_arms++);
     struct wtq_dstream *cap = ds;
     nw_connection_receive(
         ds->conn, 1, 65535,
         ^(dispatch_data_t content, nw_content_context_t ctx,
           bool is_complete, nw_error_t error) {
           cap->drv->callback_depth++;
-          cap->recv_pending = false;
           /* stream-local receive errors (peer reset etc.) are NOT
-           * connection-causal: never consume the first-causal latch
-           * here — connection-scoped detail comes from the datagram
-           * flow and the group terminal */
-          if (cap->cancel_issued) {
-              /* locally-cancelled: this is the cancel FLUSH, not peer
-               * data. NW can flush with a synthetic FINAL context and
-               * no error (measured: read as a clean CONNECT-stream
-               * FIN, closing the session CLEAN and sealing an empty
-               * record before the causal error could be delivered) —
-               * nothing from a dead stream reaches the engine. */
-              ds_maybe_free(cap, WTQ_NW_REAP_SRC_RECV);
-              cap->drv->callback_depth--;
-              return;
-          }
+           * connection-causal: the completion body never consumes the
+           * first-causal latch — connection-scoped detail comes from the
+           * datagram flow and the group terminal. A synthetic FINAL
+           * context with no error on a locally-cancelled stream is the
+           * cancel flush (measured), folded in via `cancelled`. */
           bool fin = is_complete && ctx != NULL &&
                      nw_content_context_get_is_final(ctx) &&
                      error == NULL;
-          if (content != NULL || fin)
-              ds_deliver_bytes(cap, content, fin);
-          /* errors surface through the state handler (failed), which
-           * owns reset attribution — never double-report here */
-          if (error == NULL && !fin)
-              ds_arm_receive(cap);
-          ds_maybe_free(cap, WTQ_NW_REAP_SRC_RECV); /* schedules only */
+          ds_receive_completed(cap, content, fin, error != NULL,
+                               cap->cancel_issued);
           cap->drv->callback_depth--;
         });
 }
@@ -958,6 +1039,12 @@ static void ds_handle_failure(struct wtq_dstream *ds, nw_error_t e)
      * NOT connection-causal: the first-causal transport-error latch is
      * never consumed by them */
     (void)e;
+    /* Close the backend receive state BEFORE notifying the engine. The
+     * reset callback runs with the API's recv_open still true and permits
+     * full reentrancy — a resume from inside it must find NOTHING to
+     * replay. Drop any held completion first (op_recv_enable additionally
+     * rejects a failed/terminal stream, so the resume is a no-op there). */
+    ds_drop_deferred(ds);
     if (ds->ectx != NULL && drv->session != NULL && !ds->reset_delivered &&
         !ds->fin_delivered && !ds->cancel_issued) {
         uint64_t code = 0;
@@ -1176,6 +1263,12 @@ static wtq_result_t op_shutdown_stream(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (ds->cancel_issued || ds->cancel_deferred)
         return WTQ_OK; /* idempotent */
 
+    /* The app is tearing this stream down. A receive held while paused is
+     * moot now — drop it here, synchronously, so a resume that races the
+     * cancel can never replay it (op_recv_enable also rejects once the
+     * cancel is issued or deferred). */
+    ds_drop_deferred(ds);
+
     uint64_t code = req->abort_send ? req->send_err : req->recv_err;
     NWDBG("shutdown id=%llu ready=%d code=%llu\n",
           (unsigned long long)ds->id, (int)ds->ready_seen,
@@ -1290,9 +1383,46 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
                                    bool enabled)
 {
     (void)drv;
+    /* Reject on a failed/cancelled/terminal/handleless stream WITHOUT
+     * mutating recv_enabled. A reset/terminal callback permits reentrancy
+     * with the API's recv_open still open, so a resume from inside it must
+     * neither replay a (dropped) held completion nor arm a dead stream. A
+     * locally-initiated cancel that is still deferred to ready counts too. */
+    if (ds->terminal || ds->failed_seen || ds->cancel_issued ||
+        ds->cancel_deferred || ds->conn == NULL)
+        return WTQ_ERR_CLOSED;
     ds->recv_enabled = enabled;
-    if (enabled)
-        ds_arm_receive(ds); /* re-arm; disabling stops FUTURE arms only */
+    if (!enabled)
+        return WTQ_OK; /* disabling stops FUTURE arms only */
+
+    /*
+     * Resume. A completion held while paused is replayed to the engine
+     * FIRST, exactly once and in order, then released; only after that is
+     * a new receive armed. Delivery re-enters the session bracket and may
+     * drive the stream terminal/detached (the app closing on the bytes or
+     * FIN) — the delivery guards on ectx, ds_deliver_bytes marks FIN
+     * delivered, and ds_arm_receive re-checks terminal/conn/FIN, so no
+     * receive is armed on a dead stream and the shell is never touched
+     * after its terminal (reaping is deferred across queue turns).
+     */
+    if (ds->recv_deferred) {
+        dispatch_data_t d = ds->recv_deferred_data;
+        bool fin = ds->recv_deferred_fin;
+        bool errored = ds->recv_deferred_errored;
+
+        ds->recv_deferred = false;
+        ds->recv_deferred_data = NULL;
+        ds->recv_deferred_fin = false;
+        ds->recv_deferred_errored = false;
+        if (!ds->terminal && ds->ectx != NULL)
+            ds_deliver_bytes(ds, d, fin);
+        if (d != NULL)
+            dispatch_release(d);
+        if (errored || fin)
+            return WTQ_OK; /* the receive side ended with that completion —
+                              deliver its content once, but never re-arm */
+    }
+    ds_arm_receive(ds); /* re-arm only if the stream remains live */
     return WTQ_OK;
 }
 
@@ -1565,6 +1695,54 @@ void wtq_nw_test_cancel_group(struct wtq_driver *drv)
 #ifdef WTQ_NW_TESTING
 _Atomic int wtq_nw_test_live_drivers;
 const wtq_alloc_t *wtq_nw_test_backend_alloc;
+int wtq_nw_test_recv_defer_overflow;
+int wtq_nw_test_recv_arms;
+
+/* Inject a receive completion on the domain, exactly as Apple's
+ * nw_connection_receive callback would — the production path is not
+ * externally schedulable, so this drives the pause-deferral logic
+ * deterministically. Frames the call like the real callback (depth). */
+void wtq_nw_test_deliver_recv(struct wtq_dstream *ds, dispatch_data_t content,
+                             bool fin, bool errored, bool cancelled)
+{
+    ds->drv->callback_depth++;
+    ds_receive_completed(ds, content, fin, errored, cancelled);
+    ds->drv->callback_depth--;
+}
+
+/* Drive the peer-reset (stream `failed`) state transition on the domain,
+ * exactly as the state handler's failed branch does: set failed_seen, run
+ * the failure handler (which emits on_stream_reset), then converge on
+ * cancelled. Lets a test exercise the reset-reentrancy path — including a
+ * resume attempted from inside on_stream_reset — without a cooperating
+ * peer. */
+void wtq_nw_test_stream_fail(struct wtq_driver *drv, struct wtq_dstream *ds)
+{
+    dispatch_sync(drv->queue, ^{
+      drv->callback_depth++;
+      if (!ds->failed_seen) {
+          ds->failed_seen = true;
+          ds_handle_failure(ds, NULL);
+          if (!ds->cancel_issued && ds->conn != NULL) {
+              ds->cancel_issued = true;
+              nw_connection_cancel(ds->conn);
+          }
+      }
+      drv->callback_depth--;
+    });
+}
+
+/* Call the backend receive-enable op directly on the domain, bypassing the
+ * session/engine layers — so the backend's own reject-without-mutation
+ * guard (failed/cancelled/terminal/handleless) is exercised on its own,
+ * not shadowed by a higher layer. */
+wtq_result_t wtq_nw_test_recv_enable(struct wtq_driver *drv,
+                                     struct wtq_dstream *ds, bool enabled)
+{
+    __block wtq_result_t rc = WTQ_OK;
+    dispatch_sync(drv->queue, ^{ rc = op_recv_enable(drv, ds, enabled); });
+    return rc;
+}
 
 struct wtq_driver *wtq_nw_test_conn_driver(wtq_nw_conn_t *c)
 {

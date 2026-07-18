@@ -202,6 +202,118 @@ static void dom_stream_release(struct wtq_driver *drv, wtq_stream_t *st)
     dispatch_sync(drv->queue, ^{ wtq_stream_release(st); });
 }
 
+static wtq_result_t dom_pause(struct wtq_driver *drv, wtq_stream_t *st)
+{
+    __block wtq_result_t rc;
+    dispatch_sync(drv->queue, ^{ rc = wtq_stream_pause_receive(st); });
+    return rc;
+}
+
+static wtq_result_t dom_resume(struct wtq_driver *drv, wtq_stream_t *st)
+{
+    __block wtq_result_t rc;
+    dispatch_sync(drv->queue, ^{ rc = wtq_stream_resume_receive(st); });
+    return rc;
+}
+
+/*
+ * Find the backend stream a test paused: exactly one local app bidi ever
+ * has recv_enabled == false (the one just paused), so !recv_enabled is a
+ * unique, race-free selector on the domain. `ectx` is set at open, before
+ * ready, so this works even before the stream is ready.
+ */
+static struct wtq_dstream *dom_find_paused_bidi(struct wtq_driver *drv)
+{
+    __block struct wtq_dstream *found = NULL;
+    dispatch_sync(drv->queue, ^{
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->is_local && ds->is_bidi && !ds->hidden &&
+              ds->ectx != NULL && !ds->recv_enabled && !ds->terminal &&
+              !ds->failed_seen && !ds->cancel_issued && !ds->cancel_deferred)
+              found = ds; /* the LIVE paused stream, not a dead/cancelling
+                             one whose recv_enabled was never reset */
+    });
+    return found;
+}
+
+/*
+ * Inject a receive completion on the domain exactly as Apple's
+ * nw_connection_receive callback would (via the WTQ_NW_TESTING seam). The
+ * dispatch_data_t is created with a copy destructor, so the seam's retain
+ * (when it defers) is the only reference that outlives this call.
+ */
+static void dom_inject_recv_ex(struct wtq_driver *drv, struct wtq_dstream *ds,
+                               const void *bytes, size_t len, bool fin,
+                               bool errored)
+{
+    dispatch_sync(drv->queue, ^{
+      dispatch_data_t d = NULL;
+      if (bytes != NULL && len > 0)
+          d = dispatch_data_create(bytes, len, drv->queue,
+                                   DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+      wtq_nw_test_deliver_recv(ds, d, fin, errored, false);
+      if (d != NULL)
+          dispatch_release(d);
+    });
+}
+
+static void dom_inject_recv(struct wtq_driver *drv, struct wtq_dstream *ds,
+                            const void *bytes, size_t len, bool fin)
+{
+    dom_inject_recv_ex(drv, ds, bytes, len, fin, false);
+}
+
+/*
+ * Destructor-counting injection: the injected dispatch_data_t carries a
+ * custom destructor (no copy — the buffer is used as-is) that CAPTURES this
+ * call's own counter, so the block runs EXACTLY when the last reference is
+ * released and bumps that counter once — proving the retained transport
+ * object is released exactly once whichever path (resume, reset, cancel,
+ * teardown) drops it. No shared global: each object owns its token.
+ */
+static void dom_inject_recv_counted(struct wtq_driver *drv,
+                                    struct wtq_dstream *ds, const void *bytes,
+                                    size_t len, bool fin, int *counter)
+{
+    dispatch_sync(drv->queue, ^{
+      int *token = counter; /* captured per-object by the destructor */
+      dispatch_data_t d = dispatch_data_create(bytes, len, drv->queue,
+                                               ^{ (*token)++; });
+      wtq_nw_test_deliver_recv(ds, d, fin, false, false);
+      dispatch_release(d); /* the seam's retain (on defer) is the last ref */
+    });
+}
+
+/* Snapshot a stream's deferred-receive state on the domain. */
+static bool dom_ds_deferred(struct wtq_driver *drv, struct wtq_dstream *ds)
+{
+    __block bool v = false;
+    dispatch_sync(drv->queue, ^{ v = ds->recv_deferred; });
+    return v;
+}
+
+/* Cumulative nw_connection_receive arm count, read on the domain. */
+static int dom_arms(struct wtq_driver *drv)
+{
+    __block int v = 0;
+    dispatch_sync(drv->queue, ^{ v = wtq_nw_test_recv_arms; });
+    return v;
+}
+
+/*
+ * Capture the backend stream behind a freshly opened app bidi: pause it
+ * (making it the unique !recv_enabled local bidi), snapshot the pointer,
+ * then resume so it is a normal running stream again.
+ */
+static struct wtq_dstream *dom_capture_bidi(struct wtq_driver *drv,
+                                            wtq_stream_t *st)
+{
+    (void)dom_pause(drv, st);
+    struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+    (void)dom_resume(drv, st);
+    return ds;
+}
+
 static wtq_result_t dom_close(struct wtq_driver *drv, wtq_session_t *s,
                               uint32_t code)
 {
@@ -253,6 +365,9 @@ struct side {
     int rx_fins;
     int resets;
     uint64_t last_reset_code;
+    size_t rx_at_reset;         /* rx_len sampled inside on_stream_reset  */
+    bool resume_on_reset;       /* attempt a reentrant resume there       */
+    wtq_result_t reset_resume_rc;
     int stops;
     uint64_t last_stop_code;
     int streams_closed;
@@ -307,6 +422,25 @@ struct side {
     int ctx_canceled[MAX_CTX];
     int nctx;
     int completions_total;
+
+    /* --- prefix-barrier proof (server + client roles) --- */
+    bool prefix_barrier;          /* server: run the prefix/remainder/marker
+                                     response on the target bidi */
+    wtq_stream_t *barrier_stream; /* server: the target bidi (referenced) */
+    wtq_stream_t *barrier_marker; /* server: the marker uni (owned handle) */
+    wtq_session_t *barrier_session; /* server: for the marker uni */
+    bool verify_barrier;          /* client: barrier receiver role */
+    struct wtq_dstream *barrier_target_ds; /* client: target's backend stream,
+                                     inspected on the domain at the marker */
+    size_t barrier_total;         /* client: bytes delivered on the target */
+    size_t barrier_mismatch;      /* client: bytes off the pattern */
+    int barrier_fins;             /* client: FINs on the target */
+    int marker_seen;              /* client: barrier markers received */
+    size_t target_at_marker;      /* client: target app bytes at the marker */
+    bool deferred_at_marker;      /* client: target completion was HELD in the
+                                     backend deferral at the marker */
+    int barrier_send_errors;      /* server: any prefix/remainder/marker
+                                     open-or-send failure */
 };
 
 static void side_init(struct side *sd)
@@ -370,6 +504,114 @@ static int ctx_slot(struct side *sd, void *key)
         return sd->nctx++;
     }
     return -1;
+}
+
+/* --- prefix-barrier fixtures --------------------------------------------- *
+ *
+ * The MsQuic server answers the client's request on the target bidi with a
+ * prefix, then — ONLY once the prefix's send COMPLETES (a peer ACK, since
+ * the server's SendBufferingEnabled is FALSE) — queues the remainder and a
+ * marker on an independent uni stream. The prefix completion proves the
+ * target's bytes reached the peer; the client keeps the target PAUSED with
+ * one receive outstanding, so at marker arrival the target's completion is
+ * HELD in the backend deferral (recv_deferred) and NOTHING has reached the
+ * app even though the connection demonstrably progressed. Resume then yields
+ * the whole payload and FIN, byte-exact and in order.
+ *
+ * SCOPE — this is an APP-LEVEL delivery-isolation proof, NOT a transport
+ * flow-control bound. Network.framework auto-tunes its receive window and
+ * buffers/ACKs data past the public initial-window setters (measured: a
+ * ~500 KiB response completes under a 64 KiB advertised connection window),
+ * so no exhaustion/blocking of the peer is claimed or asserted (see
+ * COMPATIBILITY.md). Distinct send contexts make each completion
+ * individually observable. */
+#define BARRIER_PREFIX (16u * 1024u)
+#define BARRIER_TOTAL (256u * 1024u)
+static uint8_t g_barrier_payload[BARRIER_TOTAL];
+static const uint8_t g_barrier_marker[1] = { 'M' };
+static int g_prefix_ctx, g_remainder_ctx, g_marker_ctx;
+
+static uint8_t barrier_pat(size_t i)
+{
+    return (uint8_t)(i * 131u + 17u);
+}
+
+/* completions recorded for a registered send ctx (0 if unseen). */
+static int side_ctx_completions_locked(struct side *sd, void *key)
+{
+    for (int i = 0; i < sd->nctx; i++)
+        if (sd->ctx_key[i] == key)
+            return sd->ctx_completions[i];
+    return 0;
+}
+
+static int side_ctx_completions(struct side *sd, void *key)
+{
+    pthread_mutex_lock(&sd->mu);
+    int n = side_ctx_completions_locked(sd, key);
+    pthread_mutex_unlock(&sd->mu);
+    return n;
+}
+
+/* Wait (condition, not sleep) until a ctx has >= want completions. */
+static bool side_wait_ctx(struct side *sd, void *key, int want)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += WAIT_MS / 1000;
+    pthread_mutex_lock(&sd->mu);
+    while (side_ctx_completions_locked(sd, key) < want)
+        if (pthread_cond_timedwait(&sd->cv, &sd->mu, &ts) != 0)
+            break;
+    bool ok = side_ctx_completions_locked(sd, key) >= want;
+    pthread_mutex_unlock(&sd->mu);
+    return ok;
+}
+
+/*
+ * Wait for the barrier marker (client cv) but FAIL FAST if the server
+ * records a barrier send/open failure — so a broken response chain does not
+ * hang for the full timeout. Condition-based: wakes on the client cv (marker
+ * signal) and re-checks both conditions on a short bounded interval; the
+ * verdict is a condition (marker arrived vs server error), never elapsed
+ * time. Returns true iff the marker arrived with no server error.
+ */
+static bool barrier_wait_marker(struct side *cl, struct side *sv)
+{
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += WAIT_MS / 1000;
+    pthread_mutex_lock(&cl->mu);
+    for (;;) {
+        if (cl->marker_seen >= 1) {
+            pthread_mutex_unlock(&cl->mu);
+            return true;
+        }
+        pthread_mutex_lock(&sv->mu);
+        int errs = sv->barrier_send_errors;
+        pthread_mutex_unlock(&sv->mu);
+        if (errs > 0) {
+            pthread_mutex_unlock(&cl->mu);
+            return false; /* the send chain failed — do not wait it out */
+        }
+        struct timespec now, t;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            break;
+        t = now;
+        t.tv_nsec += 20 * 1000 * 1000; /* re-check every 20 ms */
+        if (t.tv_nsec >= 1000000000L) {
+            t.tv_sec++;
+            t.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&cl->cv, &cl->mu, &t);
+    }
+    bool ok = cl->marker_seen >= 1;
+    pthread_mutex_unlock(&cl->mu);
+    return ok;
 }
 
 /* --- callbacks ----------------------------------------------------------- */
@@ -462,6 +704,68 @@ static void cb_stream_data(wtq_session_t *s, wtq_stream_t *st,
     if (test_dbg())
         fprintf(stderr, "[%s] data len=%zu fin=%d\n",
                 sd->echo_streams ? "sv" : "cl", len, (int)fin);
+
+    /* --- client: prefix-barrier receiver --- */
+    if (sd->verify_barrier) {
+        if (wtq_stream_is_bidi(st)) {
+            /* the TARGET stream's payload — verify each byte against the
+             * pattern at its stream offset (delivered only after resume) */
+            pthread_mutex_lock(&sd->mu);
+            size_t off = sd->barrier_total;
+            for (size_t i = 0; i < len; i++)
+                if (data[i] != barrier_pat(off + i)) {
+                    sd->barrier_mismatch++;
+                    break;
+                }
+            sd->barrier_total += len;
+            if (fin)
+                sd->barrier_fins++;
+            side_signal(sd);
+            pthread_mutex_unlock(&sd->mu);
+            return;
+        }
+        /* the independent MARKER uni stream arrived: THE barrier. This
+         * callback is SIGNAL-ONLY. Running on the serialization domain, and
+         * AFTER the target's own receive completion (the prefix was ACKed
+         * before the marker was even queued), it captures whether the
+         * target's completion is HELD in the backend deferral and how much
+         * the app has seen. The test thread inspects these and resumes; the
+         * callback must not resume (that would replay the receive back
+         * through here). */
+        pthread_mutex_lock(&sd->mu);
+        if (sd->marker_seen == 0) {
+            struct wtq_dstream *tds = sd->barrier_target_ds;
+            sd->deferred_at_marker = tds != NULL && tds->recv_deferred;
+            sd->target_at_marker = sd->barrier_total;
+        }
+        sd->marker_seen++;
+        side_signal(sd);
+        pthread_mutex_unlock(&sd->mu);
+        return;
+    }
+
+    /* --- server: prefix-barrier responder --- */
+    if (sd->prefix_barrier && wtq_stream_is_bidi(st) && fin) {
+        pthread_mutex_lock(&sd->mu);
+        sd->barrier_stream = st;
+        sd->barrier_session = s;
+        pthread_mutex_unlock(&sd->mu);
+        wtq_stream_add_ref(st); /* held across the multi-send response */
+        /* a 16 KiB prefix, NO FIN — its completion (a peer ACK, since
+         * SendBufferingEnabled=FALSE) is what gates the remainder+marker */
+        wtq_span_t pre = { g_barrier_payload, BARRIER_PREFIX };
+        wtq_result_t rc = wtq_stream_send(st, &pre, 1, 0, &g_prefix_ctx);
+        if (rc != WTQ_OK) {
+            pthread_mutex_lock(&sd->mu);
+            sd->barrier_send_errors++;
+            sd->barrier_stream = NULL;
+            side_signal(sd);
+            pthread_mutex_unlock(&sd->mu);
+            wtq_stream_release(st); /* the ref we just took, on failure */
+        }
+        return;
+    }
+
     pthread_mutex_lock(&sd->mu);
     if (sd->rx_len + len <= sizeof(sd->rx)) {
         memcpy(sd->rx + sd->rx_len, data, len);
@@ -545,14 +849,24 @@ static void cb_stream_reset(wtq_session_t *s, wtq_stream_t *st,
                             uint32_t code, void *user)
 {
     struct side *sd = user;
+    bool try_resume;
 
     (void)s;
-    (void)st;
     pthread_mutex_lock(&sd->mu);
     sd->resets++;
     sd->last_reset_code = code;
+    sd->rx_at_reset = sd->rx_len; /* bytes delivered as of the reset */
+    try_resume = sd->resume_on_reset;
     side_signal(sd);
     pthread_mutex_unlock(&sd->mu);
+
+    if (try_resume) {
+        /* Reentrancy probe: a resume attempted from INSIDE on_stream_reset
+         * (the API has not yet cleared recv_open) must be rejected and must
+         * replay nothing — the backend dropped the deferred receive before
+         * emitting this callback. Runs on the domain already. */
+        sd->reset_resume_rc = wtq_stream_resume_receive(st);
+    }
 }
 
 static void cb_stream_stop(wtq_session_t *s, wtq_stream_t *st, uint32_t code,
@@ -640,6 +954,67 @@ static void cb_send_complete(wtq_session_t *s, void *send_ctx, bool canceled,
     pthread_mutex_unlock(&sd->mu);
     if (release_st != NULL)
         wtq_stream_release(release_st);
+
+    /* prefix-barrier: the prefix's completion is a peer ACK — the target
+     * demonstrably reached the peer. ONLY on a clean completion do we queue
+     * the remainder and the independent marker. The target ref taken by the
+     * responder (barrier_stream) is released exactly once: normally by the
+     * remainder's completion, otherwise HERE on any failure — a canceled
+     * prefix, a failed remainder send, or a marker open/send failure — so no
+     * path leaves it outstanding. Same server network thread as the
+     * responder, so barrier_* are stable here. */
+    if (send_ctx == &g_prefix_ctx && sd->prefix_barrier &&
+        sd->barrier_stream != NULL) {
+        bool bad = canceled;
+        bool remainder_sent = false;
+        if (!canceled) {
+            wtq_span_t rem = { g_barrier_payload + BARRIER_PREFIX,
+                               BARRIER_TOTAL - BARRIER_PREFIX };
+            remainder_sent = wtq_stream_send(sd->barrier_stream, &rem, 1,
+                                             WTQ_SEND_FIN,
+                                             &g_remainder_ctx) == WTQ_OK;
+            if (!remainder_sent) {
+                bad = true;
+            } else {
+                wtq_stream_t *mk = NULL;
+                if (wtq_session_open_uni(sd->barrier_session, &mk) != WTQ_OK) {
+                    bad = true; /* remainder still in flight — it releases
+                                   barrier_stream on completion */
+                } else {
+                    wtq_span_t ms = { g_barrier_marker,
+                                      sizeof(g_barrier_marker) };
+                    sd->barrier_marker = mk; /* freed on marker completion */
+                    if (wtq_stream_send(mk, &ms, 1, WTQ_SEND_FIN,
+                                        &g_marker_ctx) != WTQ_OK) {
+                        bad = true;
+                        sd->barrier_marker = NULL;
+                        wtq_stream_release(mk);
+                    }
+                }
+            }
+        }
+        /* release the target ref HERE only when no remainder completion is
+         * coming to do it (canceled prefix, or the remainder send failed) */
+        if (!remainder_sent) {
+            wtq_stream_release(sd->barrier_stream);
+            sd->barrier_stream = NULL;
+        }
+        if (bad) {
+            pthread_mutex_lock(&sd->mu);
+            sd->barrier_send_errors++;
+            side_signal(sd);
+            pthread_mutex_unlock(&sd->mu);
+        }
+    }
+    /* the response is fully acknowledged: release the handles held for it */
+    if (send_ctx == &g_remainder_ctx && sd->barrier_stream != NULL) {
+        wtq_stream_release(sd->barrier_stream);
+        sd->barrier_stream = NULL;
+    }
+    if (send_ctx == &g_marker_ctx && sd->barrier_marker != NULL) {
+        wtq_stream_release(sd->barrier_marker);
+        sd->barrier_marker = NULL;
+    }
 }
 
 static void cb_datagram(wtq_session_t *s, const uint8_t *data, size_t len,
@@ -2650,6 +3025,571 @@ static void sv_stream_opened(wtq_session_t *s, wtq_stream_t *st, bool bidi,
         (void)wtq_stream_stop_sending(st, 0x55);
 }
 
+/*
+ * RECEIVE PAUSE DEFERRAL — deterministic, via the WTQ_NW_TESTING receive
+ * injection seam. op_recv_enable(false) only stops FUTURE arms, so the one
+ * already-outstanding nw_connection_receive can still complete after pause
+ * returned; without deferral its bytes or FIN would reach the engine while
+ * paused. The seam replays that completion ON THE DOMAIN — no network
+ * timing — so the backend-local deferral is proven exactly.
+ *
+ * Every scenario opens a FRESH client app bidi and pauses it BEFORE its
+ * ready (open + pause are dispatch_sync'd ahead of the ready callback), so
+ * no real receive is ever armed to race the injection.
+ */
+static int t_recv_pause(uint16_t port, struct side *sv)
+{
+    int failures = 0;
+    struct side cl;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    static const char *const offer[] = { "wt" };
+
+    (void)sv;
+    side_init(&cl);
+    cl.echo_streams = false;
+    ring_reset();
+    wtq_nw_test_recv_defer_overflow = 0;
+
+    if (!nw_client_up_ready(&cl, port, "/nw", offer, 1, NULL, &drv, &cs)) {
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    /* (1) data deferral + resume delivers exactly once, byte-exact */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t hello[5] = { 'h', 'e', 'l', 'l', 'o' };
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            dom_inject_recv(drv, ds, hello, sizeof(hello), false);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds)); /* held */
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0);     /* engine/app saw none */
+            pthread_mutex_unlock(&cl.mu);
+            /* no receive was armed while paused (paused before ready, so
+             * ready armed nothing either) */
+            int arms0 = dom_arms(drv);
+            WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, ds));
+            /* resume arms EXACTLY one receive */
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 1);
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK(cl.rx_len == sizeof(hello) &&
+                           memcmp(cl.rx, hello, sizeof(hello)) == 0);
+            pthread_mutex_unlock(&cl.mu);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (2) pure zero-byte FIN stays deferred while paused */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            pthread_mutex_lock(&cl.mu);
+            int fins0 = cl.rx_fins;
+            pthread_mutex_unlock(&cl.mu);
+            dom_inject_recv(drv, ds, NULL, 0, true); /* pure FIN */
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT(cl.rx_fins, fins0); /* FIN held */
+            pthread_mutex_unlock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+            WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.rx_fins, fins0 + 1));
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (3) data + FIN together: one deferral, one ordered delivery */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t bye[3] = { 'b', 'y', 'e' };
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            int fins0 = cl.rx_fins;
+            pthread_mutex_unlock(&cl.mu);
+            dom_inject_recv(drv, ds, bye, sizeof(bye), true);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0);
+            WTQ_TEST_CHECK_EQ_INT(cl.rx_fins, fins0);
+            pthread_mutex_unlock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+            WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.rx_fins, fins0 + 1));
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK(cl.rx_len == sizeof(bye) &&
+                           memcmp(cl.rx, bye, sizeof(bye)) == 0);
+            pthread_mutex_unlock(&cl.mu);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (3b) content delivered alongside a receive ERROR is deferred while
+     * paused, then delivered once on resume WITHOUT re-arming (the error
+     * ended the receive side) */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t oops[4] = { 'o', 'o', 'p', 's' };
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            /* content + error, while paused */
+            dom_inject_recv_ex(drv, ds, oops, sizeof(oops), false, true);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds)); /* held, not delivered */
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0);
+            pthread_mutex_unlock(&cl.mu);
+            int arms0 = dom_arms(drv);
+            WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+            /* delivered once, byte-exact, and NO re-arm (error ended it) */
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK(cl.rx_len == sizeof(oops) &&
+                           memcmp(cl.rx, oops, sizeof(oops)) == 0);
+            pthread_mutex_unlock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 0);
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, ds));
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (4) two-stream isolation: while A is paused with data HELD, an
+     * unpaused B delivers a DISTINCT payload — B progresses while A does
+     * not, and resuming A then yields exactly A's bytes */
+    {
+        wtq_stream_t *a = NULL, *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        struct wtq_dstream *dsb = dom_capture_bidi(drv, b); /* B, running */
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &a), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, a), (int)WTQ_OK);
+        struct wtq_dstream *dsa = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(dsa != NULL && dsb != NULL);
+        if (dsa != NULL && dsb != NULL) {
+            static const uint8_t a_bytes[4] = { 'A', 'A', 'A', 'A' };
+            static const uint8_t b_bytes[3] = { 'B', 'B', 'B' };
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            /* A paused -> held; B running -> delivered immediately */
+            dom_inject_recv(drv, dsa, a_bytes, sizeof(a_bytes), false);
+            dom_inject_recv(drv, dsb, b_bytes, sizeof(b_bytes), false);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, dsa));   /* A held */
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, dsb));  /* B not held */
+            pthread_mutex_lock(&cl.mu);
+            /* exactly B's payload has been delivered; none of A's */
+            WTQ_TEST_CHECK(cl.rx_len == sizeof(b_bytes) &&
+                           memcmp(cl.rx, b_bytes, sizeof(b_bytes)) == 0);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            /* now resume A -> exactly A's held bytes arrive */
+            WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, a), (int)WTQ_OK);
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK(cl.rx_len == sizeof(a_bytes) &&
+                           memcmp(cl.rx, a_bytes, sizeof(a_bytes)) == 0);
+            pthread_mutex_unlock(&cl.mu);
+        }
+        dom_stream_release(drv, a);
+        dom_stream_release(drv, b);
+    }
+
+    /* (5) repeated pause/resume toggles never re-arm: with one receive
+     * already outstanding, the recv_pending guard means every resume
+     * across the toggles issues ZERO new arms */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_capture_bidi(drv, b); /* running */
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            /* the capture's resume armed exactly one receive */
+            __block bool armed = false;
+            dispatch_sync(drv->queue, ^{ armed = ds->recv_pending; });
+            WTQ_TEST_CHECK(armed);
+            int arms0 = dom_arms(drv);
+            for (int i = 0; i < 4; i++) {
+                WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+                WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+            }
+            /* the outstanding receive was never replaced: no re-arm */
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 0);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (6) teardown while deferred: leave a completion held (with a
+     * counting destructor), then run the connection down. The retained
+     * transport object must be released EXACTLY ONCE on the terminal/reap
+     * path — proven by the destructor count, not just recv_deferred and
+     * the sanitizer. */
+    int td_dtor = 0;
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t held[6] = { 'h', 'e', 'l', 'd', '!', '!' };
+            dom_inject_recv_counted(drv, ds, held, sizeof(held), false,
+                                    &td_dtor);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            WTQ_TEST_CHECK_EQ_INT(td_dtor, 0); /* still held */
+        }
+        dom_stream_release(drv, b);
+        /* fall through to rundown WITHOUT resuming */
+    }
+
+    WTQ_TEST_CHECK_EQ_INT((int)dom_close(drv, cs, 0), (int)WTQ_OK);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    /* the held object was released exactly once during teardown */
+    WTQ_TEST_CHECK_EQ_INT(td_dtor, 1);
+    side_destroy(&cl);
+    if (failures == 0)
+        printf("PASS: recv_pause\n");
+    return failures;
+}
+
+/*
+ * RESET / CANCEL WHILE DEFERRED — its own connection because both cases
+ * terminate a real stream (transport churn). Proves the held buffer is
+ * dropped before the engine is notified, a resume attempted reentrantly
+ * from on_stream_reset is rejected, and nothing stale is replayed or
+ * re-armed on the way down.
+ */
+static int t_recv_reset_deferred(uint16_t port, struct side *sv)
+{
+    int failures = 0;
+    struct side cl;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    static const char *const offer[] = { "wt" };
+
+    (void)sv;
+    side_init(&cl);
+    cl.echo_streams = false;
+    ring_reset();
+
+    if (!nw_client_up_ready(&cl, port, "/nw", offer, 1, NULL, &drv, &cs)) {
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    /* (1) STREAM-LOCAL ABORT while deferred: op_shutdown_stream drops the
+     * held completion SYNCHRONOUSLY — its counting destructor fires exactly
+     * once — then a resume is rejected and nothing is replayed or re-armed.
+     * Runs first, on a healthy connection. */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t gone[4] = { 'g', 'o', 'n', 'e' };
+            int dtor = 0;
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            dom_inject_recv_counted(drv, ds, gone, sizeof(gone), false, &dtor);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            WTQ_TEST_CHECK_EQ_INT(dtor, 0); /* held */
+            int arms0 = dom_arms(drv);
+            WTQ_TEST_CHECK_EQ_INT((int)dom_abort(drv, b, 7), (int)WTQ_OK);
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, ds));   /* dropped now */
+            WTQ_TEST_CHECK_EQ_INT(dtor, 1);              /* released once */
+            WTQ_TEST_CHECK(dom_resume(drv, b) != WTQ_OK); /* rejected */
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 0); /* no re-arm */
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0); /* nothing replayed */
+            pthread_mutex_unlock(&cl.mu);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (2) PEER RESET while deferred, with a reentrant resume in the reset
+     * callback: the held buffer (counting destructor) is dropped BEFORE the
+     * callback and released exactly once, the resume is rejected, and
+     * nothing is replayed or re-armed. Also proves the backend guard
+     * rejects a direct op_recv_enable on the failed stream without mutating
+     * recv_enabled. */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t stale[5] = { 's', 't', 'a', 'l', 'e' };
+            int dtor = 0;
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            cl.resume_on_reset = true;
+            cl.reset_resume_rc = WTQ_OK;
+            int resets0 = cl.resets;
+            pthread_mutex_unlock(&cl.mu);
+            dom_inject_recv_counted(drv, ds, stale, sizeof(stale), false,
+                                    &dtor);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            WTQ_TEST_CHECK_EQ_INT(dtor, 0);
+            int arms0 = dom_arms(drv);
+            wtq_nw_test_stream_fail(drv, ds); /* synchronous on the domain */
+            WTQ_TEST_CHECK_EQ_INT(cl.resets, resets0 + 1);
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_at_reset, 0); /* nothing before */
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0);      /* nothing replayed */
+            WTQ_TEST_CHECK(cl.reset_resume_rc != WTQ_OK); /* resume rejected */
+            cl.resume_on_reset = false;
+            pthread_mutex_unlock(&cl.mu);
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, ds)); /* dropped */
+            WTQ_TEST_CHECK_EQ_INT(dtor, 1);            /* released once */
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 0); /* no re-arm */
+            /* the backend guard, exercised directly: rejects and does not
+             * mutate recv_enabled */
+            __block bool re0 = false;
+            dispatch_sync(drv->queue, ^{ re0 = ds->recv_enabled; });
+            wtq_result_t grc = wtq_nw_test_recv_enable(drv, ds, !re0);
+            __block bool re1 = false;
+            dispatch_sync(drv->queue, ^{ re1 = ds->recv_enabled; });
+            WTQ_TEST_CHECK_EQ_INT((int)grc, (int)WTQ_ERR_CLOSED);
+            WTQ_TEST_CHECK(re1 == re0); /* state unchanged */
+            /* a further resume through the public path is still rejected */
+            WTQ_TEST_CHECK(dom_resume(drv, b) != WTQ_OK);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    /* (3) content + error deferred, then FAILURE arrives FIRST: terminal
+     * handling drops the held completion and NOTHING is delivered (the
+     * failure-first ordering of the content-plus-error case) */
+    {
+        wtq_stream_t *b = NULL;
+        WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+        struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds != NULL) {
+            static const uint8_t part[3] = { 'p', 'a', 'r' };
+            pthread_mutex_lock(&cl.mu);
+            cl.rx_len = 0;
+            pthread_mutex_unlock(&cl.mu);
+            /* content + error, held while paused */
+            dom_inject_recv_ex(drv, ds, part, sizeof(part), false, true);
+            WTQ_TEST_CHECK(dom_ds_deferred(drv, ds));
+            int arms0 = dom_arms(drv);
+            wtq_nw_test_stream_fail(drv, ds); /* failure first */
+            WTQ_TEST_CHECK(!dom_ds_deferred(drv, ds)); /* dropped, not resumed */
+            WTQ_TEST_CHECK_EQ_INT(dom_arms(drv) - arms0, 0);
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_SIZE(cl.rx_len, 0); /* never delivered */
+            pthread_mutex_unlock(&cl.mu);
+        }
+        dom_stream_release(drv, b);
+    }
+
+    WTQ_TEST_CHECK_EQ_INT((int)dom_close(drv, cs, 0), (int)WTQ_OK);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    side_destroy(&cl);
+    if (failures == 0)
+        printf("PASS: recv_reset_deferred\n");
+    return failures;
+}
+
+/*
+ * SINGLE-SLOT INVARIANT — a second completion deferred while one is held is
+ * impossible by design (one receive is ever armed). If it ever happened the
+ * backend must NOT silently drop the peer's bytes: it stages a local
+ * backend error and fails the CONNECTION, like the missing-metadata
+ * invariant. Its own connection because the outcome is terminal.
+ */
+static int t_recv_defer_invariant(uint16_t port, struct side *sv)
+{
+    int failures = 0;
+    struct side cl;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    static const char *const offer[] = { "wt" };
+
+    (void)sv;
+    side_init(&cl);
+    cl.echo_streams = false;
+    ring_reset();
+    wtq_nw_test_recv_defer_overflow = 0;
+
+    if (!nw_client_up_ready(&cl, port, "/nw", offer, 1, NULL, &drv, &cs)) {
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    wtq_stream_t *b = NULL;
+    WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+    struct wtq_dstream *ds = dom_find_paused_bidi(drv);
+    WTQ_TEST_CHECK(ds != NULL);
+    if (ds != NULL) {
+        static const uint8_t one[3] = { 'o', 'n', 'e' };
+        static const uint8_t two[3] = { 't', 'w', 'o' };
+        dom_inject_recv(drv, ds, one, sizeof(one), false); /* held */
+        dom_inject_recv(drv, ds, two, sizeof(two), false); /* invariant */
+        WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_recv_defer_overflow, 1);
+        /* the second deferral staged a backend error and failed the
+         * connection — never a silent data drop */
+        __block bool staged = false, backend = false, shut = false;
+        dispatch_sync(drv->queue, ^{
+          staged = drv->err_staged;
+          backend = drv->err_domain == WTQ_ERRDOM_BACKEND;
+          shut = drv->shutdown_started;
+        });
+        WTQ_TEST_CHECK(staged);
+        WTQ_TEST_CHECK(backend);
+        WTQ_TEST_CHECK(shut);
+        WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.closed, 1)); /* terminal */
+    }
+    dom_stream_release(drv, b);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    side_destroy(&cl);
+    if (failures == 0)
+        printf("PASS: recv_defer_invariant\n");
+    return failures;
+}
+
+/*
+ * PREFIX-BARRIER — real-transport proof that a paused stream's completion is
+ * HELD in the backend deferral and delivers NOTHING to the app while the
+ * connection keeps progressing. Its own MsQuic listener/server side so the
+ * barrier's send accounting is isolated. The client pauses the target with
+ * one receive outstanding and requests a response. The server sends a prefix,
+ * and only its acknowledged completion (peer ACK) releases the remainder and
+ * an independent marker stream. The prefix ACK proves the target's bytes
+ * reached the peer. The marker callback is SIGNAL-ONLY; the test thread then
+ * requires recv_deferred==true (the real deferred path ran, not a merely
+ * delayed completion) and zero app delivery, and only then resumes — which
+ * yields the whole payload and FIN, byte-exact and in order. Barriers are
+ * callbacks/conditions only — no sleeps.
+ *
+ * SCOPE: application-delivery isolation only. NW auto-tunes and buffers past
+ * the public initial-window setters, so no peer flow-control bound is
+ * claimed or asserted (see COMPATIBILITY.md).
+ */
+static int t_recv_prefix_barrier(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side cl, sv_b;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    wtq_msquic_listener_t *lb = NULL;
+    static const char *const offer[] = { "wtq-nw-test" };
+
+    side_init(&cl);
+    side_init(&sv_b);
+    sv_b.prefix_barrier = true;
+    cl.verify_barrier = true;
+    ring_reset();
+
+    WTQ_TEST_CHECK_EQ_INT((int)listener_up(env, &sv_b, &lb), (int)WTQ_OK);
+    if (lb == NULL) {
+        side_destroy(&cl);
+        side_destroy(&sv_b);
+        return failures + 1;
+    }
+
+    bool up = nw_client_up_ready(&cl, wtq_msquic_listener_port(lb), "/nw",
+                                 offer, 1, NULL, &drv, &cs);
+    WTQ_TEST_CHECK(up);
+    if (!up) {
+        wtq_msquic_listener_stop(lb);
+        side_destroy(&cl);
+        side_destroy(&sv_b);
+        return failures + 1;
+    }
+
+    /* the target bidi: arm its receive, then pause with ONE outstanding */
+    wtq_stream_t *b = NULL;
+    WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &b), (int)WTQ_OK);
+    struct wtq_dstream *dsb = dom_capture_bidi(drv, b); /* arms a receive */
+    WTQ_TEST_CHECK(dsb != NULL);
+    __block bool armed = false;
+    if (dsb != NULL)
+        dispatch_sync(drv->queue, ^{ armed = dsb->recv_pending; });
+    WTQ_TEST_CHECK(armed);
+    /* the marker callback (on the domain) reads this to capture the target's
+     * deferral state at the barrier */
+    pthread_mutex_lock(&cl.mu);
+    cl.barrier_target_ds = dsb;
+    pthread_mutex_unlock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT((int)dom_pause(drv, b), (int)WTQ_OK);
+
+    /* the request — the server answers prefix -> (ack) -> remainder+marker */
+    static const uint8_t go[2] = { 'g', 'o' };
+    wtq_span_t rq = { go, sizeof(go) };
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)dom_send(drv, b, &rq, 1, WTQ_SEND_FIN, NULL), (int)WTQ_OK);
+
+    /* the prefix DID complete (reached the peer) before the marker was even
+     * queued */
+    WTQ_TEST_CHECK(side_wait_ctx(&sv_b, &g_prefix_ctx, 1));
+
+    /* THE barrier: the marker arrived (signal-only), failing fast if any
+     * server send/open failed. REQUIRE that the target's completion was HELD
+     * in the backend deferral — proving the real deferred-receive path ran,
+     * not a completion merely delayed behind the marker — and that the app
+     * has seen nothing. */
+    WTQ_TEST_CHECK(barrier_wait_marker(&cl, &sv_b));
+    pthread_mutex_lock(&cl.mu);
+    WTQ_TEST_CHECK(cl.deferred_at_marker);           /* the deferred path ran */
+    WTQ_TEST_CHECK_EQ_SIZE(cl.target_at_marker, 0);  /* nothing to the app */
+    pthread_mutex_unlock(&cl.mu);
+
+    /* only now resume; the whole payload + FIN follows, byte-exact */
+    WTQ_TEST_CHECK_EQ_INT((int)dom_resume(drv, b), (int)WTQ_OK);
+    WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.barrier_fins, 1));
+    pthread_mutex_lock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_SIZE(cl.barrier_total, (size_t)BARRIER_TOTAL);
+    WTQ_TEST_CHECK_EQ_SIZE(cl.barrier_mismatch, 0);
+    WTQ_TEST_CHECK_EQ_INT(cl.barrier_fins, 1);
+    pthread_mutex_unlock(&cl.mu);
+
+    /* each server send completed exactly once, and no send/open failed
+     * (ordering across streams is not asserted — the marker/remainder race
+     * is legitimate; only the exactly-once totals are) */
+    WTQ_TEST_CHECK(side_wait_ctx(&sv_b, &g_remainder_ctx, 1));
+    WTQ_TEST_CHECK(side_wait_ctx(&sv_b, &g_marker_ctx, 1));
+    WTQ_TEST_CHECK_EQ_INT(side_ctx_completions(&sv_b, &g_prefix_ctx), 1);
+    WTQ_TEST_CHECK_EQ_INT(side_ctx_completions(&sv_b, &g_remainder_ctx), 1);
+    WTQ_TEST_CHECK_EQ_INT(side_ctx_completions(&sv_b, &g_marker_ctx), 1);
+    pthread_mutex_lock(&sv_b.mu);
+    WTQ_TEST_CHECK_EQ_INT(sv_b.barrier_send_errors, 0);
+    pthread_mutex_unlock(&sv_b.mu);
+
+    dom_stream_release(drv, b);
+    WTQ_TEST_CHECK_EQ_INT((int)dom_close(drv, cs, 0), (int)WTQ_OK);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    wtq_msquic_listener_stop(lb);
+    side_destroy(&cl);
+    side_destroy(&sv_b);
+    if (failures == 0)
+        printf("PASS: recv_prefix_barrier\n");
+    return failures;
+}
+
 /* --- main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -2658,6 +3598,8 @@ int main(int argc, char **argv)
 
     if (certs_locate(argc > 1 ? argv[1] : NULL) != 0)
         return 1;
+    for (size_t i = 0; i < sizeof(g_barrier_payload); i++)
+        g_barrier_payload[i] = barrier_pat(i); /* deterministic verify */
     if (getenv("WTQ_NW_WAIT_MS") != NULL) {
         g_wait_ms = atoi(getenv("WTQ_NW_WAIT_MS"));
         if (g_wait_ms < 1000)
@@ -2731,6 +3673,10 @@ int main(int argc, char **argv)
         int before = failures;
 
         failures += t_establish_traffic(env, port);
+        failures += t_recv_pause(port, &g_sv);
+        failures += t_recv_reset_deferred(port, &g_sv);
+        failures += t_recv_defer_invariant(port, &g_sv);
+        failures += t_recv_prefix_barrier(env);
         failures += t_abort_wire(port, &g_sv);
         failures += t_send_completions(port, &g_sv);
         failures += t_refusal(port);
