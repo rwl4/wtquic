@@ -131,6 +131,13 @@ typedef enum wtq_driver_cap {
     WTQ_DCAP_SHUT_BIDI_SEND   = 1u << 0, /* fully-open bidi: RESET alone */
     WTQ_DCAP_SHUT_BIDI_RECV   = 1u << 1, /* fully-open bidi: STOP alone  */
     WTQ_DCAP_SHUT_SPLIT_CODES = 1u << 2, /* both halves, different codes */
+    /* recv_enable (below) imposes HARD transport flow-control backpressure
+     * while paused — stops consuming and does not extend receive credit —
+     * not merely delivery suppression. A backend sets this ONLY once it has
+     * proven transport-level pause; without it, a present recv_enable is
+     * treated as delivery-only. Surfaced publicly as
+     * WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED. */
+    WTQ_DCAP_RECV_FLOW_CONTROLLED = 1u << 3,
 } wtq_driver_cap_t;
 
 typedef struct wtq_driver_ops {
@@ -664,6 +671,15 @@ wtq_result_t wtq_conn_wt_stop(wtq_conn_t *conn, wtq_estream_t *es,
  */
 wtq_result_t wtq_conn_wt_recv_enable(wtq_conn_t *conn, wtq_estream_t *es,
                                      bool enabled);
+
+/*
+ * What receive-pause achieves on this connection's backend, as the public
+ * tri-state (0 = unsupported, 1 = delivery-only, 2 = flow-controlled).
+ * Derived from the backend's recv_enable presence and the
+ * WTQ_DCAP_RECV_FLOW_CONTROLLED capability bit — a static backend property,
+ * not per-stream state. Returns 0 for a NULL connection.
+ */
+int wtq_conn_recv_pause_mode(const wtq_conn_t *conn);
 
 /*
  * Reject an ASSOCIATED WT stream that the layer above the engine cannot

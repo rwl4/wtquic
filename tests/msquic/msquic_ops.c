@@ -13,6 +13,7 @@
 #include "proto/h3_err.h"
 #include "proto/h3_frame.h"
 #include "proto/h3_settings.h"
+#include "proto/preamble.h"
 
 #include "test_support.h"
 
@@ -1198,6 +1199,609 @@ static int test_cleanup_preserves_sealed_none(void)
     return failures;
 }
 
+/* --- receive pause/resume: synchronous arrest of queued receives ------ *
+ *
+ * StreamReceiveSetEnabled(FALSE) is asynchronous — a RECEIVE queued behind
+ * it still fires — so the backend keeps logical recv_disabled state and
+ * rejects such a receive by accepting zero bytes (TotalBufferLength -> 0),
+ * leaving the data with MsQuic for redelivery on resume. These white-box
+ * cases exercise the mechanic and the pause/resume failure handling the
+ * real loopback cannot inject; the end-to-end "engine observed none, all
+ * delivered byte-exact after resume" is the loopback's job. */
+
+static int g_rse_calls;              /* successful SetEnabled submissions */
+static BOOLEAN g_rse_last;           /* last submitted value */
+static int g_rse_fail;               /* fail the next N SetEnabled calls */
+
+static QUIC_STATUS QUIC_API rec_recv_set_enabled(HQUIC h, BOOLEAN enabled)
+{
+    (void)h;
+    if (g_rse_fail > 0) {
+        g_rse_fail--;
+        return QUIC_STATUS_ABORTED;
+    }
+    g_rse_calls++;
+    g_rse_last = enabled;
+    return QUIC_STATUS_SUCCESS;
+}
+
+static void recv_api(QUIC_API_TABLE *api)
+{
+    memset(api, 0, sizeof(*api));
+    api->StreamReceiveSetEnabled = rec_recv_set_enabled;
+    api->StreamClose = rec_stream_close;
+}
+
+/* Deliver a RECEIVE event with `count` single-byte-filled buffers; returns
+ * the TotalBufferLength the callback left (the bytes it accepted). */
+static uint64_t recv_deliver(struct wtq_dstream *ds, uint32_t count,
+                             uint32_t each, bool fin)
+{
+    static uint8_t data[64];
+    QUIC_BUFFER qb[4];
+    QUIC_STREAM_EVENT ev;
+    uint64_t total = 0;
+
+    memset(data, 0x5a, sizeof(data));
+    if (each > sizeof(data))
+        each = sizeof(data);
+    if (count > 4)
+        count = 4;
+    for (uint32_t i = 0; i < count; i++) {
+        qb[i].Buffer = data;
+        qb[i].Length = each;
+        total += each;
+    }
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_STREAM_EVENT_RECEIVE;
+    ev.RECEIVE.TotalBufferLength = total;
+    ev.RECEIVE.Buffers = count > 0 ? qb : NULL;
+    ev.RECEIVE.BufferCount = count;
+    ev.RECEIVE.Flags = fin ? QUIC_RECEIVE_FLAG_FIN : 0;
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &ev);
+    return ev.RECEIVE.TotalBufferLength;
+}
+
+/* A live-stream rig with no session: the arrest short-circuits before the
+ * engine feed, and a non-arrested data receive with no engine is simply
+ * discarded (TotalBufferLength left unchanged), so the accepted length is
+ * the observable: 0 == arrested, `total` == not arrested. */
+static struct wtq_driver *recv_rig(QUIC_API_TABLE *api,
+                                   struct wtq_dstream **ds_out)
+{
+    struct wtq_driver *drv =
+        wtq_msq_conn_new(wtq_alloc_default(), api, true);
+    if (drv == NULL)
+        return NULL;
+    drv->conn = (HQUIC)(void *)drv;
+    struct wtq_dstream *ds = wtq_msq_stream_new(drv, false, true, 4);
+    if (ds == NULL) {
+        drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+        return NULL;
+    }
+    ds->stream = (HQUIC)(void *)ds; /* live-stream sentinel */
+    *ds_out = ds;
+    return drv;
+}
+
+static void recv_rig_free(struct wtq_driver *drv)
+{
+    drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+}
+
+static const wtq_driver_ops_t *OPS(void) { return wtq_msq_driver_ops(); }
+
+/* Pause succeeds; a data-bearing RECEIVE queued behind it is arrested
+ * (accepts zero bytes) — single- and multi-buffer, and data+FIN — while an
+ * unpaused stream accepts in full; resume clears the state. */
+static int test_recv_pause_arrest(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    struct wtq_dstream *ds = NULL;
+
+    recv_api(&api);
+    g_rse_calls = 0;
+    g_rse_fail = 0;
+    struct wtq_driver *drv = recv_rig(&api, &ds);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures;
+
+    /* not paused: a data receive is accepted in full (no arrest) */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 8);
+
+    /* pause: SetEnabled(FALSE), logical state published on success */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    WTQ_TEST_CHECK(ds->recv_disabled);
+    WTQ_TEST_CHECK_EQ_INT(g_rse_calls, 1);
+    WTQ_TEST_CHECK(g_rse_last == FALSE);
+
+    /* a data receive queued behind the pause is arrested */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 0);
+    /* multi-buffer: the whole event is arrested */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 3, 8, false), 0);
+    /* data+FIN: arrested (data and FIN held for redelivery) */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, true), 0);
+    WTQ_TEST_CHECK(!ds->fin_delivered);
+
+    /* resume: SetEnabled(TRUE), state cleared on success */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true), WTQ_OK);
+    WTQ_TEST_CHECK(!ds->recv_disabled);
+    WTQ_TEST_CHECK_EQ_INT(g_rse_calls, 2);
+    WTQ_TEST_CHECK(g_rse_last == TRUE);
+
+    /* delivery is usable again */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 8);
+
+    recv_rig_free(drv);
+    return failures;
+}
+
+/* A failed pause returns the backend error and leaves the stream unpaused:
+ * data delivery stays usable. */
+static int test_recv_pause_failure(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    struct wtq_dstream *ds = NULL;
+
+    recv_api(&api);
+    g_rse_calls = 0;
+    g_rse_fail = 1; /* fail the pause submission */
+    struct wtq_driver *drv = recv_rig(&api, &ds);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures;
+
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false),
+                          WTQ_ERR_BACKEND);
+    WTQ_TEST_CHECK(!ds->recv_disabled);   /* state unchanged */
+    WTQ_TEST_CHECK_EQ_INT(g_rse_calls, 0);
+    /* delivery usable: a data receive is not arrested */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 8);
+    /* and a retried pause now takes effect */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    WTQ_TEST_CHECK(ds->recv_disabled);
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 0);
+
+    recv_rig_free(drv);
+    return failures;
+}
+
+/* A failed resume returns the backend error and leaves the stream paused
+ * (retryable); a subsequent successful resume clears it. */
+static int test_recv_resume_failure(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    struct wtq_dstream *ds = NULL;
+
+    recv_api(&api);
+    g_rse_calls = 0;
+    g_rse_fail = 0;
+    struct wtq_driver *drv = recv_rig(&api, &ds);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures;
+
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    WTQ_TEST_CHECK(ds->recv_disabled);
+
+    g_rse_fail = 1; /* fail the resume submission */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true),
+                          WTQ_ERR_BACKEND);
+    WTQ_TEST_CHECK(ds->recv_disabled);    /* still paused (retryable) */
+    /* receives are still arrested while the retry is owed */
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 0);
+
+    /* the retry succeeds and clears the pause */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true), WTQ_OK);
+    WTQ_TEST_CHECK(!ds->recv_disabled);
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver(ds, 1, 8, false), 8);
+
+    recv_rig_free(drv);
+    return failures;
+}
+
+/* A peer reset / stream teardown while paused clears the logical pause,
+ * attempts no resume, and does not make the connection fatal; a later
+ * resume on the dead stream is CLOSED, not fatal. */
+static int test_recv_reset_while_paused(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    struct wtq_dstream *ds = NULL;
+
+    recv_api(&api);
+    g_rse_calls = 0;
+    g_rse_fail = 0;
+    struct wtq_driver *drv = recv_rig(&api, &ds);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures;
+
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    WTQ_TEST_CHECK(ds->recv_disabled);
+
+    /* peer reset: the receive direction is terminal, pause cleared, and
+     * the connection is not torn down */
+    QUIC_STREAM_EVENT ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_STREAM_EVENT_PEER_SEND_ABORTED;
+    ev.PEER_SEND_ABORTED.ErrorCode = 7;
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &ev);
+    WTQ_TEST_CHECK(!ds->recv_disabled);
+    WTQ_TEST_CHECK(!drv->shutdown_started);
+
+    /* stream teardown: the transport handle is released */
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE;
+    ev.SHUTDOWN_COMPLETE.AppCloseInProgress = FALSE;
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &ev);
+    WTQ_TEST_CHECK(ds->stream == NULL);
+
+    /* resume on the dead stream: CLOSED, no resume attempted, not fatal */
+    g_rse_calls = 0;
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true),
+                          WTQ_ERR_CLOSED);
+    WTQ_TEST_CHECK_EQ_INT(g_rse_calls, 0);
+    WTQ_TEST_CHECK(!drv->shutdown_started);
+
+    recv_rig_free(drv);
+    return failures;
+}
+
+/* --- receive pause/resume over an ESTABLISHED session ----------------- *
+ *
+ * The rigs above prove the arrest mechanic and the pause/resume failure
+ * handling in isolation. These drive the arrest through a real established
+ * WebTransport session so the APP-VISIBLE outcome is observable: while
+ * paused the engine and the on_stream_data callback see NOTHING, and after
+ * resume the held bytes (modeled by MsQuic re-indicating them) arrive
+ * exactly once, byte-exact and in order, FIN included. */
+
+/* on_stream_data / on_stream_opened / on_established capture. */
+static struct rx_cap {
+    int established;
+    int opened;
+    int data_calls;
+    int fin_calls;
+    size_t bytes;
+    size_t buf_len;
+    uint8_t buf[64];
+} g_pr;
+
+static void pr_on_established(wtq_session_t *s, wtq_str_t sub, void *u)
+{
+    (void)s;
+    (void)sub;
+    (void)u;
+    g_pr.established++;
+}
+
+static void pr_on_stream_opened(wtq_session_t *s, wtq_stream_t *st,
+                                bool bidi, void *u)
+{
+    (void)s;
+    (void)st;
+    (void)bidi;
+    (void)u;
+    g_pr.opened++;
+}
+
+static void pr_on_stream_data(wtq_session_t *s, wtq_stream_t *st,
+                              const uint8_t *d, size_t n, bool fin, void *u)
+{
+    (void)s;
+    (void)st;
+    (void)u;
+    g_pr.data_calls++;
+    if (fin)
+        g_pr.fin_calls++;
+    for (size_t i = 0; i < n && g_pr.buf_len < sizeof(g_pr.buf); i++)
+        g_pr.buf[g_pr.buf_len++] = d[i];
+    g_pr.bytes += n;
+}
+
+/* Deliver a RECEIVE carrying exactly `data[0..len)` (single buffer, or a
+ * bare FIN when len == 0). Returns the TotalBufferLength the callback
+ * left — 0 == arrested, len == accepted. */
+static uint64_t recv_deliver_bytes(struct wtq_dstream *ds,
+                                   const uint8_t *data, uint32_t len,
+                                   bool fin)
+{
+    QUIC_BUFFER qb;
+    QUIC_STREAM_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_STREAM_EVENT_RECEIVE;
+    ev.RECEIVE.TotalBufferLength = len;
+    if (len > 0) {
+        qb.Buffer = (uint8_t *)data;
+        qb.Length = len;
+        ev.RECEIVE.Buffers = &qb;
+        ev.RECEIVE.BufferCount = 1;
+    }
+    ev.RECEIVE.Flags = fin ? QUIC_RECEIVE_FLAG_FIN : 0;
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &ev);
+    return ev.RECEIVE.TotalBufferLength;
+}
+
+/* Bring a client session to ESTABLISHED over the fake table (mirrors the
+ * CONNECT flow the error-record rigs use, answered with a 200), wiring the
+ * pause-relevant events. Returns the driver or NULL. */
+static struct wtq_driver *pause_estab(QUIC_API_TABLE *api,
+                                      wtq_session_t **out_sess)
+{
+    ord_api(api);
+    api->ConnectionShutdown = rec_conn_shutdown;
+    api->StreamOpen = rec_stream_open;
+    api->StreamStart = rec_stream_start;
+    api->StreamSend = rec_stream_send;
+    api->StreamReceiveSetEnabled = rec_recv_set_enabled;
+
+    struct wtq_driver *drv =
+        wtq_msq_conn_new(wtq_alloc_default(), api, true);
+    if (drv == NULL)
+        return NULL;
+    drv->conn = (HQUIC)(void *)drv;
+    g_sent_n = 0;
+    g_rse_calls = 0;
+    g_rse_fail = 0;
+    memset(&g_pr, 0, sizeof(g_pr));
+
+    wtq_session_events_t ev;
+    wtq_session_events_init(&ev);
+    ev.on_established = pr_on_established;
+    ev.on_stream_opened = pr_on_stream_opened;
+    ev.on_stream_data = pr_on_stream_data;
+    wtq_api_session_cfg_t scfg = {
+        .alloc = wtq_alloc_default(),
+        .perspective = WTQ_PERSPECTIVE_CLIENT,
+        .events = &ev,
+        .user = NULL,
+        .drv = drv,
+        .ops = wtq_msq_driver_ops(),
+    };
+    wtq_session_t *sess = NULL;
+    if (wtq_api_session_create(&scfg, &sess) != WTQ_OK) {
+        drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+        return NULL;
+    }
+    drv->session = sess;
+    wtq_conn_t *ec = wtq_api_session_conn(sess);
+
+    QUIC_CONNECTION_EVENT cev;
+    memset(&cev, 0, sizeof(cev));
+    cev.Type = QUIC_CONNECTION_EVENT_CONNECTED;
+    (void)wtq_msq_conn_callback((HQUIC)(void *)drv, drv, &cev);
+
+    wtq_connect_config_t ccfg;
+    wtq_connect_config_init(&ccfg);
+    ccfg.authority = "example.com";
+    ccfg.path = "/app";
+    if (wtq_api_session_connect(sess, &ccfg) != WTQ_OK)
+        goto fail;
+
+    /* peer SETTINGS (WebTransport) -> the engine sends CONNECT */
+    uint8_t sbuf[128];
+    wtq_h3_settings_encode_cfg_t setcfg = { true, false };
+    size_t flen = 0;
+    sbuf[0] = 0x00;
+    if (wtq_h3_settings_encode_frame(&setcfg, sbuf + 1, sizeof(sbuf) - 1,
+                                     &flen) != 0)
+        goto fail;
+    struct wtq_dstream *pds = wtq_msq_stream_new(drv, false, false, 3);
+    if (pds == NULL)
+        goto fail;
+    wtq_estream_t *pes = NULL;
+    if (wtq_conn_on_peer_uni_opened(ec, pds, 3, &pes) != WTQ_OK)
+        goto fail;
+    pds->ectx = pes;
+    wtq_api_session_enter(sess);
+    (void)wtq_conn_on_stream_bytes(ec, pes, sbuf, 1 + flen, false, 1000);
+    wtq_msq_conn_leave_and_poll(drv);
+    complete_all_sends();
+
+    /* answer the CONNECT (local bidi) with a 200 -> ESTABLISHED */
+    uint8_t section[256];
+    uint8_t resp[300];
+    size_t slen = 0;
+    if (wtq_connect_encode_response(200, NULL, section, sizeof(section),
+                                    &slen) != 0)
+        goto fail;
+    size_t hl = 0;
+    if (wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, slen, resp,
+                                   sizeof(resp), &hl) != 0)
+        goto fail;
+    memcpy(resp + hl, section, slen);
+    struct wtq_dstream *bidi = NULL;
+    for (struct wtq_dstream *it = drv->streams; it != NULL; it = it->next)
+        if (it->is_local && it->is_bidi)
+            bidi = it;
+    if (bidi == NULL || bidi->ectx == NULL)
+        goto fail;
+    wtq_api_session_enter(sess);
+    (void)wtq_conn_on_stream_bytes(ec, bidi->ectx, resp, hl + slen, false,
+                                   2000);
+    wtq_msq_conn_leave_and_poll(drv);
+
+    if (g_pr.established != 1)
+        goto fail;
+    *out_sess = sess;
+    return drv;
+
+fail:
+    wtq_session_release(sess);
+    drv->conn = NULL;
+    drv->session = NULL;
+    wtq_msq_conn_free(drv);
+    return NULL;
+}
+
+/* Open the peer's WT unidirectional data stream and drive it to the
+ * app-visible ES_WT state via its preamble (WT uni type 0x54, session 0).
+ * Returns the backend stream, with its engine ctx published. */
+static struct wtq_dstream *pause_open_wt_uni(struct wtq_driver *drv,
+                                             wtq_conn_t *ec, uint64_t id)
+{
+    struct wtq_dstream *ds = wtq_msq_stream_new(drv, false, false, id);
+    if (ds == NULL)
+        return NULL;
+    ds->stream = (HQUIC)(void *)ds;
+    wtq_estream_t *es = NULL;
+    if (wtq_conn_on_peer_uni_opened(ec, ds, id, &es) != WTQ_OK)
+        return NULL;
+    ds->ectx = es;
+    /* WT uni preamble: type 0x54 (a 2-byte varint) + session id 0 */
+    uint8_t pre[8];
+    size_t pre_len = 0;
+    if (wtq_preamble_encode(WTQ_PREAMBLE_KIND_UNI, 0, pre, sizeof(pre),
+                            &pre_len) != WTQ_PREAMBLE_OK)
+        return NULL;
+    (void)recv_deliver_bytes(ds, pre, (uint32_t)pre_len, false);
+    return ds;
+}
+
+/* Engine isolation + redelivery: while paused a payload RECEIVE is
+ * arrested and neither the engine nor on_stream_data observes it; after
+ * resume MsQuic re-indicates the held bytes and they arrive exactly once,
+ * byte-exact and in order. */
+static int test_recv_established_isolation_redelivery(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *sess = NULL;
+    struct wtq_driver *drv = pause_estab(&api, &sess);
+
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures + 1;
+    wtq_conn_t *ec = wtq_api_session_conn(sess);
+
+    struct wtq_dstream *ds = pause_open_wt_uni(drv, ec, 7);
+    WTQ_TEST_CHECK(ds != NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1); /* app saw the stream */
+    if (ds == NULL) {
+        wtq_session_release(sess);
+        drv->conn = NULL;
+        drv->session = NULL;
+        wtq_msq_conn_free(drv);
+        return failures + 1;
+    }
+
+    /* pause; a payload RECEIVE queued behind it is arrested and the
+     * engine/app observe NOTHING */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    const uint8_t hello[5] = { 'h', 'e', 'l', 'l', 'o' };
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, hello, 5, false), 0);
+    WTQ_TEST_CHECK(ds->recv_held_data);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 0);
+
+    /* resume; MsQuic re-indicates the held bytes ONCE: delivered exactly
+     * once, byte-exact */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true), WTQ_OK);
+    WTQ_TEST_CHECK(!ds->recv_held_data);
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, hello, 5, false), 5);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 5);
+    WTQ_TEST_CHECK(g_pr.buf_len == 5 && memcmp(g_pr.buf, hello, 5) == 0);
+
+    wtq_session_release(sess);
+    drv->conn = NULL;
+    drv->session = NULL;
+    wtq_msq_conn_free(drv);
+    return failures;
+}
+
+/* FIN handling while paused: a pure zero-byte FIN is DEFERRED, a graceful
+ * PEER_SEND_SHUTDOWN behind the pause is SUPPRESSED (no duplicate), and on
+ * resume the FIN is replayed to the app exactly once, after the data. */
+static int test_recv_fin_deferred_while_paused(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *sess = NULL;
+    struct wtq_driver *drv = pause_estab(&api, &sess);
+
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv == NULL)
+        return failures + 1;
+    wtq_conn_t *ec = wtq_api_session_conn(sess);
+
+    struct wtq_dstream *ds = pause_open_wt_uni(drv, ec, 7);
+    WTQ_TEST_CHECK(ds != NULL);
+    if (ds == NULL) {
+        wtq_session_release(sess);
+        drv->conn = NULL;
+        drv->session = NULL;
+        wtq_msq_conn_free(drv);
+        return failures + 1;
+    }
+
+    /* some data lands first (running), so ordering is observable */
+    const uint8_t hi[2] = { 'h', 'i' };
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, hi, 2, false), 2);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+
+    /* pause; a pure zero-byte FIN queued behind it is DEFERRED */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, false), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, NULL, 0, true), 0);
+    WTQ_TEST_CHECK(ds->fin_pending);
+    WTQ_TEST_CHECK(!ds->fin_delivered);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0); /* not delivered while paused */
+
+    /* a graceful PEER_SEND_SHUTDOWN behind the pause is suppressed */
+    QUIC_STREAM_EVENT sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.Type = QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN;
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &sev);
+    WTQ_TEST_CHECK(!ds->fin_delivered);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+
+    /* resume: the FIN is replayed exactly once, after the data */
+    WTQ_TEST_CHECK_EQ_INT(OPS()->recv_enable(drv, ds, true), WTQ_OK);
+    WTQ_TEST_CHECK(ds->fin_delivered);
+    WTQ_TEST_CHECK(!ds->fin_pending);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 2); /* FIN carried no phantom bytes */
+
+    /* a late graceful shutdown does not double-deliver the FIN */
+    (void)wtq_msq_stream_callback((HQUIC)ds->stream, ds, &sev);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+
+    wtq_session_release(sess);
+    drv->conn = NULL;
+    drv->session = NULL;
+    wtq_msq_conn_free(drv);
+    return failures;
+}
+
+/* The settings translation stamps the receive-side invariants: send
+ * buffering off (per tuning) and, where the preview ABI exposes it,
+ * non-multi-receive mode pinned OFF with its IsSet bit. */
+static int test_settings_non_multi_receive(void)
+{
+    int failures = 0;
+    QUIC_SETTINGS qs;
+    wtq_msquic_tuning_t t;
+
+    wtq_msquic_tuning_init(&t);
+    wtq_msq_settings_init(&qs, &t);
+    WTQ_TEST_CHECK(qs.IsSet.SendBufferingEnabled == TRUE);
+#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+    WTQ_TEST_CHECK(qs.StreamMultiReceiveEnabled == FALSE);
+    WTQ_TEST_CHECK(qs.IsSet.StreamMultiReceiveEnabled == TRUE);
+#endif
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1217,6 +1821,14 @@ int main(void)
     failures += test_env_close_exact_code();
     failures += test_stream_id_mismatch_detail();
     failures += test_cleanup_preserves_sealed_none();
+
+    failures += test_recv_pause_arrest();
+    failures += test_recv_pause_failure();
+    failures += test_recv_resume_failure();
+    failures += test_recv_reset_while_paused();
+    failures += test_recv_established_isolation_redelivery();
+    failures += test_recv_fin_deferred_while_paused();
+    failures += test_settings_non_multi_receive();
 
     WTQ_TEST_PASS("msquic_ops");
     return failures;

@@ -1096,6 +1096,18 @@ wtq_result_t wtq_stream_resume_receive(wtq_stream_t *st)
     return stream_recv_enable(st, true);
 }
 
+wtq_receive_pause_mode_t wtq_stream_receive_pause_mode(const wtq_stream_t *st)
+{
+    /* A static property of the transport backend (recv_enable presence +
+     * capability bit), stable for the connection's life, so no lock and no
+     * liveness requirement — but a NULL stream or one with no session has no
+     * backend to report. */
+    if (st == NULL || st->session == NULL)
+        return WTQ_RECEIVE_PAUSE_UNSUPPORTED;
+    return (wtq_receive_pause_mode_t)wtq_conn_recv_pause_mode(
+        st->session->conn);
+}
+
 uint64_t wtq_stream_id(const wtq_stream_t *st)
 {
     if (st == NULL)

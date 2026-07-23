@@ -17,7 +17,8 @@ WORK="${2:-$ROOT/build/ios-slices-work}"
 NW_API="wtq_nw_conn_cfg_init wtq_nw_conn_create wtq_nw_conn_retain \
 wtq_nw_conn_release wtq_nw_conn_post wtq_nw_conn_is_on_domain \
 wtq_nw_conn_session wtq_nw_conn_stop_begin wtq_nw_conn_join \
-wtq_nw_conn_doorbell_ring"
+wtq_nw_conn_doorbell_ring wtq_nw_conn_doorbell_ring_after \
+wtq_nw_conn_doorbell_cancel_after"
 
 for SLICE in device sim; do
     PRESET="ios-$SLICE"
@@ -44,8 +45,8 @@ for SLICE in device sim; do
             echo "FAIL: $SLICE archive missing $SYM"; exit 1; }
     done
     COUNT=$(grep -oE "T _wtq_nw_[a-z0-9_]+" <<< "$NM" | sort -u | wc -l)
-    if [ "$COUNT" -ne 10 ]; then
-        echo "FAIL: $SLICE wtq_nw_* surface is $COUNT, expected 10"
+    if [ "$COUNT" -ne 12 ]; then
+        echo "FAIL: $SLICE wtq_nw_* surface is $COUNT, expected 12"
         exit 1
     fi
 

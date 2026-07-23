@@ -151,6 +151,8 @@ int main(void)
                           WTQ_ERR_INVALID_ARG);
     WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(NULL),
                           WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_stream_receive_pause_mode(NULL),
+                          WTQ_RECEIVE_PAUSE_UNSUPPORTED);
 
     /* --- backend with recv_enable ------------------------------------ */
     {
@@ -166,6 +168,10 @@ int main(void)
             WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(s, &st), WTQ_OK);
             struct wtq_dstream *ds = wt_bidi_ds(&drv, wtq_stream_id(st));
             WTQ_TEST_CHECK(ds != NULL);
+
+            /* recv_enable present, no flow-control cap → delivery-only */
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_receive_pause_mode(st),
+                                  WTQ_RECEIVE_PAUSE_DELIVERY_ONLY);
 
             WTQ_TEST_CHECK_EQ_INT(wtq_stream_pause_receive(st), WTQ_OK);
             WTQ_TEST_CHECK(ds != NULL && ds->recv_disabled);
@@ -190,6 +196,12 @@ int main(void)
                                   WTQ_ERR_CLOSED);
             WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(st),
                                   WTQ_ERR_CLOSED);
+            /* the pause MODE is a static backend property and stays queryable
+             * on the retained terminal handle — it does not collapse to
+             * UNSUPPORTED just because the stream ended (only a NULL handle
+             * does). pause/resume return CLOSED above; the mode is unchanged. */
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_receive_pause_mode(st),
+                                  WTQ_RECEIVE_PAUSE_DELIVERY_ONLY);
             wtq_stream_release(st);
             wtq_session_release(s);
         }
@@ -208,6 +220,9 @@ int main(void)
             wtq_stream_t *st = NULL;
 
             WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(s, &st), WTQ_OK);
+            /* no recv_enable op → pause is unsupported */
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_receive_pause_mode(st),
+                                  WTQ_RECEIVE_PAUSE_UNSUPPORTED);
             WTQ_TEST_CHECK_EQ_INT(wtq_stream_pause_receive(st),
                                   WTQ_ERR_UNSUPPORTED);
             WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(st),
@@ -215,6 +230,26 @@ int main(void)
             /* the capability gate leaves the fake untouched */
             struct wtq_dstream *ds = wt_bidi_ds(&drv, wtq_stream_id(st));
             WTQ_TEST_CHECK(ds != NULL && ds->recv_enable_count == 0);
+            wtq_session_release(s);
+        }
+    }
+
+    /* --- backend advertising hard flow-controlled backpressure -------- */
+    {
+        wtq_driver_ops_t ops = *fake_driver_ops();
+        struct wtq_driver drv;
+        struct pause_side ps;
+        wtq_session_t *s = NULL;
+
+        ops.caps |= WTQ_DCAP_RECV_FLOW_CONTROLLED;
+        WTQ_TEST_CHECK_EQ_INT(session_up(&ops, &drv, &ps, &s), 0);
+        if (s != NULL) {
+            wtq_stream_t *st = NULL;
+
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(s, &st), WTQ_OK);
+            /* recv_enable present AND the cap bit set → flow-controlled */
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_receive_pause_mode(st),
+                                  WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED);
             wtq_session_release(s);
         }
     }

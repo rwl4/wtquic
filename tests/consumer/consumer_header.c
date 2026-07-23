@@ -61,6 +61,15 @@ int main(void)
         return 1;
     (void)WTQ_SEND_FIN;
 
+    /* receive-pause mode query + enumerators link; NULL is UNSUPPORTED */
+    if (wtq_stream_receive_pause_mode(stream) != WTQ_RECEIVE_PAUSE_UNSUPPORTED)
+        return 1;
+    {
+        wtq_receive_pause_mode_t m = WTQ_RECEIVE_PAUSE_DELIVERY_ONLY;
+        (void)m;
+        (void)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
+    }
+
     if (!wtq_version())
         return 1;
     if (wtq_app_error_to_h3(0) == 0)

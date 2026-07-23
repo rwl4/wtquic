@@ -14,6 +14,9 @@ int main(void)
         return 1;
     if (wtq_nw_conn_session(NULL) != NULL)
         return 1;
+    if (wtq_nw_conn_doorbell_ring_after(NULL, 1000) != WTQ_ERR_INVALID_ARG)
+        return 1;
+    wtq_nw_conn_doorbell_cancel_after(NULL);
     wtq_nw_conn_release(NULL);
     printf("PASS: network_pkg consumer (C99)\n");
     return 0;

@@ -507,11 +507,21 @@ static size_t op_dgram_max_size(wtq_driver_t *drv)
 }
 
 /*
- * Pause/resume delivery of received stream data. Disabling stops
- * future RECEIVE indications; MsQuic buffers what keeps arriving up to
- * the stream's receive window and its flow control pushes back on the
- * peer — the engine's consume-all handling of already-indicated bytes
- * is untouched.
+ * Pause/resume delivery of received stream data. StreamReceiveSetEnabled
+ * stops future RECEIVE indications and its flow control pushes back on
+ * the peer (MsQuic buffers up to the stream's receive window), but it is
+ * ASYNCHRONOUS — a RECEIVE already queued behind it still fires. So the
+ * backend also keeps a logical recv_disabled flag: while set, the stream
+ * event handler rejects a data-bearing RECEIVE synchronously
+ * (TotalBufferLength = 0), leaving those bytes with MsQuic for redelivery
+ * on resume rather than feeding them to the engine.
+ *
+ * State is published only AFTER a successful StreamReceiveSetEnabled
+ * submission: a failed pause leaves the stream unpaused (delivery stays
+ * usable), and a failed resume leaves it paused (retryable) — both return
+ * the backend error and touch no logical state. On a successful resume a
+ * FIN that was deferred during the pause (a graceful shutdown with no
+ * held bytes to redeliver) is replayed to the engine here, exactly once.
  */
 static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
                                    bool enabled)
@@ -521,6 +531,25 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (QUIC_FAILED(drv->api->StreamReceiveSetEnabled(
             ds->stream, enabled ? TRUE : FALSE)))
         return WTQ_ERR_BACKEND;
+    ds->recv_disabled = !enabled; /* published after success only */
+    if (enabled) {
+        /* Resume: MsQuic will redeliver any bytes held during the pause,
+         * with their FIN riding the final buffer. A FIN observed while
+         * paused with nothing held has no redelivery coming — replay it to
+         * the engine now, in order (no held data precedes it) and exactly
+         * once (fin_delivered guards a later PEER_SEND_SHUTDOWN). */
+        ds->recv_held_data = false;
+        if (ds->fin_pending && !ds->fin_delivered && ds->ectx != NULL &&
+            drv->session != NULL) {
+            ds->fin_pending = false;
+            ds->fin_delivered = true;
+            wtq_api_session_enter(drv->session);
+            (void)wtq_conn_on_stream_bytes(
+                wtq_api_session_conn(drv->session), ds->ectx, NULL, 0,
+                true, wtq_msq_now_us());
+            wtq_msq_conn_leave_and_poll(drv);
+        }
+    }
     return WTQ_OK;
 }
 
@@ -552,8 +581,14 @@ const wtq_driver_ops_t *wtq_msq_driver_ops(void)
     static const wtq_driver_ops_t ops = {
         .open_uni = op_open_uni,
         .send = op_send,
+        /* RECV_FLOW_CONTROLLED: pause keeps per-stream logical state and a
+         * RECEIVE already queued behind it is arrested synchronously
+         * (accepted with zero bytes — MsQuic holds the bytes for in-order
+         * redelivery and does NOT extend receive credit while nothing is
+         * consumed), so a paused peer is eventually blocked by QUIC flow
+         * control, not merely unpumped. */
         .caps = WTQ_DCAP_SHUT_BIDI_SEND | WTQ_DCAP_SHUT_BIDI_RECV |
-                WTQ_DCAP_SHUT_SPLIT_CODES,
+                WTQ_DCAP_SHUT_SPLIT_CODES | WTQ_DCAP_RECV_FLOW_CONTROLLED,
         .shutdown_stream = op_shutdown_stream,
         .conn_close = op_conn_close,
         .open_bidi = op_open_bidi,

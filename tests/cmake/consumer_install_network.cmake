@@ -7,7 +7,7 @@
 #   4. deleting the component's targets file makes REQUIRED COMPONENTS
 #      network fail with the config's missing-component message;
 #   5. the install tree ships no probe/test/internal files, and the
-#      installed archive exports exactly the nine public functions and
+#      installed archive exports exactly the twelve public functions and
 #      zero test seams/diagnostics.
 #
 # Args (all -D): BUILD (wtquic build dir), SRC (consumer source dir),
@@ -71,7 +71,8 @@ endif()
 set(_api wtq_nw_conn_cfg_init wtq_nw_conn_create wtq_nw_conn_retain
          wtq_nw_conn_release wtq_nw_conn_post wtq_nw_conn_is_on_domain
          wtq_nw_conn_session wtq_nw_conn_stop_begin wtq_nw_conn_join
-         wtq_nw_conn_doorbell_ring)
+         wtq_nw_conn_doorbell_ring wtq_nw_conn_doorbell_ring_after
+         wtq_nw_conn_doorbell_cancel_after)
 foreach(_sym IN LISTS _api)
     if(NOT _nm MATCHES "T _${_sym}\n")
         message(FATAL_ERROR "installed archive missing public: ${_sym}")
@@ -80,9 +81,9 @@ endforeach()
 string(REGEX MATCHALL "T _wtq_nw_[a-z0-9_]+" _nw_defs "${_nm}")
 list(REMOVE_DUPLICATES _nw_defs)
 list(LENGTH _nw_defs _nw_count)
-if(NOT _nw_count EQUAL 10)
+if(NOT _nw_count EQUAL 12)
     message(FATAL_ERROR
-        "installed wtq_nw_* surface is ${_nw_count}, expected exactly 10: "
+        "installed wtq_nw_* surface is ${_nw_count}, expected exactly 12: "
         "${_nw_defs}")
 endif()
 

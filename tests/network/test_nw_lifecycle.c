@@ -1263,9 +1263,23 @@ struct bell {
     int reentered;
     int fired_after_stop; /* delivery after on_stopped (must stay 0)   */
     int ring_inside;      /* one-shot: the delivery rings once more    */
+    uint64_t last_fire_us; /* CLOCK_MONOTONIC us of the latest delivery */
     struct obs *o;
     wtq_nw_conn_t *conn;
 };
+
+/* CLOCK_UPTIME_RAW microseconds — the host-uptime base the delayed
+ * doorbell arms and compares against (matching dispatch timer fire time),
+ * so a fire timestamp is comparable to a deadline the test computes from
+ * this clock. Deliberately NOT CLOCK_MONOTONIC (sleep-inclusive on
+ * Darwin). */
+static uint64_t uptime_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 static void bell_init(struct bell *b, struct obs *o)
 {
@@ -1291,6 +1305,7 @@ static void bell_cb(void *ctx)
     if (b->in_fire > 1)
         b->reentered++;
     b->fires++;
+    b->last_fire_us = uptime_us();
     if (b->ring_inside != 0) {
         b->ring_inside = 0;
         ring_target = b->conn;
@@ -1801,6 +1816,912 @@ static int t_doorbell_cfg_prefix(void)
     return failures;
 }
 
+/* --- delayed doorbell (one-shot preallocated timer) -------------------------- */
+
+#define MS_US(ms) ((uint64_t)(ms) * 1000u)
+
+static uint64_t bell_last_fire_us(struct bell *b)
+{
+    pthread_mutex_lock(&b->mu);
+    uint64_t v = b->last_fire_us;
+    pthread_mutex_unlock(&b->mu);
+    return v;
+}
+
+/*
+ * Handler-entry gate for the delayed-doorbell timer. Installed as
+ * wtq_nw_test_bell_timer_gate; it runs at the top of the timer handler
+ * (ON the domain), BEFORE the armed/deadline state check. While hold is
+ * set it blocks the handler causally so a test can reprogram or cancel
+ * the arm from another thread and observe the stale/armed gating without
+ * relying on sleeps. Once released (hold cleared) later entries pass
+ * straight through, so the reprogrammed fire is not re-gated.
+ */
+struct hgate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int entered;
+    int hold;
+};
+
+static void hgate_init(struct hgate *g)
+{
+    pthread_mutex_init(&g->mu, NULL);
+    pthread_cond_init(&g->cv, NULL);
+    g->entered = 0;
+    g->hold = 1;
+}
+
+static void hgate_destroy(struct hgate *g)
+{
+    pthread_mutex_destroy(&g->mu);
+    pthread_cond_destroy(&g->cv);
+}
+
+static void hgate_fn(void *ctx)
+{
+    struct hgate *g = ctx;
+    struct timespec dl;
+
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += WAIT_MS / 1000;
+    pthread_mutex_lock(&g->mu);
+    g->entered++;
+    pthread_cond_broadcast(&g->cv);
+    while (g->hold)
+        if (pthread_cond_timedwait(&g->cv, &g->mu, &dl) == ETIMEDOUT)
+            break;
+    pthread_mutex_unlock(&g->mu);
+}
+
+static bool hgate_wait_entered(struct hgate *g, int min)
+{
+    struct timespec dl;
+
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += WAIT_MS / 1000;
+    pthread_mutex_lock(&g->mu);
+    while (g->entered < min)
+        if (pthread_cond_timedwait(&g->cv, &g->mu, &dl) == ETIMEDOUT)
+            break;
+    bool ok = g->entered >= min;
+    pthread_mutex_unlock(&g->mu);
+    return ok;
+}
+
+static void hgate_release(struct hgate *g)
+{
+    pthread_mutex_lock(&g->mu);
+    g->hold = 0;
+    pthread_cond_broadcast(&g->cv);
+    pthread_mutex_unlock(&g->mu);
+}
+
+/* 1: a delayed ring fires exactly once, no earlier than the deadline. */
+static int t_bell_after_basic(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    uint64_t t0 = uptime_us();
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(60)), (int)WTQ_OK);
+    /* not before the deadline */
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0);
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    /* the delivery timestamp is at or after the requested deadline */
+    WTQ_TEST_CHECK(bell_last_fire_us(&b) - t0 >= MS_US(60));
+    /* a domain barrier past the fire: exactly one, no repeat */
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    WTQ_TEST_CHECK_EQ_INT(b.reentered, 0);
+    WTQ_TEST_CHECK_EQ_INT(b.fired_after_stop, 0);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_basic\n");
+    return failures;
+}
+
+/* 2: a replacing arm supersedes the previous one — only the replacement
+ * governs. Arm short, replace with long BEFORE the short elapses: no fire
+ * at the short deadline, exactly one fire at the long deadline. */
+static int t_bell_after_replace(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    uint64_t t0 = uptime_us();
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(40)), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(180)), (int)WTQ_OK);
+    /* wait well past the superseded short deadline: still silent */
+    struct timespec ts = { 0, 90 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0);
+    /* the replacement governs: one fire, at/after the long deadline */
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    WTQ_TEST_CHECK(bell_last_fire_us(&b) - t0 >= MS_US(180));
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_replace\n");
+    return failures;
+}
+
+/* 3: a stale queued handler (from a superseded shorter arm) must NOT
+ * promote the newer, later arm early. Hold an entered handler at the
+ * gate, rearm to a later deadline, release: the stale event is dropped
+ * by the absolute-deadline check, and the newer arm fires on its own
+ * schedule. RED: removing that comparison promotes early. */
+static int t_bell_after_stale(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    struct hgate g;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    hgate_init(&g);
+    wtq_nw_test_bell_timer_gate = hgate_fn;
+    wtq_nw_test_bell_timer_gate_ctx = &g;
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    uint64_t t0 = uptime_us();
+    /* short arm; its handler enters the gate and blocks */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(15)), (int)WTQ_OK);
+    /* MANDATORY prerequisite: the stale handler must actually be entered
+     * and blocked before we rearm, or the test proves nothing */
+    bool entered = hgate_wait_entered(&g, 1);
+    WTQ_TEST_CHECK(entered);
+    if (entered) {
+        /* reprogram to a far later deadline while the handler is held */
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(400)),
+            (int)WTQ_OK);
+        hgate_release(&g); /* only NOW is the stale handler released */
+        /* the released stale handler returns without promoting: a domain
+         * barrier drains past it, and no later fire is due yet */
+        _Atomic int flag = 0;
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                              (int)WTQ_OK);
+        WTQ_TEST_CHECK(barrier_wait(&flag));
+        WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0); /* NOT promoted early */
+        /* the genuine, later arm still fires exactly once */
+        WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+        WTQ_TEST_CHECK(bell_last_fire_us(&b) - t0 >= MS_US(400));
+        _Atomic int flag2 = 0;
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag2),
+                              (int)WTQ_OK);
+        WTQ_TEST_CHECK(barrier_wait(&flag2));
+        WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+    } else {
+        hgate_release(&g); /* never hang the domain on a missed entry */
+    }
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    wtq_nw_test_bell_timer_gate = NULL;
+    wtq_nw_test_bell_timer_gate_ctx = NULL;
+    hgate_destroy(&g);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_stale\n");
+    return failures;
+}
+
+/* 4: cancel_after on an expired-but-held handler prevents its promotion.
+ * Hold an entered handler at the gate, cancel, release: the armed-state
+ * check drops it, and no callback ever runs. RED: ignoring armed state
+ * promotes it anyway. */
+static int t_bell_after_cancel_queued(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    struct hgate g;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    hgate_init(&g);
+    wtq_nw_test_bell_timer_gate = hgate_fn;
+    wtq_nw_test_bell_timer_gate_ctx = &g;
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(15)), (int)WTQ_OK);
+    /* MANDATORY prerequisite: the handler must be entered and blocked
+     * before we cancel, or the armed-state drop is never exercised */
+    bool entered = hgate_wait_entered(&g, 1);
+    WTQ_TEST_CHECK(entered);
+    if (entered) {
+        wtq_nw_conn_doorbell_cancel_after(c); /* disarm while it waits */
+        hgate_release(&g); /* only NOW is the handler released */
+        /* drain the domain twice and confirm no delivery */
+        _Atomic int flag = 0;
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                              (int)WTQ_OK);
+        WTQ_TEST_CHECK(barrier_wait(&flag));
+        struct timespec ts = { 0, 40 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        _Atomic int flag2 = 0;
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag2),
+                              (int)WTQ_OK);
+        WTQ_TEST_CHECK(barrier_wait(&flag2));
+        WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0);
+    } else {
+        hgate_release(&g); /* never hang the domain on a missed entry */
+    }
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    wtq_nw_test_bell_timer_gate = NULL;
+    wtq_nw_test_bell_timer_gate_ctx = NULL;
+    hgate_destroy(&g);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_cancel_queued\n");
+    return failures;
+}
+
+/* 5: delay_us == 0 replaces a pending arm and promotes one deferred
+ * immediate delivery — no second delivery at the superseded deadline. */
+static int t_bell_after_zero(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(80)), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_OK);
+    /* the promotion delivers promptly */
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    /* wait past the superseded 80ms arm: no second delivery */
+    struct timespec ts = { 0, 140 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    WTQ_TEST_CHECK_EQ_INT(b.reentered, 0);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_zero\n");
+    return failures;
+}
+
+/* 6: a pending arm never delivers across stop/join; ring_after on the
+ * retained post-join handle returns CLOSED and cancel_after is harmless. */
+static int t_bell_after_stop(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    /* arm far out, then stop before it can fire */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(10000)), (int)WTQ_OK);
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(o.stopped, 1);
+    /* no timer/doorbell delivery during or after on_stopped */
+    WTQ_TEST_CHECK_EQ_INT(b.fired_after_stop, 0);
+    /* the retained post-join handle: arm is CLOSED, cancel is a no-op */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(10)),
+        (int)WTQ_ERR_CLOSED);
+    wtq_nw_conn_doorbell_cancel_after(c);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_ERR_CLOSED);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    WTQ_TEST_CHECK_EQ_INT(b.fired_after_stop, 0);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_stop\n");
+    return failures;
+}
+
+/* 7: threads hammer arm/replace/cancel while stop races — accepted
+ * transitions stay race-free and nothing delivers after on_stopped.
+ * (Runs under the TSan lane.) */
+static _Atomic int g_after_hammer_stop;
+
+static void *after_arm_main(void *arg)
+{
+    wtq_nw_conn_t *c = arg;
+    uint64_t d = 0;
+
+    while (!atomic_load(&g_after_hammer_stop)) {
+        (void)wtq_nw_conn_doorbell_ring_after(c, (d % 3) * MS_US(5));
+        d++;
+    }
+    return NULL;
+}
+
+static void *after_cancel_main(void *arg)
+{
+    wtq_nw_conn_t *c = arg;
+
+    while (!atomic_load(&g_after_hammer_stop))
+        wtq_nw_conn_doorbell_cancel_after(c);
+    return NULL;
+}
+
+static int t_bell_after_stop_race(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+    pthread_t th[2];
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+    atomic_store(&g_after_hammer_stop, 0);
+    WTQ_TEST_CHECK_EQ_INT(pthread_create(&th[0], NULL, after_arm_main, c), 0);
+    WTQ_TEST_CHECK_EQ_INT(pthread_create(&th[1], NULL, after_cancel_main, c),
+                          0);
+    struct timespec ts = { 0, 20 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    atomic_store(&g_after_hammer_stop, 1);
+    pthread_join(th[0], NULL);
+    pthread_join(th[1], NULL);
+    WTQ_TEST_CHECK_EQ_INT(b.fired_after_stop, 0);
+    /* post-join arms/cancels stay harmless */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(5)),
+        (int)WTQ_ERR_CLOSED);
+    wtq_nw_conn_doorbell_cancel_after(c);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_stop_race\n");
+    return failures;
+}
+
+/* 8: arm/replace/zero-delay/cancel all issued from ON the domain (a
+ * posted job) — no deadlock, and no inline on_doorbell delivery. */
+struct dom_calls {
+    wtq_nw_conn_t *c;
+    struct bell *b;
+    int fires_entry;
+    int fires_exit;
+    int rc_a;
+    int rc_b;
+    int rc_zero;
+    _Atomic int done;
+};
+
+static void dom_calls_job(void *ctx)
+{
+    struct dom_calls *d = ctx;
+
+    d->fires_entry = bell_fires(d->b);
+    d->rc_a = (int)wtq_nw_conn_doorbell_ring_after(d->c, MS_US(50));
+    d->rc_b = (int)wtq_nw_conn_doorbell_ring_after(d->c, MS_US(30));
+    d->rc_zero = (int)wtq_nw_conn_doorbell_ring_after(d->c, 0);
+    wtq_nw_conn_doorbell_cancel_after(d->c);
+    d->fires_exit = bell_fires(d->b);
+    atomic_store(&d->done, 1);
+}
+
+static int t_bell_after_on_domain(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    struct dom_calls d;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    memset(&d, 0, sizeof(d));
+    d.c = c;
+    d.b = &b;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, dom_calls_job, &d),
+                          (int)WTQ_OK);
+    /* no deadlock: the job completes */
+    for (int i = 0; i < WAIT_MS / 10 && !atomic_load(&d.done); i++) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    WTQ_TEST_CHECK(atomic_load(&d.done));
+    WTQ_TEST_CHECK_EQ_INT(d.rc_a, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(d.rc_b, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(d.rc_zero, (int)WTQ_OK);
+    /* no inline delivery: on_doorbell did not run within the job */
+    WTQ_TEST_CHECK_EQ_INT(d.fires_entry, d.fires_exit);
+    /* the zero-delay promotion delivers once, deferred, after the job */
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+    WTQ_TEST_CHECK_EQ_INT(b.reentered, 0);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_on_domain\n");
+    return failures;
+}
+
+/* 9: NULL and unconfigured surfaces; the earliest published handle arms. */
+static wtq_nw_conn_t **g_after_earliest_slot;
+static _Atomic int g_after_earliest_rc;
+
+static void after_earliest_hook(void *ctx)
+{
+    (void)ctx;
+    if (g_after_earliest_slot != NULL && *g_after_earliest_slot != NULL)
+        atomic_store(&g_after_earliest_rc,
+                     (int)wtq_nw_conn_doorbell_ring_after(
+                         *g_after_earliest_slot, MS_US(10)));
+}
+
+static int t_bell_after_config(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    /* NULL handle */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(NULL, MS_US(10)),
+        (int)WTQ_ERR_INVALID_ARG);
+    wtq_nw_conn_doorbell_cancel_after(NULL); /* no-op, no crash */
+
+    /* unconfigured doorbell: no on_doorbell -> UNSUPPORTED */
+    obs_init(&o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up(&o, NULL, &c), (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(10)),
+        (int)WTQ_ERR_UNSUPPORTED);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_ERR_UNSUPPORTED);
+    wtq_nw_conn_doorbell_cancel_after(c); /* harmless on unconfigured */
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    obs_destroy(&o);
+    c = NULL;
+
+    /* earliest published handle can arm the already-activated timer */
+    obs_init(&o);
+    bell_init(&b, &o);
+    g_after_earliest_slot = &c;
+    atomic_store(&g_after_earliest_rc, -12345);
+    wtq_nw_test_on_earliest = after_earliest_hook;
+    wtq_nw_test_on_earliest_ctx = NULL;
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    wtq_nw_test_on_earliest = NULL;
+    wtq_nw_test_on_earliest_ctx = NULL;
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    WTQ_TEST_CHECK_EQ_INT(atomic_load(&g_after_earliest_rc), (int)WTQ_OK);
+    g_after_earliest_slot = NULL;
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_config\n");
+    return failures;
+}
+
+/* 10: arm/rearm/cancel are allocation-free — with the backend allocator
+ * rejecting all requests, they still work and attempt zero allocations. */
+static int t_bell_after_no_alloc(void)
+{
+    int failures = 0;
+    wtq_alloc_t alloc = { NULL, fa_alloc, fa_realloc, fa_free };
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    fa_arm(-1, 0);
+    wtq_nw_test_backend_alloc = &alloc;
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    fa_arm(0, 1000000);
+    long before = fa_calls();
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(200)), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(30)), (int)WTQ_OK);
+    wtq_nw_conn_doorbell_cancel_after(c);
+    WTQ_TEST_CHECK_EQ_INT((int)(fa_calls() - before), 0);
+    /* a final arm still delivers, allocation-free */
+    before = fa_calls();
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, MS_US(20)), (int)WTQ_OK);
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    WTQ_TEST_CHECK_EQ_INT((int)(fa_calls() - before), 0);
+    fa_arm(-1, 0);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    wtq_nw_test_backend_alloc = NULL;
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_no_alloc\n");
+    return failures;
+}
+
+/* 11: two zero-delay promotions in a row coalesce into ONE delivery on
+ * the shared immediate source, non-reentrant. */
+static int t_bell_after_zero_coalesce(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    struct gate g = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+                      0, 1 };
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    /* block the domain, promote twice, release: the merges collapse */
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, gate_job, &g),
+                          (int)WTQ_OK);
+    gate_wait_in(&g);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_OK);
+    gate_open(&g);
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+    WTQ_TEST_CHECK_EQ_INT(b.reentered, 0);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_zero_coalesce\n");
+    return failures;
+}
+
+/* 12: a preallocated timer is torn down on the construction rollback
+ * path (session creation fails after the doorbell + timer are built) —
+ * no leak, no crash. Complements the stop/join teardown in test 6. */
+static int t_bell_after_rollback(void)
+{
+    int failures = 0;
+    wtq_alloc_t alloc = { NULL, fa_alloc, fa_realloc, fa_free };
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    long base = fa_live();
+    /* the caller session-object allocation fails: construction rolls the
+     * doorbell + timer back through nw_doorbell_teardown */
+    fa_arm(0, 1);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, &alloc, &c),
+                          (int)WTQ_ERR_NOMEM);
+    WTQ_TEST_CHECK(c == NULL);
+    WTQ_TEST_CHECK_EQ_INT((int)(fa_live() - base), 0);
+    fa_arm(-1, 0);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_rollback\n");
+    return failures;
+}
+
+/* 13: the delayed doorbell arms/compares against the host-uptime clock
+ * (matching dispatch's timer base), NOT the sleep-inclusive CLOCK_
+ * MONOTONIC. RED: switching NW_DOORBELL_CLOCK back to CLOCK_MONOTONIC
+ * flips this accessor and fails the assertion. */
+static int t_bell_after_clock(void)
+{
+    int failures = 0;
+
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_test_bell_clock(),
+                          (int)CLOCK_UPTIME_RAW);
+    if (failures == 0)
+        printf("PASS: bell_after_clock\n");
+    return failures;
+}
+
+/* 14: a timer-source creation failure rolls the already-created immediate
+ * source back through the common teardown — live-source count and backend
+ * allocation both return to baseline, no callback — and the seam is
+ * one-shot. RED: neuter the immediate-source cleanup on that path and the
+ * live-source balance fails. */
+static int t_bell_after_timer_create_fail(void)
+{
+    int failures = 0;
+    wtq_alloc_t alloc = { NULL, fa_alloc, fa_realloc, fa_free };
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    wtq_nw_test_backend_alloc = &alloc;
+    fa_arm(-1, 0);
+    int src_base = atomic_load(&wtq_nw_test_live_sources);
+    long alloc_base = fa_live();
+    wtq_nw_test_fail_next_timer_src = 1;
+    /* doorbell configured -> both sources are built; the timer create
+     * fails and the immediate source rolls back */
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_ERR_BACKEND);
+    WTQ_TEST_CHECK(c == NULL);
+    WTQ_TEST_CHECK_EQ_INT(
+        atomic_load(&wtq_nw_test_live_sources) - src_base, 0);
+    WTQ_TEST_CHECK_EQ_INT((int)(fa_live() - alloc_base), 0);
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0);
+    /* the seam is one-shot: a normal create now succeeds and runs down */
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    if (c != NULL) {
+        WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+        WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+        wtq_nw_conn_release(c);
+        WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+        /* every source built by the successful create is back down too */
+        WTQ_TEST_CHECK_EQ_INT(
+            atomic_load(&wtq_nw_test_live_sources) - src_base, 0);
+    }
+    wtq_nw_test_backend_alloc = NULL;
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_timer_create_fail\n");
+    return failures;
+}
+
+/* 15: the delay clamp saturates — UINT64_MAX cannot wrap the ns delta or
+ * the stored deadline, a saturating arm is not an immediate ring, and it
+ * stays cancelable and replaceable by ring_after(0). RED: drop the clamp
+ * and the boundary asserts fail. */
+static int t_bell_after_saturation(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+    const uint64_t max_eff = (uint64_t)INT64_MAX / 1000u;
+
+    /* pure clamp seams (no connection needed) */
+    WTQ_TEST_CHECK(wtq_nw_test_bell_effective_delay_us(UINT64_MAX) == max_eff);
+    WTQ_TEST_CHECK(wtq_nw_test_bell_effective_delay_us(0) == 0);
+    WTQ_TEST_CHECK(wtq_nw_test_bell_effective_delay_us(1000) == 1000);
+    /* the ns conversion cannot overflow a signed dispatch delta */
+    WTQ_TEST_CHECK(wtq_nw_test_bell_effective_delay_us(UINT64_MAX) * 1000u
+                   <= (uint64_t)INT64_MAX);
+    /* the stored deadline saturates instead of wrapping */
+    WTQ_TEST_CHECK(wtq_nw_test_bell_deadline_us(UINT64_MAX - 5, max_eff)
+                   == UINT64_MAX);
+    WTQ_TEST_CHECK(wtq_nw_test_bell_deadline_us(0, 1000) == 1000);
+
+    /* live: a saturating arm is not an immediate ring, and remains
+     * cancelable / replaceable */
+    obs_init(&o);
+    bell_init(&b, &o);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    uint64_t t0 = uptime_us();
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, UINT64_MAX), (int)WTQ_OK);
+    wtq_nw_test_bell_snapshot_t snap;
+    wtq_nw_test_bell_snapshot(c, &snap);
+    WTQ_TEST_CHECK(snap.armed);
+    /* the deadline sits out near the clamp, nowhere near now */
+    WTQ_TEST_CHECK(snap.deadline_us >= t0 + max_eff - MS_US(1000));
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 0); /* not an immediate ring */
+    /* cancelable */
+    wtq_nw_conn_doorbell_cancel_after(c);
+    wtq_nw_test_bell_snapshot(c, &snap);
+    WTQ_TEST_CHECK(!snap.armed);
+    /* re-arm huge, then ring_after(0) replaces and promotes it */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, UINT64_MAX), (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, 0), (int)WTQ_OK);
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_saturation\n");
+    return failures;
+}
+
+/* 16: the ordinary immediate ring is INDEPENDENT of the delayed slot — it
+ * neither arms nor cancels it. Arm a saturating delayed ring (so it cannot
+ * naturally expire during the test), fire the ordinary doorbell, and
+ * require the delayed arm and its exact deadline survive byte-for-byte;
+ * only cancel_after clears it. RED: making ring() clear the delayed slot
+ * fails the post-ring snapshot. */
+static int t_bell_after_ring_independent(void)
+{
+    int failures = 0;
+    struct obs o;
+    struct bell b;
+    wtq_nw_conn_t *c = NULL;
+
+    obs_init(&o);
+    bell_init(&b, &o);
+    int src_base = atomic_load(&wtq_nw_test_live_sources);
+    WTQ_TEST_CHECK_EQ_INT((int)client_up_bell(&o, &b, NULL, &c),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(obs_wait(&o, &o.established));
+
+    /* arm a delayed ring that cannot naturally expire during the test */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_nw_conn_doorbell_ring_after(c, UINT64_MAX), (int)WTQ_OK);
+    wtq_nw_test_bell_snapshot_t before;
+    wtq_nw_test_bell_snapshot(c, &before);
+    WTQ_TEST_CHECK(before.armed);
+
+    /* the ordinary immediate ring delivers exactly once, independently */
+    wtq_nw_conn_doorbell_ring(c);
+    WTQ_TEST_CHECK(bell_wait_fires(&b, 1));
+    _Atomic int flag = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+
+    /* the delayed arm is UNTOUCHED: still armed, exact same deadline */
+    wtq_nw_test_bell_snapshot_t after;
+    wtq_nw_test_bell_snapshot(c, &after);
+    WTQ_TEST_CHECK(after.armed);
+    WTQ_TEST_CHECK(after.deadline_us == before.deadline_us);
+
+    /* only cancel_after clears it — no second callback follows */
+    wtq_nw_conn_doorbell_cancel_after(c);
+    wtq_nw_test_bell_snapshot(c, &after);
+    WTQ_TEST_CHECK(!after.armed);
+    _Atomic int flag2 = 0;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_post(c, barrier_job, &flag2),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK(barrier_wait(&flag2));
+    WTQ_TEST_CHECK_EQ_INT(bell_fires(&b), 1);
+
+    WTQ_TEST_CHECK(wtq_nw_conn_stop_begin(c));
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_join(c), (int)WTQ_OK);
+    wtq_nw_conn_release(c);
+    WTQ_TEST_CHECK(wait_root_gone(WAIT_MS));
+    /* source + root balance for this case */
+    WTQ_TEST_CHECK_EQ_INT(
+        atomic_load(&wtq_nw_test_live_sources) - src_base, 0);
+    bell_destroy(&b);
+    obs_destroy(&o);
+    if (failures == 0)
+        printf("PASS: bell_after_ring_independent\n");
+    return failures;
+}
+
 static int t_earliest_callback_publication(void)
 {
     int failures = 0;
@@ -1888,11 +2809,31 @@ int main(void)
     failures += t_doorbell_stop_race();
     failures += t_doorbell_earliest();
     failures += t_doorbell_cfg_prefix();
+    failures += t_bell_after_basic();
+    failures += t_bell_after_replace();
+    failures += t_bell_after_stale();
+    failures += t_bell_after_cancel_queued();
+    failures += t_bell_after_zero();
+    failures += t_bell_after_stop();
+    failures += t_bell_after_stop_race();
+    failures += t_bell_after_on_domain();
+    failures += t_bell_after_config();
+    failures += t_bell_after_no_alloc();
+    failures += t_bell_after_zero_coalesce();
+    failures += t_bell_after_rollback();
+    failures += t_bell_after_clock();
+    failures += t_bell_after_timer_create_fail();
+    failures += t_bell_after_saturation();
+    failures += t_bell_after_ring_independent();
     failures += t_trust_reject();
 
     wtq_msquic_listener_stop(g_listener);
     wtq_msquic_env_close(g_env);
     obs_destroy(&g_sv);
+
+    /* whole-battery doorbell source accounting: every connection built
+     * across every case is gone, so no immediate/timer source may leak */
+    WTQ_TEST_CHECK_EQ_INT(atomic_load(&wtq_nw_test_live_sources), 0);
 
     if (failures > 0) {
         fprintf(stderr, "FAILED: test_nw_lifecycle (%d)\n", failures);

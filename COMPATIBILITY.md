@@ -101,6 +101,32 @@ consumer that needs accepted-means-delivered semantics should request
 a separate result-returning primitive rather than assume it of the
 doorbell.
 
+`wtq_nw_conn_doorbell_ring_after()` / `wtq_nw_conn_doorbell_cancel_after()`
+schedule that SAME doorbell on a delay from a one-shot
+`DISPATCH_SOURCE_TYPE_TIMER` on the connection domain, preallocated at
+connection construction — no per-arm wtquic object, no callback closure,
+no configured/backend allocator call, no timer thread (no claim is made
+about libdispatch's own internals). The delay is measured in host uptime
+(`CLOCK_UPTIME_RAW`, the base a default dispatch timer fires against, so a
+suspended system does not consume it — deliberately not the sleep-
+inclusive `CLOCK_MONOTONIC`). It rings `on_doorbell`; it does not itself
+service the session or infer any application deadline. Both calls are
+legal only while the caller owns a valid retained handle (NULL is the
+documented result/no-op; a released or stale pointer is invalid). There
+is exactly ONE delayed slot: a successful arm REPLACES the previous one
+(only the latest governs delivery), `cancel_after` clears an
+unpromoted arm, and `delay_us == 0` promotes directly into the immediate
+doorbell (a deferred domain delivery, never inline). The ordinary
+`wtq_nw_conn_doorbell_ring()` neither arms nor cancels the delayed slot.
+`ring_after` returns `WTQ_OK` when armed (armed ≠ delivered — the arm may
+still be replaced, canceled, coalesced, or absorbed by teardown),
+`WTQ_ERR_INVALID_ARG` on a NULL handle, `WTQ_ERR_UNSUPPORTED` when no
+doorbell was configured, and `WTQ_ERR_CLOSED` after `stop_begin`; the
+scheduled ring, like the immediate one, never runs during or after
+`on_stopped`, and `cancel_after` is an idempotent no-op on a
+NULL/unconfigured/stopped/post-join handle. Both are callable from any
+thread, including the domain.
+
 ## Network.framework ready-transition stream drop (measured)
 
 macOS 15's Network.framework QUIC intermittently DROPS a
@@ -205,12 +231,56 @@ transport events that Network.framework did not report.
 - A locally extracted stream has no native QUIC id before it is started;
   metadata and the id arrive asynchronously at `ready`. Consequently,
   `wtq_stream_id()` may return `WTQ_STREAM_ID_UNKNOWN` until then.
+- Network.framework can deliver a stream's `ready` state with the QUIC
+  metadata (and so the id) ABSENT inside that callback frame. Measured
+  (366 events over 780 loopback-gate iterations): every such ready was
+  STALE — it raced the stream's own failure/cancellation, the stream was
+  dead by the next serialization-domain turn, and the metadata never
+  materialized later. The backend therefore processes a metadata-less
+  ready in two stages: notified in the callback, processed one domain
+  turn later — a stream found dying then belongs to its failure path
+  (the connection stays up; this raced-ready previously killed the whole
+  connection), a stream found alive with metadata processes normally
+  (late id report, sends, stamped deferred cancels), and a live stream
+  STILL without metadata remains the deterministic connection-fatal
+  backend invariant. Stamped cancels and the send pump key off the
+  processed stage, so an abort in the one-turn window keeps its exact
+  application error code.
 - `nw_quic_get_stream_type()` has reported a peer-initiated
   unidirectional stream as a datagram flow. The backend classifies inbound
   streams from the QUIC stream-id bits instead.
 - A peer's `STOP_SENDING` and its application code have no public receive
   signal. The backend never infers one. Local stream cancellation retires
   blocked sends and supplies the bounded cleanup path.
+- **Receive pause arrests application delivery, not transport-level peer
+  backpressure.** `wtq_stream_pause_receive()` stops the engine and the
+  application from seeing further bytes (the one already-armed receive
+  completion is held in the backend and replayed on resume; no new receive
+  is armed). It does NOT impose a hard flow-control bound on the peer: the
+  public initial-window setters (`nw_quic_set_initial_max_data`,
+  `nw_quic_set_initial_max_stream_data_*`) are *initial* values that
+  Network.framework auto-tunes upward, and the framework buffers and ACKs
+  received data well past them. Measured: with a 64 KiB advertised
+  connection window and a paused stream that delivered nothing to the app,
+  a ~500 KiB peer response still completed (was fully ACKed) at the
+  transport. So a paused wtquic peer is bounded only by Network.framework's
+  internal receive buffering, not by the advertised window. This is a
+  documented parity exception; no private API is used to close it. The
+  distinction is exposed programmatically, not only in prose:
+  `wtq_stream_receive_pause_mode()` reports
+  `WTQ_RECEIVE_PAUSE_DELIVERY_ONLY` for the Network backend and
+  `WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED` for the MsQuic backend, so a
+  bounded-memory caller can decide (accept delivery isolation vs.
+  reject/close) instead of assuming a guarantee the header does not make.
+  MsQuic earns `FLOW_CONTROLLED` through its logical receive-pause:
+  `StreamReceiveSetEnabled(FALSE)` alone is asynchronous (a RECEIVE already
+  queued behind it still fires), so the backend keeps per-stream pause
+  state and arrests a queued data RECEIVE synchronously by accepting zero
+  bytes — MsQuic holds those bytes for in-order redelivery on resume and
+  extends no receive credit while nothing is consumed, so a paused peer is
+  eventually blocked by QUIC flow control. The capability is a driver bit
+  (`WTQ_DCAP_RECV_FLOW_CONTROLLED`) each backend must earn; both backends'
+  loopback suites assert their advertised mode against the real transport.
 - Stamping group metadata and cancelling the group did not put an
   application-level CONNECTION_CLOSE code on the wire; the peer observed
   a transport close with code zero. The backend therefore does not claim

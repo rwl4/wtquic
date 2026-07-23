@@ -1,8 +1,13 @@
 /*
- * MsQuic stream: the per-stream event handler. Receive is consume-all —
- * every byte MsQuic indicates is fed straight into the engine and the
- * event returns success, so MsQuic's own flow-control windows are the
- * only inbound throttle.
+ * MsQuic stream: the per-stream event handler. Receive is consume-all
+ * while running — every byte MsQuic indicates is fed straight into the
+ * engine and the event returns success — except when the app has logically
+ * paused the stream (wtq_stream_pause_receive). While paused, a data-
+ * bearing RECEIVE is arrested by accepting zero bytes so MsQuic holds it
+ * for in-order redelivery on resume, and a graceful FIN with nothing to
+ * redeliver is deferred and replayed on resume; nothing reaches the engine
+ * until resume. Otherwise MsQuic's own flow-control windows are the only
+ * inbound throttle.
  *
  * A backend stream's transport life ends at its SHUTDOWN_COMPLETE
  * (StreamClose there); the struct survives until the connection sweep
@@ -113,11 +118,37 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         break;
 
     case QUIC_STREAM_EVENT_RECEIVE: {
+        bool fin = (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+
+        /*
+         * Logical pause arrest. StreamReceiveSetEnabled(FALSE) is
+         * asynchronous, so this RECEIVE may have been queued behind the
+         * app's pause. While logically paused NOTHING reaches the engine:
+         *  - a data-bearing receive is rejected by accepting zero bytes,
+         *    so MsQuic holds the unconsumed bytes (and any FIN riding
+         *    them) and stops indicating RECEIVE until resume, at which
+         *    point they redeliver exactly once, in order;
+         *  - a pure zero-byte FIN carries no data to hold and MsQuic will
+         *    not re-indicate it, so the backend remembers it and replays
+         *    it to the engine on resume.
+         * The bytes of a receive ALREADY being processed are untouched —
+         * this only arrests the queued-later events the public pause must
+         * stop.
+         */
+        if (ds->recv_disabled) {
+            if (ev->RECEIVE.BufferCount > 0) {
+                ds->recv_held_data = true;
+                ev->RECEIVE.TotalBufferLength = 0;
+            } else if (fin) {
+                ds->fin_pending = true;
+            }
+            break;
+        }
+
         /* consume-all: feed every buffer, return success */
         if (ds->ectx == NULL || drv->session == NULL)
             break; /* engine refused the stream: discard the bytes */
 
-        bool fin = (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
         wtq_conn_t *ec = wtq_api_session_conn(drv->session);
 
         wtq_api_session_enter(drv->session);
@@ -147,11 +178,25 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
 
     case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
         /* graceful end of the peer's send direction; the FIN usually
-         * already arrived on a RECEIVE */
+         * already arrived on a RECEIVE. While paused nothing is delivered:
+         * if data is held for redelivery the FIN rides it on resume, so
+         * only a shutdown with nothing held needs the backend to remember
+         * the FIN and replay it on resume. */
+        if (ds->recv_disabled) {
+            if (!ds->recv_held_data)
+                ds->fin_pending = true;
+            break;
+        }
         stream_feed_fin(ds);
         break;
 
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+        /* the peer aborted its send: the receive direction is terminal,
+         * any held-back bytes are discarded, and no resume is owed — clear
+         * the logical pause and any deferred FIN so nothing lingers */
+        ds->recv_disabled = false;
+        ds->recv_held_data = false;
+        ds->fin_pending = false;
         if (ds->ectx != NULL && drv->session != NULL) {
             wtq_api_session_enter(drv->session);
             (void)wtq_conn_on_stream_reset(

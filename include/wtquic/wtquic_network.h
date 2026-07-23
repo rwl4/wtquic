@@ -170,6 +170,68 @@ WTQ_API wtq_result_t wtq_nw_conn_create(const wtq_nw_conn_cfg_t *cfg,
  */
 WTQ_API void wtq_nw_conn_doorbell_ring(wtq_nw_conn_t *c);
 
+/*
+ * Schedule the SAME configured doorbell (cfg.on_doorbell) to ring once
+ * after delay_us microseconds, without allocating a callback closure or
+ * a timer thread — the timer is preallocated with the doorbell. This
+ * arms on_doorbell on the domain; it does NOT itself call any wtquic
+ * session service, and it infers no application deadline. What runs
+ * after the delay is exactly the immediate doorbell delivery.
+ *
+ * There is exactly ONE delayed slot per connection. A successful call
+ * REPLACES any previous delayed arm (only the latest governs delivery);
+ * wtq_nw_conn_doorbell_cancel_after() clears it. The ordinary
+ * wtq_nw_conn_doorbell_ring() is independent — it neither arms nor
+ * cancels the delayed slot.
+ *
+ * Returns:
+ *   WTQ_ERR_INVALID_ARG  conn is NULL;
+ *   WTQ_ERR_CLOSED       stop_begin has latched (or a dead-but-valid
+ *                        post-join handle) — no arm is made;
+ *   WTQ_ERR_UNSUPPORTED  cfg.on_doorbell was not configured;
+ *   WTQ_OK               the delayed ring was armed.
+ * WTQ_OK means armed, NOT delivered: the arm may still be replaced,
+ * canceled, coalesced into the immediate doorbell, or absorbed by
+ * teardown before it fires. delay_us == 0 replaces/disarms any pending
+ * delayed arm and promotes directly into the immediate doorbell (a
+ * deferred delivery on the domain — never an inline on_doorbell call).
+ * The delay is measured in host uptime (a suspended system does not
+ * consume it); excessive delays are clamped to the largest representable
+ * timer value.
+ *
+ * ALLOCATION: no per-arm wtquic object and no callback closure are
+ * created, and no call is made through the configured/backend wtquic
+ * allocator — the timer source is preallocated at connection
+ * construction. (This makes no claim about libdispatch's own internals.)
+ *
+ * LIFETIME: legal only while the caller owns a valid, retained
+ * wtq_nw_conn_t. A NULL handle returns WTQ_ERR_INVALID_ARG; a released or
+ * otherwise stale pointer is invalid (undefined). A retained post-join
+ * handle stays safe and returns WTQ_ERR_CLOSED. Nonblocking and callable
+ * from any thread, INCLUDING the connection domain (a posted job or the
+ * doorbell callback itself). Like the immediate doorbell, the scheduled
+ * ring never runs during or after on_stopped.
+ */
+WTQ_API wtq_result_t wtq_nw_conn_doorbell_ring_after(wtq_nw_conn_t *conn,
+                                                     uint64_t delay_us);
+
+/*
+ * Cancel a pending delayed doorbell arm (from wtq_nw_conn_doorbell_ring_
+ * after). Idempotent: a no-op when nothing is armed, on an unconfigured
+ * doorbell, and on a NULL/stopped/post-join handle. It affects ONLY a
+ * delayed arm that has not yet been promoted — once the timer has merged
+ * the ring into the immediate doorbell, normal doorbell coalescing
+ * applies and this cannot retract it. It never touches the immediate
+ * wtq_nw_conn_doorbell_ring() path, and it makes no configured/backend
+ * allocator call.
+ *
+ * LIFETIME: like ring_after, legal only while the caller owns a valid,
+ * retained handle (NULL is the documented no-op; a released/stale pointer
+ * is invalid), from any thread including the domain; a retained post-join
+ * handle stays safe.
+ */
+WTQ_API void wtq_nw_conn_doorbell_cancel_after(wtq_nw_conn_t *conn);
+
 WTQ_API void wtq_nw_conn_retain(wtq_nw_conn_t *c);
 /*
  * Drop one reference (any thread; over-release is refused, not fatal).

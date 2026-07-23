@@ -49,5 +49,11 @@ int main()
     (void)WTQ_SEND_FIN;
     wtq_stream_set_user(stream, nullptr);
 
+    /* receive-pause mode query + enumerators are usable from C++17 */
+    if (wtq_stream_receive_pause_mode(stream) != WTQ_RECEIVE_PAUSE_UNSUPPORTED)
+        return 1;
+    (void)WTQ_RECEIVE_PAUSE_DELIVERY_ONLY;
+    (void)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
+
     return wtq_version() ? 0 : 1;
 }

@@ -268,6 +268,24 @@ struct wtq_dstream {
     bool is_local;
     bool is_bidi;
     bool fin_delivered;      /* engine got this stream's FIN already */
+    /* Logical receive-pause state. StreamReceiveSetEnabled(FALSE) is
+       asynchronous — MsQuic queues it, so a RECEIVE already behind it
+       still fires — so the backend keeps this flag to arrest such a
+       receive synchronously: while set, a data-bearing RECEIVE is
+       rejected (TotalBufferLength = 0) instead of fed to the engine, and
+       MsQuic holds the bytes for redelivery on resume. Published only
+       after a successful StreamReceiveSetEnabled submission. */
+    bool recv_disabled;
+    bool recv_held_data;     /* while paused, a data-bearing RECEIVE was
+                                arrested and left with MsQuic to redeliver
+                                on resume; its FIN (if any) rides those
+                                bytes, so a graceful shutdown seen while
+                                this is set owes no separate FIN */
+    bool fin_pending;        /* while paused, a FIN with nothing held to
+                                redeliver (a pure zero-byte FIN, or a
+                                PEER_SEND_SHUTDOWN with no held data) was
+                                deferred; the backend replays it to the
+                                engine exactly once on resume */
 };
 
 /* Backend connection context (the driver SPI's wtq_driver_t). */

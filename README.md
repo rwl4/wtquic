@@ -245,6 +245,14 @@ wtq_nw_conn_post(conn, fn, ctx); /* run fn(ctx) on the domain:
    node per submission and can report NOMEM; a ring cannot */
 wtq_nw_conn_doorbell_ring(conn);
 
+/* the same doorbell on a delay, from a timer preallocated at connection
+   construction (no per-arm object, no callback closure, no configured/
+   backend allocator call, no timer thread): one delayed slot, a new arm
+   replaces it, cancel_after clears it. delay is host uptime; returns
+   CLOSED after stop_begin. Legal only on a valid retained handle. */
+wtq_nw_conn_doorbell_ring_after(conn, 5000 /* us */);
+wtq_nw_conn_doorbell_cancel_after(conn);
+
 /* teardown: nonblocking begin from anywhere (callbacks included),
    then either join off-domain or resume from on_stopped */
 wtq_nw_conn_stop_begin(conn);
@@ -286,7 +294,28 @@ declaration in `include/wtquic/`.
 - **No held-buffer receive API yet**: received data is borrowed for the
   duration of the callback; copy what must outlive it. Receive
   pause/resume exists (`wtq_stream_pause_receive` /
-  `wtq_stream_resume_receive`).
+  `wtq_stream_resume_receive`) and **arrests application delivery**: pause
+  stops arming *future* receives, but because Network.framework's receive
+  is a pull, one `nw_connection_receive` is always outstanding, so the
+  completion queued behind a pause can still fire. That one completion is
+  held backend-local — its transport buffer is RETAINED (zero-copy, never
+  copied) and, for a pure FIN, remembered — and is never delivered to the
+  application while paused; resume replays it exactly once, in order (FIN
+  included), then arms the next receive. **Transport-level peer
+  backpressure is NOT guaranteed on this backend**: the public
+  initial-window setters are values Network.framework auto-tunes upward,
+  and it buffers/ACKs past them, so a paused peer is bounded only by the
+  framework's internal receive buffering, not by the advertised window (a
+  documented parity exception — see `COMPATIBILITY.md`). This is not a
+  hidden footnote: the guarantee is typed.
+  `wtq_stream_receive_pause_mode()` reports
+  `WTQ_RECEIVE_PAUSE_DELIVERY_ONLY` for the Network backend and
+  `WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED` for the MsQuic backend (its logical
+  pause arrests even an already-queued RECEIVE synchronously and extends no
+  receive credit while paused, so the peer is eventually blocked by QUIC
+  flow control). A memory-sensitive caller branches on the mode (accept
+  delivery isolation, or refuse/close) rather than assuming a bound that
+  the Network backend does not provide.
 - The bundled `examples/` are stubs pending the convenience-layer
   ergonomics pass.
 

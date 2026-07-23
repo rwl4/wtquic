@@ -101,18 +101,53 @@ WTQ_API wtq_result_t wtq_stream_stop_sending(wtq_stream_t *stream,
 /*
  * Pause / resume delivery of incoming data on this stream. Pausing
  * stops future on_stream_data events; data already being delivered
- * still arrives (the borrowed-during-callback contract is unchanged),
- * and what keeps arriving from the peer sits in the transport's
- * receive window until its flow control pushes back — real
- * backpressure, no bytes buffered by wtquic. Resume re-opens the tap
- * and delivery continues in order, FIN included.
+ * still arrives (the borrowed-during-callback contract is unchanged).
+ * Resume re-opens the tap and delivery continues in order, FIN
+ * included.
  *
- * WTQ_ERR_UNSUPPORTED when the transport backend cannot pause reads;
- * WTQ_ERR_STATE when the incoming direction is already finished;
- * WTQ_ERR_CLOSED after stream/session end.
+ * The GUARANTEED, portable effect is delivery suppression: while paused
+ * the application sees no further on_stream_data. Whether that also
+ * imposes hard transport-level flow-control backpressure on the peer is
+ * BACKEND-DEPENDENT — query wtq_stream_receive_pause_mode() to find out.
+ * A delivery-only backend keeps consuming, ACKing, and expanding receive
+ * credit while paused, so a paused peer is not flow-control-bounded and
+ * bytes may accumulate below wtquic (in the transport). A resource-
+ * sensitive caller must consult the mode before relying on pause for
+ * bounded memory.
+ *
+ * WTQ_ERR_UNSUPPORTED when the transport backend cannot pause delivery
+ * (see WTQ_RECEIVE_PAUSE_UNSUPPORTED); WTQ_ERR_STATE when the incoming
+ * direction is already finished; WTQ_ERR_CLOSED after stream/session end.
  */
 WTQ_API wtq_result_t wtq_stream_pause_receive(wtq_stream_t *stream);
 WTQ_API wtq_result_t wtq_stream_resume_receive(wtq_stream_t *stream);
+
+/*
+ * What wtq_stream_pause_receive actually achieves on this stream's
+ * backend. A connection-wide, static property of the transport backend; it
+ * does not change over a stream's life and stays queryable on a retained
+ * handle after the stream has ended (the backend mode is reported for the
+ * whole life of the handle, terminal or not). A backend that cannot pause
+ * delivery reports WTQ_RECEIVE_PAUSE_UNSUPPORTED; a NULL handle also
+ * reports it, for lack of a backend to name.
+ */
+typedef enum wtq_receive_pause_mode {
+    /* Pause cannot suppress delivery at all — do not rely on it. */
+    WTQ_RECEIVE_PAUSE_UNSUPPORTED = 0,
+    /* Pause suppresses application delivery, but the transport may keep
+     * consuming, ACKing, and expanding receive credit while paused: no
+     * hard flow-control bound on the peer, bytes may buffer below
+     * wtquic. (Apple Network.framework.) */
+    WTQ_RECEIVE_PAUSE_DELIVERY_ONLY = 1,
+    /* Pause suppresses delivery AND stops transport consumption without
+     * extending receive credit, so the peer is eventually blocked by
+     * QUIC flow control — real backpressure, nothing buffered by
+     * wtquic. */
+    WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED = 2,
+} wtq_receive_pause_mode_t;
+
+WTQ_API wtq_receive_pause_mode_t
+wtq_stream_receive_pause_mode(const wtq_stream_t *stream);
 
 /* --- queries -------------------------------------------------------------- */
 

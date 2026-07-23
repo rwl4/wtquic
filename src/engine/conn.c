@@ -2551,6 +2551,15 @@ wtq_result_t wtq_conn_wt_recv_enable(wtq_conn_t *conn, wtq_estream_t *es,
     return conn->ops.recv_enable(conn->drv, es->ds, enabled);
 }
 
+int wtq_conn_recv_pause_mode(const wtq_conn_t *conn)
+{
+    if (conn == NULL || conn->ops.recv_enable == NULL)
+        return 0; /* WTQ_RECEIVE_PAUSE_UNSUPPORTED */
+    if (conn->ops.caps & WTQ_DCAP_RECV_FLOW_CONTROLLED)
+        return 2; /* WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED */
+    return 1;     /* WTQ_RECEIVE_PAUSE_DELIVERY_ONLY */
+}
+
 void wtq_estream_set_user(wtq_estream_t *es, void *user)
 {
     if (es != NULL)

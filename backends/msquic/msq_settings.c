@@ -18,6 +18,20 @@ void wtq_msq_settings_init(QUIC_SETTINGS *qs,
     memset(qs, 0, sizeof(*qs));
     qs->SendBufferingEnabled = t.send_buffering ? TRUE : FALSE;
     qs->IsSet.SendBufferingEnabled = TRUE;
+    /*
+     * Mandatory: default (non-multi) receive mode. The receive-pause
+     * arrest (see msq_stream.c) relies on MsQuic's default single-
+     * outstanding-RECEIVE behaviour, where accepting a receive only
+     * partially disables further indications until StreamReceiveSetEnabled.
+     * Multi-receive is a preview-gated field, so it only exists (and can
+     * only be enabled) under QUIC_API_ENABLE_PREVIEW_FEATURES — stamp it
+     * OFF there so a preview build cannot leave it on. Stable-ABI builds
+     * cannot set it at all (the field is absent), so it is already off.
+     */
+#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+    qs->StreamMultiReceiveEnabled = FALSE;
+    qs->IsSet.StreamMultiReceiveEnabled = TRUE;
+#endif
     qs->PeerUnidiStreamCount = t.peer_unidi_stream_count;
     qs->IsSet.PeerUnidiStreamCount = TRUE;
     qs->PeerBidiStreamCount = t.peer_bidi_stream_count;

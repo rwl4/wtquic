@@ -267,6 +267,14 @@ if(WTQ_MSQUIC_ENABLED)
         ${CMAKE_CURRENT_SOURCE_DIR}/unit)
     target_link_libraries(test_msquic_ops PRIVATE msquic::msquic)
     target_compile_options(test_msquic_ops PRIVATE ${WTQ_WARN_FLAGS})
+    # Match the backend's preview define so the settings test sees the
+    # preview-gated StreamMultiReceiveEnabled field when it exists. Safe
+    # here: these white-box cases drive fake QUIC_API_TABLEs and never pass
+    # a QUIC_SETTINGS across the real libmsquic ABI.
+    if(WTQ_MSQUIC_PREVIEW)
+        target_compile_definitions(test_msquic_ops PRIVATE
+            QUIC_API_ENABLE_PREVIEW_FEATURES)
+    endif()
     add_test(NAME msquic_ops COMMAND test_msquic_ops)
     set_tests_properties(msquic_ops PROPERTIES LABELS msquic)
 

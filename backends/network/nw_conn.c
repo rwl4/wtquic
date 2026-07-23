@@ -91,6 +91,16 @@ struct wtq_nw_conn {
     dispatch_source_t doorbell_src;
     void (*on_doorbell)(void *ctx);
     void *doorbell_ctx;
+    /* the one-shot DELAYED doorbell: a preallocated timer source on the
+     * same domain, created disarmed with the doorbell. All three fields
+     * are guarded by mu. doorbell_timer_deadline_us is a host-uptime
+     * absolute (nw_uptime_us / CLOCK_UPTIME_RAW space, matching the
+     * dispatch timer base); the handler ignores any event whose arrival
+     * precedes it — a stale fire from a superseded, shorter arm.
+     * There is exactly one slot: a new arm replaces the previous. */
+    dispatch_source_t doorbell_timer_src;
+    bool doorbell_timer_armed;
+    uint64_t doorbell_timer_deadline_us;
     wtq_alloc_t alloc;    /* frees this handle                        */
 };
 
@@ -123,6 +133,46 @@ static uint64_t nw_now_us(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/*
+ * The DELAYED-DOORBELL clock. It must share the base a default dispatch
+ * timer fires against — mach_absolute_time / host uptime, which does NOT
+ * advance while the system is asleep — so the handler's absolute-deadline
+ * stale check is consistent with when the timer actually fires. Darwin
+ * documents CLOCK_UPTIME_RAW as mach_absolute_time after timebase
+ * conversion. This is deliberately NOT nw_now_us()/CLOCK_MONOTONIC, which
+ * on Darwin keeps advancing across sleep and would drift from dispatch
+ * uptime; delay_us is therefore measured in host uptime and a suspend
+ * does not consume it.
+ */
+#define NW_DOORBELL_CLOCK CLOCK_UPTIME_RAW
+
+static uint64_t nw_uptime_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(NW_DOORBELL_CLOCK, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* The largest delay whose microsecond->nanosecond conversion stays a
+ * non-negative signed dispatch_time delta; larger requests clamp here so
+ * neither the multiplication nor the deadline addition can wrap. */
+#define NW_DOORBELL_MAX_DELAY_US ((uint64_t)INT64_MAX / 1000u)
+
+/* Pure clamp helpers (shared with a test seam): effective delay saturates
+ * so eff_us * 1000 cannot exceed INT64_MAX, and the absolute deadline
+ * saturates to UINT64_MAX rather than wrapping. */
+static uint64_t nw_doorbell_effective_delay_us(uint64_t delay_us)
+{
+    return delay_us > NW_DOORBELL_MAX_DELAY_US ? NW_DOORBELL_MAX_DELAY_US
+                                               : delay_us;
+}
+
+static uint64_t nw_doorbell_deadline_us(uint64_t now_us, uint64_t eff_us)
+{
+    return eff_us > UINT64_MAX - now_us ? UINT64_MAX : now_us + eff_us;
 }
 
 /* --- engine bracket ---------------------------------------------------- */
@@ -244,9 +294,14 @@ static void ds_synthesize_completions(struct wtq_dstream *ds)
  * until it retires, the stream (and through it the connection root)
  * simply stays alive. Correctness never depends on when.
  */
+static void ds_drop_deferred(struct wtq_dstream *ds);
+
 static bool ds_reap_eligible(const struct wtq_dstream *ds)
 {
-    return ds->terminal && !ds->recv_pending &&
+    /* ready_recheck_pending is a structural pin: a queued metadata recheck
+     * holds a raw ds capture for a later turn, so the shell must outlive
+     * it (the recheck clears the pin and re-arms reaping). */
+    return ds->terminal && !ds->recv_pending && !ds->ready_recheck_pending &&
            ds->recs_unretired == 0 && ds->recs_app_pending == 0 &&
            ds->batches_live == 0;
 }
@@ -266,6 +321,10 @@ static void ds_reap_phase2(struct wtq_dstream *ds)
     if (wtq_nw_test_park_reaps)
         return; /* diagnostic: hold every object forever */
 #endif
+    /* backstop: a deferred receive is normally released at the terminal,
+     * but the destruction path releases it too so no retained buffer can
+     * ever outlive the shell (idempotent) */
+    ds_drop_deferred(ds);
     if (ds->conn != NULL) {
         WTQ_NW_TEST(if (drv->callback_depth != 0)
                         wtq_nw_test_release_in_cb++);
@@ -513,6 +572,52 @@ int wtq_nw_test_peer_opens;
 int wtq_nw_test_peer_rejects;
 int wtq_nw_test_adopts;
 int wtq_nw_test_meta_deny;
+int wtq_nw_test_meta_deny_sticky;
+int wtq_nw_test_stamp_count;
+uint64_t wtq_nw_test_last_stamp_code;
+/* Handler-entry gate for the delayed-doorbell timer: invoked at the very
+ * top of nw_doorbell_timer_fire, BEFORE the state check, so a test can
+ * hold a queued/entered handler causally (no sleeps) while it reprograms
+ * or cancels the arm from another thread and observes the stale/armed
+ * gating. */
+void (*wtq_nw_test_bell_timer_gate)(void *ctx);
+void *wtq_nw_test_bell_timer_gate_ctx;
+/* One-shot: force the NEXT delayed-doorbell timer-source creation to
+ * fail, exercising the construction rollback of the immediate source. */
+int wtq_nw_test_fail_next_timer_src;
+/* Live doorbell/timer dispatch sources: +1 per successful create, -1 at
+ * each detach+release. A create-failure rollback must return to baseline. */
+_Atomic int wtq_nw_test_live_sources;
+
+/* The clockid the delayed doorbell arms/compares against — must match the
+ * base dispatch timers fire on (host uptime). Lets a test pin the clock
+ * domain deterministically. */
+clockid_t wtq_nw_test_bell_clock(void)
+{
+    return NW_DOORBELL_CLOCK;
+}
+
+/* Snapshot the delayed-doorbell slot under mu (armed flag + stored
+ * absolute deadline) so a test can inspect an arm without racing it. */
+void wtq_nw_test_bell_snapshot(wtq_nw_conn_t *c,
+                               wtq_nw_test_bell_snapshot_t *out)
+{
+    pthread_mutex_lock(&c->mu);
+    out->armed = c->doorbell_timer_armed;
+    out->deadline_us = c->doorbell_timer_deadline_us;
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* Pure delay-clamp seams (the exact functions ring_after uses). */
+uint64_t wtq_nw_test_bell_effective_delay_us(uint64_t delay_us)
+{
+    return nw_doorbell_effective_delay_us(delay_us);
+}
+
+uint64_t wtq_nw_test_bell_deadline_us(uint64_t now_us, uint64_t eff_us)
+{
+    return nw_doorbell_deadline_us(now_us, eff_us);
+}
 #endif /* WTQ_NW_TESTING */
 
 /*
@@ -537,7 +642,9 @@ static void ds_pump_sends(struct wtq_dstream *ds)
 {
     struct wtq_driver *drv = ds->drv;
 
-    if (ds->send_inflight || !ds->ready_seen || ds->terminal ||
+    /* gate on ready PROCESSED, not merely notified: a stale metadata-less
+     * ready must not release sends before its one-turn recheck resolves */
+    if (ds->send_inflight || !ds->ready_processed || ds->terminal ||
         ds->cancel_issued || ds->conn == NULL)
         return;
     if (ds->pending_sends == NULL)
@@ -732,44 +839,137 @@ static void ds_deliver_bytes(struct wtq_dstream *ds, dispatch_data_t content,
     nw_leave_and_poll(drv);
 }
 
+/* Release a held deferred receive, if any. Idempotent: safe to call from
+ * every terminal/reset/detach/reap path, so the retained transport buffer
+ * is released exactly once with no stale delivery. */
+static void ds_drop_deferred(struct wtq_dstream *ds)
+{
+    if (ds->recv_deferred_data != NULL) {
+        dispatch_release(ds->recv_deferred_data);
+        ds->recv_deferred_data = NULL;
+    }
+    ds->recv_deferred = false;
+    ds->recv_deferred_fin = false;
+    ds->recv_deferred_errored = false;
+}
+
+/*
+ * The receive-completion body, confined to the serialization domain. Runs
+ * for Apple's nw_connection_receive completion (and, in tests, the
+ * injection seam). `errored`/`cancelled` fold the callback's error and
+ * local-cancel state.
+ *
+ * While the app has the stream PAUSED, the one already-outstanding
+ * completion is retained here instead of reaching the engine — pause only
+ * stops FUTURE arms, so without this the queued completion would deliver
+ * data or FIN after pause returned. At most one completion is ever held
+ * (only one receive is armed at a time); a second is an invariant failure,
+ * not an unbounded queue. Otherwise the bytes are delivered and, unless a
+ * FIN or error ended the receive side, a new receive is armed.
+ */
+static void ds_receive_completed(struct wtq_dstream *ds,
+                                 dispatch_data_t content, bool fin,
+                                 bool errored, bool cancelled)
+{
+    ds->recv_pending = false;
+    if (cancelled) {
+        /* locally-cancelled: this is the cancel FLUSH, not peer data —
+         * nothing from a dead stream reaches the engine */
+        ds_maybe_free(ds, WTQ_NW_REAP_SRC_RECV);
+        return;
+    }
+    /* A FIN or a receive error ends the receive side PERMANENTLY. Latch it
+     * BEFORE any deferral, delivery, or re-arm decision below — including the
+     * paused branch, which otherwise ignores an error-only completion — so no
+     * later resume (even one reentrant from replay delivery) can arm another
+     * receive on a finished stream. ds_arm_receive re-checks this latch. */
+    if (fin || errored)
+        ds->recv_ended = true;
+    if (!ds->recv_enabled && (content != NULL || fin)) {
+        /* PAUSED: hold this one completion. Network.framework may deliver
+         * data received BEFORE an error in the same completion (see
+         * connection.h), so a data-bearing errored completion is held too,
+         * with its error preserved — otherwise its bytes would reach the
+         * engine while paused. Bounded to a single slot: a second deferral
+         * would mean two receives were outstanding, which the arm gate
+         * forbids. */
+        if (ds->recv_deferred) {
+            /* Backend invariant failure: with one completion already held,
+             * a second means two receives were outstanding — impossible by
+             * the arm gate. Never silently drop the peer's bytes; stage a
+             * local backend error and fail the CONNECTION, the same
+             * deterministic outcome the missing-metadata invariant takes. */
+            struct wtq_driver *drv = ds->drv;
+
+            WTQ_NW_TEST(wtq_nw_test_recv_defer_overflow++);
+            if (!drv->err_staged) {
+                drv->err_staged = true;
+                drv->err_kind = WTQ_ERR_KIND_LOCAL;
+                drv->err_domain = WTQ_ERRDOM_BACKEND;
+                drv->err_code = 0;
+            }
+            (void)op_conn_close(drv, 0);
+            return;
+        }
+        ds->recv_deferred = true;
+        ds->recv_deferred_fin = fin;
+        ds->recv_deferred_errored = errored;
+        if (content != NULL) {
+            dispatch_retain(content); /* zero-copy: retain, never copy */
+            ds->recv_deferred_data = content;
+        }
+        WTQ_NW_TEST(if (wtq_nw_test_defer_hook != NULL)
+                        wtq_nw_test_defer_hook(ds));
+        /* no engine delivery and no re-arm while paused: the app sees
+         * nothing until resume. This arrests APPLICATION delivery only —
+         * it is NOT transport backpressure: Network.framework keeps
+         * buffering and ACKing received data past the advertised window,
+         * so a paused peer is not flow-control-bounded here (see
+         * COMPATIBILITY.md). */
+        return;
+    }
+    if (content != NULL || fin)
+        ds_deliver_bytes(ds, content, fin);
+    /* errors surface through the state handler (failed), which owns reset
+     * attribution — never double-report here */
+    if (!errored && !fin)
+        ds_arm_receive(ds);
+    ds_maybe_free(ds, WTQ_NW_REAP_SRC_RECV); /* schedules only */
+}
+
 static void ds_arm_receive(struct wtq_dstream *ds)
 {
+    /* Last gate before the Apple call. Beyond the obvious not-live checks,
+     * bail on every teardown/ended signal: recv_ended (FIN or receive error
+     * seen), and the cancel/reset flags — because replay delivery
+     * (op_recv_enable resume) runs app code that can reentrantly reset the
+     * stream or close the session BEFORE returning here, setting cancel_issued
+     * / cancel_deferred / failed_seen without necessarily setting `terminal`.
+     * Arming after any of these would issue nw_connection_receive on a stream
+     * that is finished or being torn down. */
     if (ds->recv_pending || ds->terminal || ds->conn == NULL ||
-        !ds->recv_enabled || ds->fin_delivered)
+        !ds->recv_enabled || ds->fin_delivered || ds->recv_ended ||
+        ds->cancel_issued || ds->cancel_deferred || ds->failed_seen)
         return;
     ds->recv_pending = true;
+    WTQ_NW_TEST(ds->recv_arm_count++);
     struct wtq_dstream *cap = ds;
     nw_connection_receive(
         ds->conn, 1, 65535,
         ^(dispatch_data_t content, nw_content_context_t ctx,
           bool is_complete, nw_error_t error) {
           cap->drv->callback_depth++;
-          cap->recv_pending = false;
           /* stream-local receive errors (peer reset etc.) are NOT
-           * connection-causal: never consume the first-causal latch
-           * here — connection-scoped detail comes from the datagram
-           * flow and the group terminal */
-          if (cap->cancel_issued) {
-              /* locally-cancelled: this is the cancel FLUSH, not peer
-               * data. NW can flush with a synthetic FINAL context and
-               * no error (measured: read as a clean CONNECT-stream
-               * FIN, closing the session CLEAN and sealing an empty
-               * record before the causal error could be delivered) —
-               * nothing from a dead stream reaches the engine. */
-              ds_maybe_free(cap, WTQ_NW_REAP_SRC_RECV);
-              cap->drv->callback_depth--;
-              return;
-          }
+           * connection-causal: the completion body never consumes the
+           * first-causal latch — connection-scoped detail comes from the
+           * datagram flow and the group terminal. A synthetic FINAL
+           * context with no error on a locally-cancelled stream is the
+           * cancel flush (measured), folded in via `cancelled`. */
           bool fin = is_complete && ctx != NULL &&
                      nw_content_context_get_is_final(ctx) &&
                      error == NULL;
-          if (content != NULL || fin)
-              ds_deliver_bytes(cap, content, fin);
-          /* errors surface through the state handler (failed), which
-           * owns reset attribution — never double-report here */
-          if (error == NULL && !fin)
-              ds_arm_receive(cap);
-          ds_maybe_free(cap, WTQ_NW_REAP_SRC_RECV); /* schedules only */
+          ds_receive_completed(cap, content, fin, error != NULL,
+                               cap->cancel_issued);
           cap->drv->callback_depth--;
         });
 }
@@ -828,20 +1028,43 @@ static void ds_attach_state_handler(struct wtq_dstream *ds)
 }
 
 /*
- * ready: metadata (and the native id) exist now. Local streams report
- * the id through the CURRENT ectx (critical ectx-NULL streams do not
- * report). Inbound streams become visible to the engine here — never
- * earlier — classified by id bits alone.
+ * ready: metadata (and the native id) NORMALLY exist now — but NW can
+ * deliver a stale ready with the metadata absent in the callback frame
+ * (measured; see ds_ready_recheck), so processing is two-stage when the
+ * in-frame sample misses. Local streams report the id through the
+ * CURRENT ectx (critical ectx-NULL streams do not report). Inbound
+ * streams become visible to the engine at processing — never earlier —
+ * classified by id bits alone.
  */
-static void ds_handle_ready(struct wtq_dstream *ds)
+/* Missing QUIC metadata at ready, unrecoverably: a silent stream cancel
+ * would strand engine state (a CONNECT or critical stream would never
+ * produce a session outcome). Fail the CONNECTION — one deterministic
+ * outcome for every dependent piece of state. */
+static void ds_ready_meta_fatal(struct wtq_dstream *ds)
 {
     struct wtq_driver *drv = ds->drv;
-    bool ok = false;
-    uint64_t id = stream_native_id(ds->conn, &ok);
+
+    if (!drv->err_staged) {
+        drv->err_staged = true;
+        drv->err_kind = WTQ_ERR_KIND_LOCAL;
+        drv->err_domain = WTQ_ERRDOM_BACKEND;
+        drv->err_code = 0;
+    }
+    (void)op_conn_close(drv, 0);
+}
+
+static void ds_ready_process(struct wtq_dstream *ds, uint64_t id);
+
+/* Sample the native id, with the test seams applied at the SAMPLE (so a
+ * denial can model both a frame-only miss — one-shot bit, cleared on use,
+ * available again at the recheck — and PERSISTENT absence — sticky bit,
+ * never cleared, denied at the recheck too). */
+static uint64_t ds_sample_native_id(struct wtq_dstream *ds, bool *ok)
+{
+    uint64_t id = stream_native_id(ds->conn, ok);
 
 #ifdef WTQ_NW_TESTING
     {
-        /* class-targeted metadata denial (one-shot per class bit) */
         int cls = 0;
         if (ds->is_local && !ds->is_bidi && ds->ectx == NULL)
             cls = WTQ_NW_META_DENY_CRITICAL;
@@ -849,28 +1072,89 @@ static void ds_handle_ready(struct wtq_dstream *ds)
             cls = WTQ_NW_META_DENY_LOCAL_BIDI;
         else if (ds->is_local && ds->ectx != NULL)
             cls = WTQ_NW_META_DENY_APP;
-        if (cls != 0 && (wtq_nw_test_meta_deny & cls) != 0) {
-            wtq_nw_test_meta_deny &= ~cls;
-            ok = false; /* SEAM: metadata missing at ready */
+        else if (!ds->is_local)
+            cls = WTQ_NW_META_DENY_INBOUND;
+        if (cls != 0) {
+            if ((wtq_nw_test_meta_deny_sticky & cls) != 0) {
+                *ok = false; /* persistent: denied at every sample */
+            } else if ((wtq_nw_test_meta_deny & cls) != 0) {
+                wtq_nw_test_meta_deny &= ~cls;
+                *ok = false; /* frame-only: this sample alone */
+            }
         }
     }
 #endif
+    return id;
+}
 
+/*
+ * Deferred stage of a ready whose metadata was absent IN the NW callback
+ * frame. MEASURED (366 events over 780 loopback-gate iterations, zero
+ * counterexamples): such a ready is STALE — it races the stream's own
+ * death, and by the next serialization-domain turn the stream had always
+ * failed or cancelled; the metadata never materialized later. So one turn
+ * later, exactly three dispositions exist:
+ *   - the stream is failing/cancelled/terminal: the FAILURE path owns it —
+ *     its terminal delivery produces the engine outcome, nothing is
+ *     stranded, and the connection stays up (this was the flaky
+ *     connection-kill: a stale ready on a live connection nuked it);
+ *   - alive and the metadata now samples: process the ready late — the id
+ *     is reported, sends pump, the receive arms, and a deferred stamped
+ *     cancel applies with its exact code;
+ *   - alive and STILL no metadata: the genuine backend invariant failure —
+ *     connection-fatal, exactly as before (never observed empirically, but
+ *     a silent cancel would strand a CONNECT/critical stream).
+ */
+static void ds_ready_recheck(struct wtq_dstream *ds)
+{
+    /* drop the structural reap pin FIRST (this block is the capture it
+     * protected), and re-arm reaping on the dying path — the stream may
+     * have become fully reap-eligible while pinned, with no further event
+     * coming to notice it */
+    ds->ready_recheck_pending = false;
+    if (ds->terminal || ds->failed_seen || ds->cancel_issued ||
+        ds->conn == NULL) {
+        ds_maybe_free(ds, WTQ_NW_REAP_SRC_STATE); /* schedules only */
+        return; /* dying: the failure path owns the outcome */
+    }
+    bool ok = false;
+    uint64_t id = ds_sample_native_id(ds, &ok);
     if (!ok) {
-        /* Missing QUIC metadata (and so the id) at ready is a BACKEND
-         * INVARIANT FAILURE: a silent stream cancel would strand engine
-         * state (a CONNECT or critical stream would never produce a
-         * session outcome). Fail the CONNECTION — one deterministic
-         * outcome for every dependent piece of state. */
-        if (!drv->err_staged) {
-            drv->err_staged = true;
-            drv->err_kind = WTQ_ERR_KIND_LOCAL;
-            drv->err_domain = WTQ_ERRDOM_BACKEND;
-            drv->err_code = 0;
-        }
-        (void)op_conn_close(drv, 0);
+        ds_ready_meta_fatal(ds);
         return;
     }
+    ds_ready_process(ds, id);
+}
+
+static void ds_handle_ready(struct wtq_dstream *ds)
+{
+    bool ok = false;
+    uint64_t id = ds_sample_native_id(ds, &ok);
+
+    if (!ok) {
+        /* metadata absent inside the callback frame: two-stage ready —
+         * notified now (ready_seen), PROCESSED only when the recheck one
+         * domain turn later resolves it (see ds_ready_recheck). Until
+         * then op_shutdown_stream defers its stamped cancel and the send
+         * pump stays gated (both key off ready_processed). The pending
+         * flag pins the shell against the reap for the capture's life. */
+        ds->ready_recheck_pending = true;
+        struct wtq_dstream *cap = ds;
+        dispatch_async(ds->drv->queue, ^{
+          cap->drv->callback_depth++;
+          ds_ready_recheck(cap);
+          cap->drv->callback_depth--;
+        });
+        return;
+    }
+    ds_ready_process(ds, id);
+}
+
+static void ds_ready_process(struct wtq_dstream *ds, uint64_t id)
+{
+    struct wtq_driver *drv = ds->drv;
+
+    ds->ready_processed = true; /* the id exists; sends/cancels may proceed */
     ds->id = id;
     NWDBG("ready %s %s id=%llu ectx=%p\n", ds->is_local ? "local" : "peer",
           ds->is_bidi ? "bidi" : "uni", (unsigned long long)id,
@@ -958,6 +1242,12 @@ static void ds_handle_failure(struct wtq_dstream *ds, nw_error_t e)
      * NOT connection-causal: the first-causal transport-error latch is
      * never consumed by them */
     (void)e;
+    /* Close the backend receive state BEFORE notifying the engine. The
+     * reset callback runs with the API's recv_open still true and permits
+     * full reentrancy — a resume from inside it must find NOTHING to
+     * replay. Drop any held completion first (op_recv_enable additionally
+     * rejects a failed/terminal stream, so the resume is a no-op there). */
+    ds_drop_deferred(ds);
     if (ds->ectx != NULL && drv->session != NULL && !ds->reset_delivered &&
         !ds->fin_delivered && !ds->cancel_issued) {
         uint64_t code = 0;
@@ -1162,6 +1452,10 @@ static void ds_stamped_cancel(struct wtq_dstream *ds, uint64_t code)
     if (md != NULL) {
         nw_quic_set_stream_application_error(md, code);
         nw_release(md);
+        WTQ_NW_TEST({
+            wtq_nw_test_stamp_count++;
+            wtq_nw_test_last_stamp_code = code;
+        });
     }
     ds->cancel_issued = true;
     nw_connection_cancel(ds->conn);
@@ -1176,14 +1470,21 @@ static wtq_result_t op_shutdown_stream(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (ds->cancel_issued || ds->cancel_deferred)
         return WTQ_OK; /* idempotent */
 
+    /* The app is tearing this stream down. A receive held while paused is
+     * moot now — drop it here, synchronously, so a resume that races the
+     * cancel can never replay it (op_recv_enable also rejects once the
+     * cancel is issued or deferred). */
+    ds_drop_deferred(ds);
+
     uint64_t code = req->abort_send ? req->send_err : req->recv_err;
     NWDBG("shutdown id=%llu ready=%d code=%llu\n",
-          (unsigned long long)ds->id, (int)ds->ready_seen,
+          (unsigned long long)ds->id, (int)ds->ready_processed,
           (unsigned long long)code);
-    if (!ds->ready_seen) {
-        /* pre-ready: the metadata (and the stamp slot) does not exist
-         * yet — a cancel now would go out unstamped (code 0). Defer the
-         * stamped cancel to the ready transition; the engine's view is
+    if (!ds->ready_processed) {
+        /* pre-ready — or a ready whose metadata was absent in-frame and is
+         * awaiting the one-turn recheck: the stamp slot does not exist yet,
+         * so a cancel now would go out UNSTAMPED (code 0). Defer the
+         * stamped cancel to ready processing; the engine's view is
          * unchanged (the stream is going down either way). */
         ds->cancel_deferred = true;
         ds->cancel_code = code;
@@ -1290,9 +1591,58 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
                                    bool enabled)
 {
     (void)drv;
+    /* Reject on a failed/cancelled/terminal/handleless stream WITHOUT
+     * mutating recv_enabled. A reset/terminal callback permits reentrancy
+     * with the API's recv_open still open, so a resume from inside it must
+     * neither replay a (dropped) held completion nor arm a dead stream. A
+     * locally-initiated cancel that is still deferred to ready counts too. */
+    if (ds->terminal || ds->failed_seen || ds->cancel_issued ||
+        ds->cancel_deferred || ds->conn == NULL)
+        return WTQ_ERR_CLOSED;
+    /* A receive side that already ENDED (a FIN or a receive error was seen)
+     * with NOTHING held is finished: there is nothing to replay, no receive
+     * to arm, and per the public contract the incoming direction being
+     * finished is WTQ_ERR_STATE for pause AND resume alike. Reject BOTH
+     * directions WITHOUT mutating recv_enabled — recv_ended is latched on
+     * the ending completion before any failed-state callback, so this also
+     * covers the window after an error-only completion but before
+     * failed_seen. A HELD terminal completion (recv_deferred) stays
+     * pausable/replayable exactly once, so reject only when nothing is
+     * held. */
+    if (ds->recv_ended && !ds->recv_deferred)
+        return WTQ_ERR_STATE;
     ds->recv_enabled = enabled;
-    if (enabled)
-        ds_arm_receive(ds); /* re-arm; disabling stops FUTURE arms only */
+    if (!enabled)
+        return WTQ_OK; /* disabling stops FUTURE arms only */
+
+    /*
+     * Resume. A completion held while paused is replayed to the engine
+     * FIRST, exactly once and in order, then released; only after that is
+     * a new receive armed. Delivery re-enters the session bracket and may
+     * drive the stream terminal/detached (the app closing on the bytes or
+     * FIN) — the delivery guards on ectx, ds_deliver_bytes marks FIN
+     * delivered, and ds_arm_receive re-checks terminal/conn/FIN, so no
+     * receive is armed on a dead stream and the shell is never touched
+     * after its terminal (reaping is deferred across queue turns).
+     */
+    if (ds->recv_deferred) {
+        dispatch_data_t d = ds->recv_deferred_data;
+        bool fin = ds->recv_deferred_fin;
+        bool errored = ds->recv_deferred_errored;
+
+        ds->recv_deferred = false;
+        ds->recv_deferred_data = NULL;
+        ds->recv_deferred_fin = false;
+        ds->recv_deferred_errored = false;
+        if (!ds->terminal && ds->ectx != NULL)
+            ds_deliver_bytes(ds, d, fin);
+        if (d != NULL)
+            dispatch_release(d);
+        if (errored || fin)
+            return WTQ_OK; /* the receive side ended with that completion —
+                              deliver its content once, but never re-arm */
+    }
+    ds_arm_receive(ds); /* re-arm only if the stream remains live */
     return WTQ_OK;
 }
 
@@ -1565,6 +1915,65 @@ void wtq_nw_test_cancel_group(struct wtq_driver *drv)
 #ifdef WTQ_NW_TESTING
 _Atomic int wtq_nw_test_live_drivers;
 const wtq_alloc_t *wtq_nw_test_backend_alloc;
+int wtq_nw_test_recv_defer_overflow;
+void (*wtq_nw_test_defer_hook)(struct wtq_dstream *ds);
+
+/* Inject a receive completion on the domain, exactly as Apple's
+ * nw_connection_receive callback would — the production path is not
+ * externally schedulable, so this drives the pause-deferral logic
+ * deterministically. Frames the call like the real callback (depth). */
+void wtq_nw_test_deliver_recv(struct wtq_dstream *ds, dispatch_data_t content,
+                             bool fin, bool errored, bool cancelled)
+{
+    ds->drv->callback_depth++;
+    ds_receive_completed(ds, content, fin, errored, cancelled);
+    ds->drv->callback_depth--;
+}
+
+/* Drive the peer-reset (stream `failed`) state transition on the domain,
+ * exactly as the state handler's failed branch does: set failed_seen, run
+ * the failure handler (which emits on_stream_reset), then converge on
+ * cancelled. Lets a test exercise the reset-reentrancy path — including a
+ * resume attempted from inside on_stream_reset — without a cooperating
+ * peer. */
+/* Failure + SAME-TURN capture and guard probe (see the header contract):
+ * after this block returns, the ds may be reaped on any later domain
+ * turn, so everything a test wants to know about the failed stream is
+ * captured here, atomically with the failure itself. */
+void wtq_nw_test_stream_fail_probe(struct wtq_driver *drv,
+                                   struct wtq_dstream *ds,
+                                   wtq_nw_test_fail_probe_t *out)
+{
+    dispatch_sync(drv->queue, ^{
+      drv->callback_depth++;
+      if (!ds->failed_seen) {
+          ds->failed_seen = true;
+          ds_handle_failure(ds, NULL);
+          if (!ds->cancel_issued && ds->conn != NULL) {
+              ds->cancel_issued = true;
+              nw_connection_cancel(ds->conn);
+          }
+      }
+      out->deferred_after = ds->recv_deferred;
+      out->arms_after = ds->recv_arm_count;
+      out->re_before = ds->recv_enabled;
+      out->enable_rc = op_recv_enable(drv, ds, !ds->recv_enabled);
+      out->re_after = ds->recv_enabled;
+      drv->callback_depth--;
+    });
+}
+
+/* Call the backend receive-enable op directly on the domain, bypassing the
+ * session/engine layers — so the backend's own reject-without-mutation
+ * guard (failed/cancelled/terminal/handleless) is exercised on its own,
+ * not shadowed by a higher layer. */
+wtq_result_t wtq_nw_test_recv_enable(struct wtq_driver *drv,
+                                     struct wtq_dstream *ds, bool enabled)
+{
+    __block wtq_result_t rc = WTQ_OK;
+    dispatch_sync(drv->queue, ^{ rc = op_recv_enable(drv, ds, enabled); });
+    return rc;
+}
 
 struct wtq_driver *wtq_nw_test_conn_driver(wtq_nw_conn_t *c)
 {
@@ -1624,19 +2033,73 @@ static void nw_doorbell_fire(void *arg)
     c->on_doorbell(c->doorbell_ctx);
 }
 
-/* Cancel + release the doorbell source (idempotent). The finish worker
+/*
+ * The DELAYED doorbell timer handler, on the domain. A persistent timer
+ * source may already have an event queued for an older, shorter arm when
+ * a caller reprograms its deadline; armed state alone cannot tell that
+ * event apart from the current one. So on every entry, under mu: require
+ * the slot armed, the connection live, and both sources present; then
+ * read nw_uptime_us() and DROP any event that arrives before the current
+ * absolute deadline (a stale fire — the source is already reprogrammed
+ * for, and will fire again at, the live deadline). Only a genuine fire
+ * disarms the one-shot slot and merges into the immediate doorbell, still
+ * under mu so teardown cannot detach doorbell_src underneath us. The
+ * merge is deliberately NOT wtq_nw_conn_doorbell_ring() — that would
+ * recursively lock mu.
+ */
+static void nw_doorbell_timer_fire(void *arg)
+{
+    struct wtq_nw_conn *c = arg;
+
+    WTQ_NW_TEST(if (wtq_nw_test_bell_timer_gate != NULL)
+                    wtq_nw_test_bell_timer_gate(wtq_nw_test_bell_timer_gate_ctx));
+
+    pthread_mutex_lock(&c->mu);
+    if (!c->doorbell_timer_armed || c->closed ||
+        c->doorbell_timer_src == NULL || c->doorbell_src == NULL) {
+        pthread_mutex_unlock(&c->mu);
+        return;
+    }
+    if (nw_uptime_us() < c->doorbell_timer_deadline_us) {
+        /* stale event from a superseded arm; the reprogrammed source
+         * still holds the live deadline and will fire again */
+        pthread_mutex_unlock(&c->mu);
+        return;
+    }
+    c->doorbell_timer_armed = false;
+    c->doorbell_timer_deadline_us = 0;
+    dispatch_source_set_timer(c->doorbell_timer_src, DISPATCH_TIME_FOREVER,
+                              DISPATCH_TIME_FOREVER, 0);
+    dispatch_source_merge_data(c->doorbell_src, 1);
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* Cancel + release the doorbell sources (idempotent). The finish worker
  * calls this on the domain BEFORE on_stopped — on a serial queue that
  * guarantees no event handler runs during or after the final block.
- * Build rollback paths call it before anything started. */
+ * Build rollback paths call it before anything started. One mu critical
+ * section marks the delayed arm inactive and detaches BOTH sources; on
+ * the domain the timer is cancelled/released first, then the immediate
+ * source, so no delayed handler can outlive the teardown. */
 static void nw_doorbell_teardown(struct wtq_nw_conn *c)
 {
     pthread_mutex_lock(&c->mu);
+    dispatch_source_t timer = c->doorbell_timer_src;
     dispatch_source_t bell = c->doorbell_src;
+    c->doorbell_timer_armed = false;
+    c->doorbell_timer_deadline_us = 0;
+    c->doorbell_timer_src = NULL;
     c->doorbell_src = NULL;
     pthread_mutex_unlock(&c->mu);
+    if (timer != NULL) {
+        dispatch_source_cancel(timer);
+        dispatch_release(timer);
+        WTQ_NW_TEST(atomic_fetch_sub(&wtq_nw_test_live_sources, 1));
+    }
     if (bell != NULL) {
         dispatch_source_cancel(bell);
         dispatch_release(bell);
+        WTQ_NW_TEST(atomic_fetch_sub(&wtq_nw_test_live_sources, 1));
     }
 }
 
@@ -1822,6 +2285,69 @@ void wtq_nw_conn_doorbell_ring(wtq_nw_conn_t *c)
     pthread_mutex_lock(&c->mu);
     if (!c->closed && c->doorbell_src != NULL)
         dispatch_source_merge_data(c->doorbell_src, 1);
+    pthread_mutex_unlock(&c->mu);
+}
+
+wtq_result_t wtq_nw_conn_doorbell_ring_after(wtq_nw_conn_t *c,
+                                             uint64_t delay_us)
+{
+    if (c == NULL)
+        return WTQ_ERR_INVALID_ARG;
+
+    pthread_mutex_lock(&c->mu);
+    /* Priority per the contract: stop/dead-but-valid wins over the static
+     * unconfigured property. on_doorbell is immutable after create, so it
+     * still names an unconfigured doorbell after teardown NULLs the
+     * sources. */
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        return WTQ_ERR_CLOSED;
+    }
+    if (c->on_doorbell == NULL) {
+        pthread_mutex_unlock(&c->mu);
+        return WTQ_ERR_UNSUPPORTED;
+    }
+    /* not closed AND configured -> both sources are live */
+    if (delay_us == 0) {
+        /* replace/disarm any pending arm and promote directly into the
+         * immediate doorbell (a deferred domain delivery, never inline) */
+        c->doorbell_timer_armed = false;
+        c->doorbell_timer_deadline_us = 0;
+        dispatch_source_set_timer(c->doorbell_timer_src, DISPATCH_TIME_FOREVER,
+                                  DISPATCH_TIME_FOREVER, 0);
+        dispatch_source_merge_data(c->doorbell_src, 1);
+        pthread_mutex_unlock(&c->mu);
+        return WTQ_OK;
+    }
+    uint64_t eff_us = nw_doorbell_effective_delay_us(delay_us);
+    /* the authoritative deadline lives in nw_uptime_us() (CLOCK_UPTIME_RAW,
+     * dispatch's host-uptime base); sample it BEFORE the dispatch start so
+     * the timer fires at or after it, keeping the handler's stale check in
+     * the safe direction */
+    uint64_t now = nw_uptime_us();
+    c->doorbell_timer_deadline_us = nw_doorbell_deadline_us(now, eff_us);
+    c->doorbell_timer_armed = true;
+    dispatch_source_set_timer(
+        c->doorbell_timer_src,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(eff_us * 1000u)),
+        DISPATCH_TIME_FOREVER, 0);
+    pthread_mutex_unlock(&c->mu);
+    return WTQ_OK;
+}
+
+void wtq_nw_conn_doorbell_cancel_after(wtq_nw_conn_t *c)
+{
+    if (c == NULL)
+        return;
+    pthread_mutex_lock(&c->mu);
+    /* affects only a not-yet-promoted delayed arm; harmless when nothing
+     * is armed, unconfigured, or the sources are already torn down */
+    if (c->doorbell_timer_src != NULL) {
+        c->doorbell_timer_armed = false;
+        c->doorbell_timer_deadline_us = 0;
+        dispatch_source_set_timer(c->doorbell_timer_src, DISPATCH_TIME_FOREVER,
+                                  DISPATCH_TIME_FOREVER, 0);
+    }
     pthread_mutex_unlock(&c->mu);
 }
 
@@ -2013,6 +2539,37 @@ static wtq_result_t nw_conn_build(const wtq_alloc_t *alloc,
         dispatch_source_set_event_handler_f(c->doorbell_src,
                                             nw_doorbell_fire);
         dispatch_activate(c->doorbell_src);
+        WTQ_NW_TEST(atomic_fetch_add(&wtq_nw_test_live_sources, 1));
+
+        /* the one-shot delayed timer: same domain, created before any
+         * callback can start so the earliest published handle can arm it. */
+        bool force_timer_fail = false;
+        WTQ_NW_TEST(force_timer_fail = wtq_nw_test_fail_next_timer_src != 0;
+                    wtq_nw_test_fail_next_timer_src = 0);
+        c->doorbell_timer_src =
+            force_timer_fail
+                ? NULL
+                : dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                         drv->queue);
+        if (c->doorbell_timer_src == NULL) {
+            /* through the COMMON teardown: it cancels/releases the
+             * immediate source (the timer half is NULL) and balances the
+             * live-source count — no duplicated cleanup */
+            nw_doorbell_teardown(c);
+            dispatch_release(drv->queue);
+            balloc->free(drv, sizeof(*drv), balloc->ctx);
+            nw_conn_handle_free(c);
+            return WTQ_ERR_BACKEND;
+        }
+        dispatch_set_context(c->doorbell_timer_src, c);
+        dispatch_source_set_event_handler_f(c->doorbell_timer_src,
+                                            nw_doorbell_timer_fire);
+        /* explicit initial disarm (belt-and-suspenders: a fresh timer with
+         * no set_timer also never fires) before activation */
+        dispatch_source_set_timer(c->doorbell_timer_src, DISPATCH_TIME_FOREVER,
+                                  DISPATCH_TIME_FOREVER, 0);
+        dispatch_activate(c->doorbell_timer_src);
+        WTQ_NW_TEST(atomic_fetch_add(&wtq_nw_test_live_sources, 1));
     }
 
     char portstr[8];

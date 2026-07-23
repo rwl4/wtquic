@@ -19,6 +19,7 @@
 
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <Network/Network.h>
 
 #include <wtquic/wtquic.h>
@@ -96,7 +97,20 @@ struct wtq_dstream {
                                 the transport reports one at ready      */
     bool is_local;
     bool is_bidi;
-    bool ready_seen;
+    bool ready_seen;         /* `ready` NOTIFIED (state callback ran once) */
+    bool ready_processed;    /* ready PROCESSING ran: the metadata/id was
+                                obtained (in-frame, or at the one-turn
+                                recheck when NW delivered a stale ready
+                                without metadata). Stamped cancels and the
+                                send pump key off THIS, not ready_seen —
+                                a stamp needs the metadata. */
+    bool ready_recheck_pending; /* a metadata recheck block holds a raw ds
+                                capture for the next domain turn: the shell
+                                MUST NOT be reaped while set (structural
+                                ownership — the reap eligibility gate checks
+                                it; queue FIFO alone is not an encoded
+                                dependency). Cleared at recheck entry, which
+                                then re-arms reaping. */
     bool failed_seen;        /* `failed` observed: effects applied once */
     bool terminal;           /* `cancelled` observed — the ONLY final
                                 state: NW can deliver failed AND then
@@ -116,6 +130,36 @@ struct wtq_dstream {
                                 engine pool slot — backend-parked only  */
     bool recv_enabled;
     bool recv_pending;       /* a receive block is outstanding          */
+    /*
+     * Bounded backend-local deferred receive (pause contract). A receive
+     * completion that arrives while the app has paused the stream is held
+     * here instead of reaching the engine: op_recv_enable(false) only
+     * stops FUTURE arms, so the ONE already-outstanding receive can still
+     * complete after pause returned. At most one completion is ever held —
+     * only one nw_connection_receive is armed at a time — so this is a
+     * single slot, never a queue; a second deferral is an invariant
+     * failure. Resume replays it to the engine exactly once, in order,
+     * then releases it. Zero-copy: the transport dispatch_data_t is
+     * RETAINED, never copied.
+     */
+    bool recv_ended;         /* the receive side ended PERMANENTLY (a FIN
+                                or a receive error was seen). Latched before
+                                any deferral/delivery/re-arm and never
+                                cleared, so no later resume — even one
+                                reentrant from a replay callback — can arm a
+                                receive on a finished stream. */
+    bool recv_deferred;      /* a completion is held (paused)            */
+#ifdef WTQ_NW_TESTING
+    unsigned recv_arm_count; /* TEST: nw_connection_receive arms on THIS
+                                stream (per-stream attribution — no global
+                                counter to be perturbed by other streams) */
+#endif
+    bool recv_deferred_fin;  /* the held completion carried the FIN      */
+    bool recv_deferred_errored; /* the held completion carried a receive
+                                   error (NW may deliver data received
+                                   before the error): resume delivers the
+                                   content once but never re-arms          */
+    dispatch_data_t recv_deferred_data; /* retained buffer; NULL = pure FIN */
     bool send_blocked;       /* a gather was refused WOULD_BLOCK; the
                                 writable edge is armed until capacity
                                 frees (edge semantics are the backend's) */
@@ -370,7 +414,53 @@ extern int wtq_nw_test_adopts;
 #define WTQ_NW_META_DENY_CRITICAL 0x1
 #define WTQ_NW_META_DENY_LOCAL_BIDI 0x2
 #define WTQ_NW_META_DENY_APP 0x4
+#define WTQ_NW_META_DENY_INBOUND 0x8
+/* One-shot denial: the class bit is consumed by ONE metadata sample —
+ * models a stale NW ready whose metadata is absent only inside the
+ * callback frame; the one-turn recheck then sees the real metadata and
+ * recovers the stream. */
 extern int wtq_nw_test_meta_deny;
+/* Sticky denial: never cleared — the recheck is denied too, modeling
+ * PERSISTENT metadata absence on a live stream (the connection-fatal
+ * backend invariant). */
+extern int wtq_nw_test_meta_deny_sticky;
+
+/* TEST-VISIBLE stamped-cancel record: bumped (with the code) each time
+ * ds_stamped_cancel actually stamped the application error onto live
+ * QUIC metadata. Lets a test prove a DEFERRED cancel (pre-ready, or
+ * ready-awaiting-recheck) was applied with its exact code — the stream
+ * itself may never surface at the peer (a pre-association reset). */
+extern int wtq_nw_test_stamp_count;
+extern uint64_t wtq_nw_test_last_stamp_code;
+
+/* Delayed-doorbell timer handler-entry gate: called at the top of the
+ * timer handler, BEFORE its armed/deadline state check, so a test can
+ * block a queued/entered handler and inject a reprogram or cancel from
+ * another thread — proving the stale-deadline drop and armed-state drop
+ * causally, without scheduler-luck sleeps. */
+extern void (*wtq_nw_test_bell_timer_gate)(void *ctx);
+extern void *wtq_nw_test_bell_timer_gate_ctx;
+
+/* One-shot seam: force the NEXT delayed-doorbell timer-source creation to
+ * fail, so a test can drive the construction rollback of the immediate
+ * source through the common teardown. */
+extern int wtq_nw_test_fail_next_timer_src;
+/* Live doorbell/timer dispatch-source balance (atomic): +1 per created
+ * source, -1 per detach+release. A rollback must return to baseline. */
+extern _Atomic int wtq_nw_test_live_sources;
+/* The clockid the delayed doorbell arms and compares against — pinned by
+ * a test to prove it shares dispatch's host-uptime base. */
+clockid_t wtq_nw_test_bell_clock(void);
+/* A snapshot of the delayed-doorbell slot, read under mu. */
+typedef struct wtq_nw_test_bell_snapshot {
+    bool armed;
+    uint64_t deadline_us;
+} wtq_nw_test_bell_snapshot_t;
+void wtq_nw_test_bell_snapshot(wtq_nw_conn_t *c,
+                               wtq_nw_test_bell_snapshot_t *out);
+/* The exact pure delay-clamp helpers ring_after uses (saturating). */
+uint64_t wtq_nw_test_bell_effective_delay_us(uint64_t delay_us);
+uint64_t wtq_nw_test_bell_deadline_us(uint64_t now_us, uint64_t eff_us);
 
 /*
  * TEST HOOK (nw_send_holder.m): create a holder capturing `on_retire`/
@@ -397,6 +487,66 @@ extern int wtq_nw_test_dgram_reap_src[WTQ_NW_REAP_SRC__N];
  * before-child-terminal teardown order (children are then torn down
  * from the group-terminal path). */
 void wtq_nw_test_cancel_group(struct wtq_driver *drv);
+
+/*
+ * TEST SEAM: run the receive-completion body directly on the serialization
+ * domain — the production path is Apple's nw_connection_receive callback,
+ * not externally schedulable, so this lets a test inject a completion
+ * (bytes / FIN / error / cancel) at a controlled moment and prove the
+ * pause deferral deterministically. `content` is borrowed for the call
+ * (retained internally when deferred). NOT a production seam.
+ */
+void wtq_nw_test_deliver_recv(struct wtq_dstream *ds, dispatch_data_t content,
+                             bool fin, bool errored, bool cancelled);
+
+/* TEST-VISIBLE invariant counter: a completion was deferred while one was
+ * already held (the single-outstanding-receive invariant was violated). It
+ * fails the connection; the counter only records that it fired. */
+extern int wtq_nw_test_recv_defer_overflow;
+
+/* TEST SEAM: invoked on the serialization domain the instant a receive
+ * completion is DEFERRED while paused — the test-visible deferral event a
+ * test thread can condition-wait on (a direct same-stream barrier; no
+ * cross-stream ordering assumptions). NULL (the default) is a no-op. */
+extern void (*wtq_nw_test_defer_hook)(struct wtq_dstream *ds);
+
+
+/* nw_connection_receive arms are attributed PER STREAM (struct wtq_dstream's
+ * recv_arm_count, test-only), not a process-global counter: a global reading
+ * is perturbed by any other live stream that arms between two samples, so a
+ * cross-stream arm could spuriously fail or pass a single-stream assertion. */
+
+/*
+ * TEST SEAM: drive the peer-reset (stream `failed`) transition on the
+ * domain — sets failed_seen, runs the failure handler (which emits
+ * on_stream_reset), converges to cancelled — PLUS a same-turn capture
+ * and guard probe. After the failure the ds may be reaped on ANY later domain turn
+ * (the two-phase reap gives no fixed validity window), so post-failure
+ * state reads and the direct op_recv_enable guard probe must happen in
+ * the SAME domain operation as the failure — never as separate
+ * dispatches. Captures the deferral flag and per-stream arm count after
+ * the failure, then probes op_recv_enable(!recv_enabled) and records
+ * that recv_enabled was not mutated by the rejected call.
+ */
+typedef struct wtq_nw_test_fail_probe {
+    bool deferred_after;     /* recv_deferred after the failure */
+    unsigned arms_after;     /* recv_arm_count after the failure */
+    bool re_before;          /* recv_enabled before the guard probe */
+    wtq_result_t enable_rc;  /* op_recv_enable(drv, ds, !re_before) */
+    bool re_after;           /* recv_enabled after the probe */
+} wtq_nw_test_fail_probe_t;
+
+void wtq_nw_test_stream_fail_probe(struct wtq_driver *drv,
+                                   struct wtq_dstream *ds,
+                                   wtq_nw_test_fail_probe_t *out);
+
+/*
+ * TEST SEAM: call op_recv_enable directly on the domain, bypassing the
+ * session/engine layers, so the backend's reject-without-mutation guard
+ * (failed/cancelled/terminal/handleless) can be proven on its own.
+ */
+wtq_result_t wtq_nw_test_recv_enable(struct wtq_driver *drv,
+                                     struct wtq_dstream *ds, bool enabled);
 
 #else /* !WTQ_NW_TESTING */
 #define WTQ_NW_TEST(stmt) ((void)0)

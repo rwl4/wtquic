@@ -124,18 +124,45 @@ struct side {
     bool close_when_dgrams_back;  /* close once echo+empty both seen */
     bool pause_before_ping;       /* pause the bidi stream's receive
                                      side before sending the ping */
-    bool resume_on_send_complete; /* resume the paused stream when the
-                                     ping's completion arrives */
+    bool resume_on_marker;        /* resume the paused stream when the
+                                     independent barrier marker arrives */
     bool close_in_send_complete;  /* close the session instead */
     bool echo_big_on_fin;         /* answer a stream FIN with a large
                                      (600 KiB) response */
+    bool marker_after_big;        /* run the window-exhausting barrier: a
+                                     prefix fills the peer's receive window,
+                                     and only its completion queues the
+                                     blocked remainder and the marker */
     wtq_result_t pause_rc;
+    wtq_receive_pause_mode_t pause_mode; /* sampled at the pause */
     wtq_result_t resume_rc;
-    size_t data_at_resume;        /* bytes delivered before the resume */
+    size_t data_at_resume;        /* bytes delivered on the target stream at
+                                     the barrier (before the resume) */
+    int marker_seen;              /* barrier markers received (client) */
+    int marker_completions;       /* marker send completions (server) */
+    int prefix_completions;       /* window-filling prefix completions: its
+                                     ACK proves the prefix reached the peer
+                                     and exhausted the credit (server) */
+    wtq_stream_t *target_stream;  /* server: the response stream, so the
+                                     remainder can be queued from the
+                                     prefix's completion */
     wtq_stream_t *held;           /* the paused stream (live only) */
+    bool verify_pattern;          /* byte-exact check received data against
+                                     the deterministic budget_a pattern */
+    size_t data_mismatch;         /* bytes that did not match the pattern */
+    struct side *peer;            /* the other end (for cross-side probes) */
+    int peer_completions_at_resume; /* peer's stream-send completions sampled
+                                       at the barrier (-1 = not sampled) */
 
     wtq_session_t *session; /* server: seen in callbacks; client: ours */
 };
+
+/* Deterministic content for byte-exact verification of the large response
+ * (budget_a is filled with this in main). */
+static uint8_t pause_pat_byte(size_t i)
+{
+    return (uint8_t)(i * 131u + 17u);
+}
 
 /* Static payloads for the budget probe (static lifetime, so the
  * borrow-until-completion contract is trivially honored): two 600 KiB
@@ -150,9 +177,25 @@ static uint8_t bulk_payload[32 * 1024];
  * probe */
 static uint8_t oversized_payload[3 * 1024 * 1024];
 
+/* The pause barrier splits the large response at the peer's configured
+ * receive window: a prefix exactly fills the window, and its completion
+ * (transport ACK — proof the prefix reached the peer and exhausted the
+ * credit) is what queues the blocked remainder and the free-flowing
+ * marker. Keep this equal to the client's stream_recv_window below. */
+#define PAUSE_WINDOW (16u * 1024u)
+#define PAUSE_PREFIX_LEN PAUSE_WINDOW
+
+/* Distinct sentinel send contexts for the barrier's three sends. Their
+ * addresses are distinctive and never heap-owned, so cb_send_complete can
+ * account each apart from the ordinary stream-send path. */
+static int g_prefix_ctx;
+static int g_remainder_ctx;
+static int g_marker_ctx;
+
 static void side_init(struct side *sd)
 {
     memset(sd, 0, sizeof(*sd));
+    sd->peer_completions_at_resume = -1;
     pthread_mutex_init(&sd->mu, NULL);
     pthread_cond_init(&sd->cv, NULL);
 }
@@ -210,6 +253,11 @@ static void cb_established(wtq_session_t *s, wtq_str_t sub, void *user)
                  * response cannot have been delivered yet */
                 pthread_mutex_lock(&sd->mu);
                 sd->pause_rc = wtq_stream_pause_receive(st);
+                /* the MsQuic backend's advertised pause mode is HARD
+                 * flow-control backpressure (the logical pause arrests a
+                 * queued RECEIVE and extends no credit) — assert the
+                 * query agrees with the backend under test */
+                sd->pause_mode = wtq_stream_receive_pause_mode(st);
                 sd->held = st;
                 pthread_mutex_unlock(&sd->mu);
             }
@@ -446,7 +494,46 @@ static void cb_stream_data(wtq_session_t *s, wtq_stream_t *st,
     struct side *sd = user;
 
     (void)s;
+
+    /* The pause-barrier marker arrives on its own (uni) stream, never the
+     * held bidi. Its arrival proves the peer has queued the big response
+     * while the target stayed paused: sample the target's (still zero)
+     * progress and the peer's (still zero) send completions, then resume.
+     * The marker byte is not counted as target payload. */
+    if (sd->resume_on_marker && !wtq_stream_is_bidi(st)) {
+        pthread_mutex_lock(&sd->mu);
+        if (sd->marker_seen == 0) {
+            int pc = -1;
+
+            if (sd->peer != NULL) {
+                pthread_mutex_lock(&sd->peer->mu);
+                pc = sd->peer->send_completions;
+                pthread_mutex_unlock(&sd->peer->mu);
+            }
+            sd->peer_completions_at_resume = pc;
+            sd->data_at_resume = sd->data_total;
+            if (sd->held != NULL)
+                sd->resume_rc = wtq_stream_resume_receive(sd->held);
+        }
+        sd->marker_seen++;
+        side_signal(sd);
+        pthread_mutex_unlock(&sd->mu);
+        return;
+    }
+
     pthread_mutex_lock(&sd->mu);
+    /* byte-exact check over the WHOLE stream (data[] only caps the small
+     * snapshot; this verifies every received byte against the pattern at
+     * its stream offset) */
+    if (sd->verify_pattern) {
+        size_t off = sd->data_total; /* offset of this chunk */
+
+        for (size_t i = 0; i < len; i++)
+            if (data[i] != pause_pat_byte(off + i)) {
+                sd->data_mismatch++;
+                break;
+            }
+    }
     sd->data_events++;
     sd->data_total += len;
     if (len > 0 && sd->data_len + len <= sizeof(sd->data)) {
@@ -459,9 +546,25 @@ static void cb_stream_data(wtq_session_t *s, wtq_stream_t *st,
     pthread_mutex_unlock(&sd->mu);
 
     if (fin && sd->echo_big_on_fin && wtq_stream_is_bidi(st)) {
-        wtq_span_t span = { budget_a, sizeof(budget_a) };
+        if (sd->marker_after_big) {
+            /* Window-exhausting barrier: send ONLY a prefix that exactly
+             * fills the peer's receive window. Its completion (a transport
+             * ACK) proves the prefix reached the peer and consumed the
+             * whole credit; the remainder and the independent marker are
+             * queued from that completion (cb_send_complete), so the
+             * remainder is provably flow-control-blocked at the barrier
+             * and the marker cannot precede the target reaching the peer. */
+            wtq_span_t pre = { budget_a, PAUSE_PREFIX_LEN };
 
-        (void)wtq_stream_send(st, &span, 1, WTQ_SEND_FIN, NULL);
+            pthread_mutex_lock(&sd->mu);
+            sd->target_stream = st;
+            pthread_mutex_unlock(&sd->mu);
+            (void)wtq_stream_send(st, &pre, 1, 0, &g_prefix_ctx);
+        } else {
+            wtq_span_t span = { budget_a, sizeof(budget_a) };
+
+            (void)wtq_stream_send(st, &span, 1, WTQ_SEND_FIN, NULL);
+        }
     }
     if (fin && sd->echo_on_fin && wtq_stream_is_bidi(st)) {
         static const uint8_t pong[4] = { 'p', 'o', 'n', 'g' };
@@ -534,27 +637,59 @@ static void cb_send_complete(wtq_session_t *s, void *send_ctx,
                              bool canceled, void *user)
 {
     struct side *sd = user;
-    wtq_stream_t *held;
 
+    /* Barrier sends use sentinel contexts: account each apart from the
+     * ordinary stream-send path, and never free them (they are not heap). */
+    if (send_ctx == &g_marker_ctx) {
+        pthread_mutex_lock(&sd->mu);
+        sd->marker_completions++;
+        side_signal(sd);
+        pthread_mutex_unlock(&sd->mu);
+        return;
+    }
+    if (send_ctx == &g_prefix_ctx) {
+        /* the prefix reached the peer and exhausted its receive window;
+         * NOW queue the remainder (provably blocked — the window is shut
+         * until the paused client consumes) and the free-flowing marker */
+        wtq_stream_t *tgt;
+
+        pthread_mutex_lock(&sd->mu);
+        sd->prefix_completions++;
+        tgt = sd->target_stream;
+        side_signal(sd);
+        pthread_mutex_unlock(&sd->mu);
+
+        if (tgt != NULL) {
+            wtq_span_t rem = { budget_a + PAUSE_PREFIX_LEN,
+                               sizeof(budget_a) - PAUSE_PREFIX_LEN };
+
+            (void)wtq_stream_send(tgt, &rem, 1, WTQ_SEND_FIN,
+                                  &g_remainder_ctx);
+        }
+        wtq_stream_t *mk = NULL;
+        if (wtq_session_open_uni(s, &mk) == WTQ_OK) {
+            static const uint8_t m[1] = { 'M' };
+            wtq_span_t ms = { m, sizeof(m) };
+
+            (void)wtq_stream_send(mk, &ms, 1, WTQ_SEND_FIN, &g_marker_ctx);
+        }
+        return;
+    }
+
+    /* the remainder is the "real" response completion; everything else
+     * (the client's ping) is an ordinary heap-owned send */
     pthread_mutex_lock(&sd->mu);
     sd->send_completions++;
     if (canceled)
         sd->send_cancels++;
-    sd->data_at_resume = sd->data_total;
-    held = sd->held;
     side_signal(sd);
     pthread_mutex_unlock(&sd->mu);
 
-    if (sd->resume_on_send_complete && held != NULL) {
-        pthread_mutex_lock(&sd->mu);
-        sd->resume_rc = wtq_stream_resume_receive(held);
-        pthread_mutex_unlock(&sd->mu);
-    }
     if (sd->close_in_send_complete)
         (void)wtq_session_close(s, 0, NULL, 0);
 
-    /* the completion is the legal release point for the send's data */
-    free(send_ctx);
+    if (send_ctx != &g_remainder_ctx)
+        free(send_ctx); /* the remainder ctx is a sentinel, not heap */
 }
 
 static void cb_datagram(wtq_session_t *s, const uint8_t *data, size_t len,
@@ -1461,14 +1596,17 @@ static int t_pause_resume(void)
     side_init(&sv);
     side_init(&cl);
     sv.echo_big_on_fin = true;
+    sv.marker_after_big = true; /* wire barrier once the response is queued */
     cl.ping_in_established = true;
     cl.pause_before_ping = true;
-    cl.resume_on_send_complete = true;
+    cl.resume_on_marker = true; /* resume only once the barrier arrives */
     cl.close_on_fin = true;
     cl.close_code = 5;
     cl.release_in_closed = true;
+    cl.verify_pattern = true;   /* byte-exact check of the 600 KiB response */
+    cl.peer = &sv;              /* sample the server's stall at the barrier */
 
-    client_ecfg.tuning.stream_recv_window = 16u * 1024u;
+    client_ecfg.tuning.stream_recv_window = PAUSE_WINDOW;
     WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&server_ecfg, &senv),
                           WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&client_ecfg, &cenv),
@@ -1495,11 +1633,28 @@ static int t_pause_resume(void)
         wtq_msquic_env_close(cenv);
 
     WTQ_TEST_CHECK_EQ_INT(cl.pause_rc, WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT((int)cl.pause_mode,
+                          (int)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED);
     WTQ_TEST_CHECK_EQ_INT(cl.resume_rc, WTQ_OK);
-    /* nothing was delivered while paused… */
+    /* the barrier's precondition: the window-filling prefix completed, so
+     * the target stream demonstrably reached the peer and exhausted its
+     * receive credit BEFORE the remainder and marker were queued */
+    WTQ_TEST_CHECK_EQ_INT(sv.prefix_completions, 1);
+    /* the barrier fired: the marker (sent only after the prefix completed)
+     * arrived, so the samples below are taken at a point where the target
+     * has provably consumed its credit and the remainder is blocked */
+    WTQ_TEST_CHECK_EQ_INT(cl.marker_seen, 1);
+    /* nothing of the response reached the app while paused — not even the
+     * prefix that filled the transport window… */
     WTQ_TEST_CHECK_EQ_SIZE(cl.data_at_resume, 0);
-    /* …and everything (FIN last) after the resume */
+    /* …and the remainder made no progress: its send had not completed at
+     * the barrier because the window was pinned shut by the paused
+     * receiver (prefix and marker completions are accounted separately, so
+     * neither can mask this)… */
+    WTQ_TEST_CHECK_EQ_INT(cl.peer_completions_at_resume, 0);
+    /* …and everything (FIN last) after the resume, byte-exact */
     WTQ_TEST_CHECK_EQ_SIZE(cl.data_total, sizeof(budget_a));
+    WTQ_TEST_CHECK_EQ_SIZE(cl.data_mismatch, 0);
     WTQ_TEST_CHECK_EQ_INT(cl.fin_events, 1);
     WTQ_TEST_CHECK_EQ_INT(cl.send_completions, 1);
     WTQ_TEST_CHECK_EQ_INT(sv.send_completions, 1);
@@ -1567,6 +1722,8 @@ static int t_close_while_paused(void)
         wtq_msquic_env_close(cenv);
 
     WTQ_TEST_CHECK_EQ_INT(cl.pause_rc, WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT((int)cl.pause_mode,
+                          (int)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED);
     /* the response never reached the app */
     WTQ_TEST_CHECK_EQ_SIZE(cl.data_total, 0);
     WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
@@ -1589,6 +1746,10 @@ int main(int argc, char **argv)
 
     if (certs_locate(argc > 1 ? argv[1] : NULL) != 0)
         return 2;
+
+    /* deterministic content for the byte-exact pause/resume check */
+    for (size_t i = 0; i < sizeof(budget_a); i++)
+        budget_a[i] = pause_pat_byte(i);
 
     failures += t_handshake_close();
     failures += t_unknown_path_404();

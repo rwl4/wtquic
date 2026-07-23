@@ -44,6 +44,7 @@ set(ALLOWED_SYMBOLS
     wtq_stream_stop_sending
     wtq_stream_pause_receive
     wtq_stream_resume_receive
+    wtq_stream_receive_pause_mode
     wtq_stream_id
     wtq_stream_is_bidi
     wtq_stream_is_local
