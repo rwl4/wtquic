@@ -563,7 +563,9 @@ static wtq_result_t conn_open_locals(wtq_conn_t *conn)
 {
     /* Control stream: type 0x00 + our SETTINGS frame. */
     uint8_t buf[1 + 8 + 64];
-    wtq_h3_settings_encode_cfg_t scfg = { conn->ecp, conn->wt_profile };
+    wtq_h3_settings_encode_cfg_t scfg = {
+        conn->ecp, wtq_h3_wt_profile_bit(conn->wt_profile)
+    };
     size_t flen = 0;
 
     buf[0] = 0x00;

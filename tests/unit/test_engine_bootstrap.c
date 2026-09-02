@@ -71,7 +71,10 @@ static void rig_down(rig_t *r)
 static size_t build_peer_control(uint8_t *dst, size_t cap, bool ecp,
                                  bool legacy)
 {
-    wtq_h3_settings_encode_cfg_t cfg = { ecp, legacy };
+    wtq_h3_settings_encode_cfg_t cfg = {
+        ecp, legacy ? WTQ_H3_WT_PROFILES_D13_14_COMPAT
+                    : WTQ_H3_WT_PROFILES_CURRENT
+    };
     size_t flen = 0;
 
     dst[0] = 0x00;

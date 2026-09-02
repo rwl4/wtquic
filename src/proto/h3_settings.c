@@ -128,8 +128,9 @@ typedef struct out_setting {
     uint64_t value;
 } out_setting_t;
 
-/* Worst case: 2 QPACK zeros + ECP + DATAGRAM + one WT setting. */
-#define MAX_OUT_SETTINGS 5
+/* Worst case: 2 QPACK zeros + ECP + DATAGRAM + one WT setting per known
+ * profile (a full multi-version advertisement). */
+#define MAX_OUT_SETTINGS (4 + WTQ_H3_WT_PROFILE_COUNT)
 
 static size_t build_out_settings(const wtq_h3_settings_encode_cfg_t *cfg,
                                  out_setting_t *out)
@@ -146,12 +147,33 @@ static size_t build_out_settings(const wtq_h3_settings_encode_cfg_t *cfg,
     }
     out[n].id = WTQ_H3_SET_H3_DATAGRAM;
     out[n++].value = 1;
-    /* Exactly ONE WT setting, chosen by profile — never both dialects,
-     * never the D07 codepoint. */
-    if (cfg->wt_profile == WTQ_H3_WT_PROFILE_D13_14_COMPAT) {
+    /*
+     * One WT setting per set member, in ASCENDING identifier order so the
+     * payload stays byte-exact testable (0x14e9cd29 < 0x2c7cf000). This is
+     * a capability advertisement, not a selection: several members is a
+     * legitimate multi-version offer. The D07 codepoint (0xc671706a) is
+     * never emitted — it stays receive-only.
+     *
+     * TOTALITY: mask to the profiles this build knows FIRST, then fall back
+     * to CURRENT-only when nothing known remains. Masking before the test is
+     * what makes the fallback true: a non-zero set carrying only UNKNOWN bits
+     * would otherwise slip past a bare `== 0` check and emit an
+     * advertisement with no WT capability signal at all. Rejecting unknown
+     * caller bits stays the engine/public boundary's job; this is defence in
+     * depth, not public acceptance.
+     */
+    wtq_h3_wt_profile_set_t profiles =
+        cfg->wt_profiles & WTQ_H3_WT_PROFILES_ALL;
+    if (profiles == 0)
+        profiles = WTQ_H3_WT_PROFILES_CURRENT;
+    if (profiles & WTQ_H3_WT_PROFILES_D13_14_COMPAT) {
         out[n].id = WTQ_H3_SET_WT_MAX_SESSIONS_D13;
         out[n++].value = 1;
-    } else {
+    }
+    if (profiles & WTQ_H3_WT_PROFILES_CURRENT) {
+        /* draft-16 s3.1: the value MUST be exactly 1. Always send 1 —
+         * drafts 15 and 16 share this codepoint but draft-16 treats > 1 as
+         * H3_SETTINGS_ERROR, so 1 is the only value both accept. */
         out[n].id = WTQ_H3_SET_WT_ENABLED;
         out[n++].value = 1;
     }
@@ -215,27 +237,79 @@ wtq_h3_settings_status_t wtq_h3_settings_encode_frame(
     return WTQ_H3_SETTINGS_OK;
 }
 
+/*
+ * Profile precedence, NEWEST DRAFT FIRST. This ordering is the negotiation
+ * policy ("the highest version supported by both endpoints is selected",
+ * draft-16 s7.1) and is deliberately explicit rather than derived from the
+ * enum's numeric values, so introducing a profile cannot silently reorder
+ * preference.
+ */
+static const wtq_h3_wt_profile_t WT_PRECEDENCE[] = {
+    WTQ_H3_WT_PROFILE_CURRENT,        /* drafts 15-16 */
+    WTQ_H3_WT_PROFILE_D13_14_COMPAT,  /* drafts 13-14 */
+};
+
+_Static_assert(sizeof(WT_PRECEDENCE) / sizeof(WT_PRECEDENCE[0]) ==
+                   WTQ_H3_WT_PROFILE_COUNT,
+               "every known profile must appear exactly once in the "
+               "precedence table");
+
+/* Does the peer advertise THIS profile's WT signal? */
+static bool peer_advertises(const wtq_h3_settings_t *peer,
+                            wtq_h3_wt_profile_t profile)
+{
+    switch (profile) {
+    case WTQ_H3_WT_PROFILE_CURRENT:
+        /* draft-16: a 0/1 boolean; the decoder already rejects > 1. */
+        return peer->has_wt_enabled && peer->wt_enabled == 1;
+    case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
+        return peer->has_wt_max_sessions_d13 &&
+               peer->wt_max_sessions_d13 > 0;
+    }
+    return false;
+}
+
+bool wtq_h3_settings_select_profile(const wtq_h3_settings_t *peer,
+                                    bool peer_is_server,
+                                    wtq_h3_wt_profile_set_t set,
+                                    wtq_h3_wt_profile_t *out)
+{
+    if (peer == NULL || out == NULL)
+        return false;
+
+    /* Profile-independent requirements first: they gate every profile
+     * equally, so a peer failing them has no mutual profile at all. */
+    if (!(peer->has_h3_datagram && peer->h3_datagram == 1))
+        return false;
+    if (peer_is_server &&
+        !(peer->has_enable_connect_protocol &&
+          peer->enable_connect_protocol == 1))
+        return false;
+
+    /* The intersection, walked newest-first: the first hit is the highest
+     * mutually supported profile. A signal for a profile outside `set` is
+     * ignored — it can never select anything on its own. */
+    for (size_t i = 0; i < WTQ_H3_WT_PROFILE_COUNT; i++) {
+        wtq_h3_wt_profile_t p = WT_PRECEDENCE[i];
+
+        if ((set & wtq_h3_wt_profile_bit(p)) == 0)
+            continue;
+        if (!peer_advertises(peer, p))
+            continue;
+        *out = p;
+        return true;
+    }
+    return false;
+}
+
 bool wtq_h3_settings_peer_supports_wt(const wtq_h3_settings_t *peer,
                                       bool peer_is_server,
                                       wtq_h3_wt_profile_t profile)
 {
-    /* PROFILE-AWARE: only the SELECTED profile's WT setting satisfies it.
-     * A setting from the other dialect does not count — current mode
-     * requires WT_ENABLED=1; D13/14 compat requires WT_MAX_SESSIONS
-     * (0x14e9cd29) > 0. (The decoder already rejects WT_ENABLED > 1.) */
-    bool wt_signal;
-    if (profile == WTQ_H3_WT_PROFILE_D13_14_COMPAT)
-        wt_signal = peer->has_wt_max_sessions_d13 &&
-                    peer->wt_max_sessions_d13 > 0;
-    else
-        wt_signal = peer->has_wt_enabled && peer->wt_enabled == 1;
+    wtq_h3_wt_profile_t sel;
 
-    bool datagram = peer->has_h3_datagram && peer->h3_datagram == 1;
-
-    if (!wt_signal || !datagram)
-        return false;
-    if (peer_is_server)
-        return peer->has_enable_connect_protocol &&
-               peer->enable_connect_protocol == 1;
-    return true;
+    /* One implementation of the policy: ask for exactly this profile. */
+    return wtq_h3_settings_select_profile(peer, peer_is_server,
+                                          wtq_h3_wt_profile_bit(profile),
+                                          &sel);
 }

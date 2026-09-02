@@ -54,36 +54,107 @@ static bool tp_varint(const uint8_t *p, size_t len, size_t *off,
 #define ID_WT_MAXSESS13 0x14e9cd29ull
 #define ID_WT_MAXSESS07 0xc671706aull
 #define ID_ENABLE_WT    0x2b603742ull
+#define ID_QPACK_CAP     0x01ull
+#define ID_QPACK_BLOCKED 0x07ull
+#define ID_ECP           0x08ull
+#define ID_DATAGRAM      0x33ull
 
 /* Walk a bare SETTINGS PAYLOAD (id,value pairs) and record which WT
  * signals appear. Returns false on a malformed stream. */
 typedef struct {
-    bool wt_enabled;   uint64_t wt_enabled_v;
-    bool max13;        uint64_t max13_v;
-    bool max07;        uint64_t max07_v;
-    bool enable_wt;    uint64_t enable_wt_v;
+    bool wt_enabled;   uint64_t wt_enabled_v;   unsigned wt_enabled_n;
+    bool max13;        uint64_t max13_v;        unsigned max13_n;
+    bool max07;        uint64_t max07_v;        unsigned max07_n;
+    bool enable_wt;    uint64_t enable_wt_v;    unsigned enable_wt_n;
+    /* shared base every wtquic advertisement carries */
+    bool qpack_cap;     uint64_t qpack_cap_v;
+    bool qpack_blocked; uint64_t qpack_blocked_v;
+    bool ecp;           uint64_t ecp_v;
+    bool datagram;      uint64_t datagram_v;
+    /* identifiers never DECREASE across the payload. Non-decreasing (not
+     * strict) on purpose: that keeps ORDER and DUPLICATE detection
+     * independently load-bearing — a repeat is caught by the *_n counts,
+     * a swap by this flag. */
+    bool nondecreasing;
+    size_t pairs;
 } tp_wt_signals_t;
 
 static bool tp_scan_settings(const uint8_t *p, size_t len,
                              tp_wt_signals_t *s)
 {
     size_t off = 0;
+    bool have_last = false;
+    uint64_t last_id = 0;
+
     memset(s, 0, sizeof(*s));
+    s->nondecreasing = true;
     while (off < len) {
         uint64_t id, val;
         if (!tp_varint(p, len, &off, &id))
             return false;
         if (!tp_varint(p, len, &off, &val))
             return false;
+        if (have_last && id < last_id)
+            s->nondecreasing = false;
+        last_id = id;
+        have_last = true;
+        s->pairs++;
         switch (id) {
-        case ID_WT_ENABLED:   s->wt_enabled = true; s->wt_enabled_v = val; break;
-        case ID_WT_MAXSESS13: s->max13 = true;      s->max13_v = val;      break;
-        case ID_WT_MAXSESS07: s->max07 = true;      s->max07_v = val;      break;
-        case ID_ENABLE_WT:    s->enable_wt = true;  s->enable_wt_v = val;  break;
-        default: break; /* QPACK zeros, DATAGRAM, ECP, grease: ignored */
+        case ID_WT_ENABLED:
+            s->wt_enabled = true; s->wt_enabled_v = val; s->wt_enabled_n++;
+            break;
+        case ID_WT_MAXSESS13:
+            s->max13 = true;      s->max13_v = val;      s->max13_n++;
+            break;
+        case ID_WT_MAXSESS07:
+            s->max07 = true;      s->max07_v = val;      s->max07_n++;
+            break;
+        case ID_ENABLE_WT:
+            s->enable_wt = true;  s->enable_wt_v = val;  s->enable_wt_n++;
+            break;
+        case ID_QPACK_CAP:     s->qpack_cap = true;     s->qpack_cap_v = val;     break;
+        case ID_QPACK_BLOCKED: s->qpack_blocked = true; s->qpack_blocked_v = val; break;
+        case ID_ECP:           s->ecp = true;           s->ecp_v = val;           break;
+        case ID_DATAGRAM:      s->datagram = true;      s->datagram_v = val;      break;
+        default: break; /* grease and anything else: ignored */
         }
     }
     return true;
+}
+
+/* Does the payload carry the shared base every wtquic advertisement has?
+ * (QPACK zeros, ECP=1, H3_DATAGRAM=1.) */
+static bool tp_base_ok(const tp_wt_signals_t *s)
+{
+    return s->qpack_cap && s->qpack_cap_v == 0 &&
+           s->qpack_blocked && s->qpack_blocked_v == 0 &&
+           s->ecp && s->ecp_v == 1 &&
+           s->datagram && s->datagram_v == 1;
+}
+
+/*
+ * Strict CURRENT + D13/14 UNION classifier — the independent oracle for a
+ * multi-version advertisement. Requires: BOTH supported signals present
+ * EXACTLY ONCE with value 1; NO D07 and NO Chrome/D02 signal; the shared
+ * base intact; and identifiers non-decreasing, which pins the
+ * deterministic ascending emission order (0x14e9cd29 before 0x2c7cf000).
+ * Deliberately does NOT call the production SETTINGS decoder, so encoder
+ * and decoder cannot agree on the same defect.
+ */
+static bool tp_settings_is_union(const uint8_t *p, size_t len)
+{
+    tp_wt_signals_t s;
+    if (!tp_scan_settings(p, len, &s))
+        return false;
+    if (!s.nondecreasing)
+        return false;
+    if (!tp_base_ok(&s))
+        return false;
+    if (!(s.max13 && s.max13_n == 1 && s.max13_v == 1))
+        return false;
+    if (!(s.wt_enabled && s.wt_enabled_n == 1 && s.wt_enabled_v == 1))
+        return false;
+    return !s.max07 && !s.enable_wt;
 }
 
 /* Strict CURRENT SETTINGS: WT_ENABLED==1 present, and NO other-profile
@@ -254,6 +325,137 @@ static bool tp_connect_is_compat(const uint8_t *p, size_t len)
 
 /* ---- tests ---------------------------------------------------------- */
 
+/*
+ * The multi-version advertisement, validated by the INDEPENDENT parser.
+ * Input comes from the production ENCODER (encoders are fine here — only
+ * the production DECODER is off-limits), so a defect the encoder and
+ * decoder would agree on is still caught.
+ */
+static void test_settings_union_parser(int *fp)
+{
+    int failures = 0;
+    uint8_t buf[64];
+    size_t n = 0;
+
+    /* The real union the encoder emits classifies as a union, and as
+     * NEITHER single-profile shape (each of those forbids the other's
+     * signal). */
+    wtq_h3_settings_encode_cfg_t both = { true, WTQ_H3_WT_PROFILES_ALL };
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&both, buf, sizeof(buf),
+                                                  &n) == WTQ_H3_SETTINGS_OK);
+    WTQ_TEST_CHECK(tp_settings_is_union(buf, n));
+    WTQ_TEST_CHECK(!tp_settings_is_current(buf, n));
+    WTQ_TEST_CHECK(!tp_settings_is_compat(buf, n));
+    /* and BOTH peer-signal rules match it — it offers both generations */
+    WTQ_TEST_CHECK(tp_peer_is_current(buf, n));
+    WTQ_TEST_CHECK(tp_peer_is_compat(buf, n));
+
+    /* Neither single-profile payload is a union. */
+    wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILES_CURRENT };
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cur, buf, sizeof(buf),
+                                                  &n) == WTQ_H3_SETTINGS_OK);
+    WTQ_TEST_CHECK(!tp_settings_is_union(buf, n));
+    wtq_h3_settings_encode_cfg_t cmp = {
+        true, WTQ_H3_WT_PROFILES_D13_14_COMPAT };
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cmp, buf, sizeof(buf),
+                                                  &n) == WTQ_H3_SETTINGS_OK);
+    WTQ_TEST_CHECK(!tp_settings_is_union(buf, n));
+
+    /* --- hand-built negatives: the oracle must REJECT each defect --- */
+    /* the exact good union, for reference */
+    const uint8_t ok[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,       /* 0x14e9cd29 = 1 */
+        0xac, 0x7c, 0xf0, 0x00, 0x01,       /* 0x2c7cf000 = 1 */
+    };
+    WTQ_TEST_CHECK(tp_settings_is_union(ok, sizeof(ok)));
+
+    /* missing member: CURRENT dropped */
+    const uint8_t miss_cur[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(miss_cur, sizeof(miss_cur)));
+
+    /* missing member: D13/14 dropped */
+    const uint8_t miss_d13[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(miss_d13, sizeof(miss_d13)));
+
+    /* DUPLICATE member (still non-decreasing, so the *_n count is what
+     * catches this — order and duplication are independent checks) */
+    const uint8_t dup[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,       /* repeated CURRENT */
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(dup, sizeof(dup)));
+
+    /* WRONG VALUE on each member */
+    const uint8_t bad_cur_val[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x00,       /* WT_ENABLED = 0 */
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(bad_cur_val, sizeof(bad_cur_val)));
+    const uint8_t bad_d13_val[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x00,       /* MAX_SESSIONS = 0 */
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(bad_d13_val, sizeof(bad_d13_val)));
+
+    /* WRONG ORDER: CURRENT emitted before D13/14 (ids decrease) */
+    const uint8_t swapped[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(swapped, sizeof(swapped)));
+
+    /* FOREIGN generation present: D07 (0xc671706a, 8-byte varint id) */
+    const uint8_t with_d07[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+        0xc0, 0x00, 0x00, 0x00, 0xc6, 0x71, 0x70, 0x6a, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(with_d07, sizeof(with_d07)));
+
+    /* FOREIGN generation present: Chrome/D02 ENABLE_WEBTRANSPORT
+     * (0x2b603742). Placed in ascending position so ORDER is not what
+     * rejects it — the foreign-signal rule is. */
+    const uint8_t with_d02[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xab, 0x60, 0x37, 0x42, 0x01,       /* 0x2b603742 = 1 */
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(with_d02, sizeof(with_d02)));
+
+    /* SHARED BASE broken: H3_DATAGRAM missing */
+    const uint8_t no_dgram[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(no_dgram, sizeof(no_dgram)));
+
+    /* SHARED BASE broken: ECP present but 0 */
+    const uint8_t bad_ecp[] = {
+        0x01, 0x00, 0x07, 0x00, 0x08, 0x00, 0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01,
+        0xac, 0x7c, 0xf0, 0x00, 0x01,
+    };
+    WTQ_TEST_CHECK(!tp_settings_is_union(bad_ecp, sizeof(bad_ecp)));
+
+    *fp += failures;
+}
+
+
 static void test_settings_parsers(int *fp)
 {
     int failures = 0;
@@ -261,15 +463,14 @@ static void test_settings_parsers(int *fp)
     size_t n = 0;
 
     /* current-profile SETTINGS from the production encoder */
-    wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILE_CURRENT };
+    wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILES_CURRENT };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cur, buf, sizeof(buf),
                                                   &n) == WTQ_H3_SETTINGS_OK);
     WTQ_TEST_CHECK(tp_settings_is_current(buf, n));
     WTQ_TEST_CHECK(!tp_settings_is_compat(buf, n)); /* cross-profile fails */
 
     /* compat-profile SETTINGS */
-    wtq_h3_settings_encode_cfg_t cmp = {
-        true, WTQ_H3_WT_PROFILE_D13_14_COMPAT };
+    wtq_h3_settings_encode_cfg_t cmp = { true, WTQ_H3_WT_PROFILES_D13_14_COMPAT };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cmp, buf, sizeof(buf),
                                                   &n) == WTQ_H3_SETTINGS_OK);
     WTQ_TEST_CHECK(tp_settings_is_compat(buf, n));
@@ -410,9 +611,8 @@ static void test_profile_table(int *fp)
     /* AXIS 1 (SPECIFIC): SETTINGS share the whole base and differ ONLY
      * in the trailing WT signal (8-byte common prefix identical). */
     {
-        wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILE_CURRENT };
-        wtq_h3_settings_encode_cfg_t cmp = {
-            true, WTQ_H3_WT_PROFILE_D13_14_COMPAT };
+        wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILES_CURRENT };
+        wtq_h3_settings_encode_cfg_t cmp = { true, WTQ_H3_WT_PROFILES_D13_14_COMPAT };
         WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cur, a, sizeof(a),
                                                       &na) ==
                        WTQ_H3_SETTINGS_OK);
@@ -497,6 +697,7 @@ int main(void)
 {
     int failures = 0;
     test_settings_parsers(&failures);
+    test_settings_union_parser(&failures);
     test_connect_token_parsers(&failures);
     test_profile_table(&failures);
     WTQ_TEST_PASS("test_profile_parsers");

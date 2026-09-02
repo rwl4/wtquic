@@ -68,8 +68,7 @@ size_t wt15_vectors_build(wt15_vector_t *out, size_t max)
         wt15_vector_t *v = NEXT("settings_compat_send", WT15_SETTINGS,
                                 "D13/14 compat profile: WT_MAX_SESSIONS "
                                 "0x14e9cd29=1 only (no WT_ENABLED, no D07)");
-        wtq_h3_settings_encode_cfg_t cfg = {
-            true, WTQ_H3_WT_PROFILE_D13_14_COMPAT };
+        wtq_h3_settings_encode_cfg_t cfg = { true, WTQ_H3_WT_PROFILES_D13_14_COMPAT };
         CHECK_BUILD(wtq_h3_settings_encode_payload(&cfg, v->wire,
                                                    WT15_MAX_WIRE, &len) ==
                     WTQ_H3_SETTINGS_OK);

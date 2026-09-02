@@ -111,28 +111,85 @@ wtq_h3_settings_status_t wtq_h3_settings_decode(const uint8_t *payload,
 
 /* The WebTransport-over-HTTP/3 wire profile that selects which WT SETTINGS
  * we emit (proto-layer mirror of the public wtq_webtransport_profile_t;
- * the engine maps one to the other). Exactly ONE WT setting is advertised
- * per profile — never both dialects at once. */
+ * the engine maps one to the other). Each profile contributes exactly ONE
+ * WT setting to the advertisement. */
 typedef enum wtq_h3_wt_profile {
-    /* draft-16: SETTINGS_WT_ENABLED (0x2c7cf000) = 1 only. */
+    /* draft-16: SETTINGS_WT_ENABLED (0x2c7cf000) = 1. */
     WTQ_H3_WT_PROFILE_CURRENT = 0,
-    /* drafts 13/14 compat: SETTINGS_WT_MAX_SESSIONS (0x14e9cd29) = 1 only.
+    /* drafts 13/14 compat: SETTINGS_WT_MAX_SESSIONS (0x14e9cd29) = 1.
      * NOT the D07 codepoint (0xc671706a), NOT WT_ENABLED, no flow control. */
     WTQ_H3_WT_PROFILE_D13_14_COMPAT = 1
 } wtq_h3_wt_profile_t;
 
-/* wtquic's outgoing SETTINGS:
+/*
+ * A SET of the profiles above — the proto-layer mirror of the public
+ * wtq_webtransport_profile_set_t. This header is internal and never
+ * includes a public API header, so the set type is mirrored here exactly
+ * as wtq_h3_wt_profile_t mirrors the public profile enum; the API/backend
+ * boundary converts between them and static-asserts the masks match.
+ *
+ * Membership is spelled with explicit constants rather than a shift macro:
+ * a generic 1u << p is undefined behaviour for an out-of-range profile.
+ */
+typedef uint64_t wtq_h3_wt_profile_set_t;
+
+#define WTQ_H3_WT_PROFILES_CURRENT       UINT64_C(0x1)
+#define WTQ_H3_WT_PROFILES_D13_14_COMPAT UINT64_C(0x2)
+
+/* Every profile this build knows — the validity mask for a caller's set. */
+#define WTQ_H3_WT_PROFILES_ALL \
+    (WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT)
+
+/* How many profiles this build knows: the upper bound on WT settings in
+ * one advertisement. The precedence table's length is static-asserted
+ * against it, so the two cannot drift. */
+#define WTQ_H3_WT_PROFILE_COUNT 2
+
+/* The one-bit set for a single profile, or 0 for an unknown value. Total
+ * by construction — no shift, so no undefined behaviour. */
+static inline wtq_h3_wt_profile_set_t
+wtq_h3_wt_profile_bit(wtq_h3_wt_profile_t profile)
+{
+    switch (profile) {
+    case WTQ_H3_WT_PROFILE_CURRENT:
+        return WTQ_H3_WT_PROFILES_CURRENT;
+    case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
+        return WTQ_H3_WT_PROFILES_D13_14_COMPAT;
+    }
+    return 0;
+}
+
+/*
+ * wtquic's outgoing SETTINGS:
  *   always: QPACK_MAX_TABLE_CAPACITY=0, QPACK_BLOCKED_STREAMS=0 (explicit
  *           zeros: unambiguous "no dynamic table" signal, matches h3zero),
  *           H3_DATAGRAM=1
- *   profile: exactly one WT setting — WT_ENABLED=1 (current) or
- *           WT_MAX_SESSIONS 0x14e9cd29=1 (D13/14 compat); never both, and
- *           never the D07 0xc671706a codepoint.
+ *   profiles: one WT setting per member of wt_profiles, in ascending
+ *           identifier order — WT_MAX_SESSIONS 0x14e9cd29=1 (D13/14 compat)
+ *           and/or WT_ENABLED 0x2c7cf000=1 (current). Never the D07
+ *           0xc671706a codepoint, which stays receive-only.
  *   config: ENABLE_CONNECT_PROTOCOL (servers MUST send it; harmless from
- *           clients). */
+ *           clients).
+ *
+ * SETTINGS advertise CAPABILITIES, not an already-selected dialect: a set
+ * with several members is a legitimate multi-version advertisement (see
+ * draft-16 s7.1, "sends a SETTINGS_WT_ENABLED value for each supported
+ * version"). Selecting one from the peer's reply is
+ * wtq_h3_settings_select_profile's job.
+ *
+ * The set is masked to WTQ_H3_WT_PROFILES_ALL first; if nothing KNOWN
+ * remains — an empty set, or a non-zero set carrying only unknown bits —
+ * it encodes as CURRENT-only. This codec is deliberately TOTAL: it has no
+ * way to report an error, and emitting zero WT settings ("no
+ * WebTransport") is not a configuration wtquic ever wants. Rejecting an
+ * empty or out-of-range set belongs to the layer that accepts it from a
+ * caller (the engine at conn-create), so a mistake fails loudly there;
+ * this fallback is defence in depth, never public acceptance of unknown
+ * bits.
+ */
 typedef struct wtq_h3_settings_encode_cfg {
     bool enable_connect_protocol;
-    wtq_h3_wt_profile_t wt_profile;
+    wtq_h3_wt_profile_set_t wt_profiles;
 } wtq_h3_settings_encode_cfg_t;
 
 /* Encoded payload length for the configuration. Never 0. */
@@ -159,20 +216,42 @@ wtq_h3_settings_status_t wtq_h3_settings_encode_frame(
     size_t *out_len);
 
 /*
- * Does a peer's SETTINGS indicate enough WebTransport support for
- * wtquic v1? Pure predicate, no connection state.
+ * Choose the wire profile to speak with this peer: the HIGHEST-precedence
+ * member of (our `set` INTERSECT the profiles the peer advertised) that
+ * also meets the profile-independent requirements. Pure function, no
+ * connection state.
  *
- * PROFILE-AWARE WT signal (only the selected dialect satisfies it):
+ * Returns true and writes *out on success; returns false and leaves *out
+ * UNTOUCHED when there is no mutual profile. There is deliberately no
+ * "none" enum member — the boolean carries that, so no caller can mistake
+ * a sentinel for the zero-valued CURRENT profile.
+ *
+ * PRECEDENCE is newest-draft-first and explicit (see the table in the .c),
+ * NOT the enum's numeric order, so adding a profile cannot silently
+ * reorder preference.
+ *
+ * Per-profile WT signal (a signal from a profile outside `set` never
+ * counts, and never selects a profile on its own):
  *   WTQ_H3_WT_PROFILE_CURRENT:        WT_ENABLED == 1.
  *   WTQ_H3_WT_PROFILE_D13_14_COMPAT:  WT_MAX_SESSIONS (0x14e9cd29) > 0.
- * A setting from the other profile does NOT count.
  *
- * peer_is_server true (we are the client evaluating a server):
- *   WT signal AND ENABLE_CONNECT_PROTOCOL == 1 AND H3_DATAGRAM == 1.
- * peer_is_server false (we are the server evaluating a client):
- *   WT signal AND H3_DATAGRAM == 1.
+ * Profile-independent requirements:
+ *   peer_is_server true (we are the client evaluating a server):
+ *     H3_DATAGRAM == 1 AND ENABLE_CONNECT_PROTOCOL == 1.
+ *   peer_is_server false (we are the server evaluating a client):
+ *     H3_DATAGRAM == 1.
  *
  * Present-with-value-0 settings count as NOT enabled.
+ */
+bool wtq_h3_settings_select_profile(const wtq_h3_settings_t *peer,
+                                    bool peer_is_server,
+                                    wtq_h3_wt_profile_set_t set,
+                                    wtq_h3_wt_profile_t *out);
+
+/*
+ * Does a peer's SETTINGS indicate enough WebTransport support for exactly
+ * ONE profile? A thin convenience over wtq_h3_settings_select_profile with
+ * a single-member set — one implementation, no duplicated policy.
  */
 bool wtq_h3_settings_peer_supports_wt(const wtq_h3_settings_t *peer,
                                       bool peer_is_server,

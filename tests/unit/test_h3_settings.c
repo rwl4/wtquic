@@ -58,7 +58,7 @@ static void test_default_roundtrip(int *fp)
     WTQ_TEST_CHECK_EQ_SIZE(s.unknown_count, 0);
 
     /* Without ECP (client-minimal variant) the id disappears. */
-    wtq_h3_settings_encode_cfg_t noecp = { false, WTQ_H3_WT_PROFILE_CURRENT };
+    wtq_h3_settings_encode_cfg_t noecp = { false, WTQ_H3_WT_PROFILES_CURRENT };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&noecp, buf, sizeof(buf),
                                                   &out_len) ==
                    WTQ_H3_SETTINGS_OK);
@@ -70,7 +70,7 @@ static void test_default_roundtrip(int *fp)
     /* RED-first #1: BYTE-EXACT current-profile SETTINGS payload — QPACK
      * zeros, ECP=1, H3_DATAGRAM=1, then WT_ENABLED (0x2c7cf000)=1 ONLY.
      * No WT_MAX_SESSIONS codepoint of either draft appears. */
-    wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILE_CURRENT };
+    wtq_h3_settings_encode_cfg_t cur = { true, WTQ_H3_WT_PROFILES_CURRENT };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cur, buf, sizeof(buf),
                                                   &out_len) ==
                    WTQ_H3_SETTINGS_OK);
@@ -88,7 +88,7 @@ static void test_default_roundtrip(int *fp)
      * the same base, then WT_MAX_SESSIONS (0x14e9cd29)=1 ONLY. No
      * WT_ENABLED, and NEVER the D07 codepoint (0xc671706a). */
     wtq_h3_settings_encode_cfg_t compat = {
-        true, WTQ_H3_WT_PROFILE_D13_14_COMPAT };
+        true, WTQ_H3_WT_PROFILES_D13_14_COMPAT };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&compat, buf, sizeof(buf),
                                                   &out_len) ==
                    WTQ_H3_SETTINGS_OK);
@@ -108,6 +108,219 @@ static void test_default_roundtrip(int *fp)
     WTQ_TEST_CHECK(!s.has_wt_max_sessions_d07);
     WTQ_TEST_CHECK(!s.has_wt_enabled);
 
+    /* BYTE-EXACT MULTI-VERSION advertisement: both profiles in ONE payload,
+     * in ascending identifier order (0x14e9cd29 before 0x2c7cf000), sharing
+     * the identical base prefix. This is a capability offer, not a
+     * selection (draft-16 s7.1). The D07 codepoint still never appears. */
+    wtq_h3_settings_encode_cfg_t both = { true, WTQ_H3_WT_PROFILES_ALL };
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&both, buf, sizeof(buf),
+                                                  &out_len) ==
+                   WTQ_H3_SETTINGS_OK);
+    const uint8_t both_expect[] = {
+        0x01, 0x00,
+        0x07, 0x00,
+        0x08, 0x01,
+        0x33, 0x01,
+        0x94, 0xe9, 0xcd, 0x29, 0x01, /* WT_MAX_SESSIONS 0x14e9cd29 = 1 */
+        0xac, 0x7c, 0xf0, 0x00, 0x01, /* WT_ENABLED      0x2c7cf000 = 1 */
+    };
+    WTQ_TEST_CHECK_EQ_SIZE(out_len, sizeof(both_expect));
+    WTQ_TEST_CHECK(memcmp(buf, both_expect, out_len) == 0);
+    /* the union is the single-profile base plus BOTH signals: the shared
+     * 8-byte prefix is byte-identical to each single-profile payload */
+    WTQ_TEST_CHECK(memcmp(both_expect, cur_expect, 8) == 0);
+    WTQ_TEST_CHECK(memcmp(both_expect, compat_expect, 8) == 0);
+    WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, out_len, &s) ==
+                   WTQ_H3_SETTINGS_OK);
+    WTQ_TEST_CHECK(s.has_wt_enabled && s.wt_enabled == 1);
+    WTQ_TEST_CHECK(s.has_wt_max_sessions_d13 && s.wt_max_sessions_d13 == 1);
+    WTQ_TEST_CHECK(!s.has_wt_max_sessions_d07);
+
+    /* TOTALITY. The codec never emits a WT-less advertisement. The set is
+     * masked to the KNOWN profiles first, so the CURRENT-only fallback
+     * covers BOTH an empty set and a non-zero set carrying only unknown
+     * bits — the latter would slip past a bare `== 0` test and ship
+     * SETTINGS with no WebTransport signal at all. Rejecting unknown
+     * caller bits stays the engine's job at conn-create; this is defence
+     * in depth. Both cases must be byte-identical to the CURRENT payload. */
+    uint8_t ebuf[64];
+    size_t elen = 0;
+    const wtq_h3_wt_profile_set_t total_sets[] = {
+        0,                                     /* empty                    */
+        WTQ_H3_WT_PROFILES_ALL << 8,           /* unknown-only, disjoint   */
+        UINT64_C(1) << 63,                     /* unknown-only, high bit   */
+        ~WTQ_H3_WT_PROFILES_ALL,               /* every unknown bit set    */
+    };
+    for (size_t i = 0; i < sizeof(total_sets) / sizeof(total_sets[0]); i++) {
+        wtq_h3_settings_encode_cfg_t tot = { true, total_sets[i] };
+        elen = 0;
+        WTQ_TEST_CHECK_EQ_SIZE(wtq_h3_settings_payload_len(&tot),
+                               sizeof(cur_expect));
+        WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&tot, ebuf,
+                                                      sizeof(ebuf), &elen) ==
+                       WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK_EQ_SIZE(elen, sizeof(cur_expect));
+        WTQ_TEST_CHECK(memcmp(ebuf, cur_expect, elen) == 0);
+    }
+    /* A known bit accompanied by unknown bits still advertises exactly the
+     * known member — masking must not swallow the real profile. */
+    wtq_h3_settings_encode_cfg_t mixed = {
+        true, WTQ_H3_WT_PROFILES_D13_14_COMPAT | (UINT64_C(1) << 40) };
+    elen = 0;
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&mixed, ebuf, sizeof(ebuf),
+                                                  &elen) ==
+                   WTQ_H3_SETTINGS_OK);
+    WTQ_TEST_CHECK_EQ_SIZE(elen, sizeof(compat_expect));
+    WTQ_TEST_CHECK(memcmp(ebuf, compat_expect, elen) == 0);
+
+    *fp += failures;
+}
+
+/*
+ * Profile SELECTION: the highest mutually supported profile, chosen from
+ * the peer's advertisement intersected with our configured set. The token
+ * plays no part here — SETTINGS alone select.
+ */
+static void test_select_profile(int *fp)
+{
+    int failures = 0;
+    uint8_t buf[64];
+    size_t n = 0;
+    wtq_h3_settings_t peer;
+    wtq_h3_wt_profile_t sel;
+
+    /* Build a peer advertisement from a set, then decode it back. */
+#define PEER_ADVERTISING(mask)                                            \
+    do {                                                                  \
+        wtq_h3_settings_encode_cfg_t c = { true, (mask) };                 \
+        WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(                     \
+                           &c, buf, sizeof(buf), &n) ==                    \
+                       WTQ_H3_SETTINGS_OK);                                \
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, n, &peer) ==            \
+                       WTQ_H3_SETTINGS_OK);                                \
+    } while (0)
+
+    /* --- the full pairwise matrix: our set x what the peer advertised --- */
+    struct {
+        wtq_h3_wt_profile_set_t peer_mask;
+        wtq_h3_wt_profile_set_t our_set;
+        bool expect;
+        wtq_h3_wt_profile_t want;
+    } cases[] = {
+        /* single vs single: match */
+        { WTQ_H3_WT_PROFILES_CURRENT, WTQ_H3_WT_PROFILES_CURRENT,
+          true, WTQ_H3_WT_PROFILE_CURRENT },
+        { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+          true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        /* single vs single: cross-profile has NO intersection */
+        { WTQ_H3_WT_PROFILES_CURRENT, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+          false, 0 },
+        { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_CURRENT,
+          false, 0 },
+        /* we offer both, peer offers one: the peer decides */
+        { WTQ_H3_WT_PROFILES_CURRENT, WTQ_H3_WT_PROFILES_ALL,
+          true, WTQ_H3_WT_PROFILE_CURRENT },
+        { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_ALL,
+          true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        /* peer offers both, we offer one: we decide */
+        { WTQ_H3_WT_PROFILES_ALL, WTQ_H3_WT_PROFILES_CURRENT,
+          true, WTQ_H3_WT_PROFILE_CURRENT },
+        { WTQ_H3_WT_PROFILES_ALL, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+          true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        /* BOTH offer both: HIGHEST mutual wins — CURRENT. The winner is
+         * fixed by the explicit newest-first PRECEDENCE TABLE, not by the
+         * order the settings appear on the wire and not by any implicit
+         * enum-iteration contract (the enum values carry no precedence
+         * meaning of their own). The reverse-precedence neuter below is
+         * what makes that load-bearing. */
+        { WTQ_H3_WT_PROFILES_ALL, WTQ_H3_WT_PROFILES_ALL,
+          true, WTQ_H3_WT_PROFILE_CURRENT },
+        /* an empty set of ours can never select anything */
+        { WTQ_H3_WT_PROFILES_ALL, 0, false, 0 },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        PEER_ADVERTISING(cases[i].peer_mask);
+        sel = (wtq_h3_wt_profile_t)0x7f; /* poison: must stay on false */
+        bool got = wtq_h3_settings_select_profile(&peer, true,
+                                                  cases[i].our_set, &sel);
+        WTQ_TEST_CHECK_EQ_INT((int)got, (int)cases[i].expect);
+        if (cases[i].expect)
+            WTQ_TEST_CHECK_EQ_INT((int)sel, (int)cases[i].want);
+        else
+            /* *out is UNTOUCHED when there is no mutual profile */
+            WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
+    }
+
+    /* --- the profile-independent requirements gate every profile --- */
+    /* no ENABLE_CONNECT_PROTOCOL: fine for a server judging a client,
+     * fatal for a client judging a server */
+    {
+        wtq_h3_settings_encode_cfg_t c = { false, WTQ_H3_WT_PROFILES_ALL };
+        WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&c, buf, sizeof(buf),
+                                                      &n) ==
+                       WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, n, &peer) ==
+                       WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &peer, true, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK(wtq_h3_settings_select_profile(
+            &peer, false, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel, (int)WTQ_H3_WT_PROFILE_CURRENT);
+    }
+    /* H3_DATAGRAM absent: no profile is selectable in either direction */
+    {
+        const uint8_t no_dgram[] = {
+            0x08, 0x01,
+            0xac, 0x7c, 0xf0, 0x00, 0x01,
+        };
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(no_dgram, sizeof(no_dgram),
+                                              &peer) == WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &peer, true, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &peer, false, WTQ_H3_WT_PROFILES_ALL, &sel));
+    }
+    /* a D07-only / Chrome-only peer matches NEITHER supported profile:
+     * a signal outside our set never selects anything on its own */
+    {
+        const uint8_t d07_only[] = {
+            0x33, 0x01,
+            0x08, 0x01,
+            /* 0xc671706a needs the 8-byte varint form (> 0x3fffffff) */
+            0xc0, 0x00, 0x00, 0x00, 0xc6, 0x71, 0x70, 0x6a, 0x01,
+        };
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(d07_only, sizeof(d07_only),
+                                              &peer) == WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(peer.has_wt_max_sessions_d07);
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &peer, true, WTQ_H3_WT_PROFILES_ALL, &sel));
+    }
+    /* h3zero sends BOTH 0x14e9cd29 and 0xc671706a: the D13 signal decides,
+     * and the unsupported D07 codepoint alongside it changes nothing */
+    {
+        const uint8_t h3zero[] = {
+            0x33, 0x01,
+            0x08, 0x01,
+            0x94, 0xe9, 0xcd, 0x29, 0x01, /* 0x14e9cd29 = 1 */
+            0xc0, 0x00, 0x00, 0x00, 0xc6, 0x71, 0x70, 0x6a, 0x01,
+        };
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(h3zero, sizeof(h3zero),
+                                              &peer) == WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(wtq_h3_settings_select_profile(
+            &peer, true, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel, (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT);
+    }
+
+    /* NULL guards */
+    WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(NULL, true,
+                                                   WTQ_H3_WT_PROFILES_ALL,
+                                                   &sel));
+    WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(&peer, true,
+                                                   WTQ_H3_WT_PROFILES_ALL,
+                                                   NULL));
+
+#undef PEER_ADVERTISING
     *fp += failures;
 }
 
@@ -369,7 +582,9 @@ static void test_nonminimal(int *fp)
 static void test_encode_bounds(int *fp)
 {
     int failures = 0;
-    wtq_h3_settings_encode_cfg_t cfg = { true, true };
+    /* The WIDEST advertisement (every known profile) gives the longest
+     * payload, so the capacity sweep below covers the worst case. */
+    wtq_h3_settings_encode_cfg_t cfg = { true, WTQ_H3_WT_PROFILES_ALL };
     size_t need = wtq_h3_settings_payload_len(&cfg);
 
     for (size_t cap = 0; cap < need; cap++) {
@@ -501,6 +716,7 @@ int main(void)
     test_unknown(&failures);
     test_legacy_receive(&failures);
     test_supports_wt(&failures);
+    test_select_profile(&failures);
     test_truncation(&failures);
     test_nonminimal(&failures);
     test_encode_bounds(&failures);
