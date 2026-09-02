@@ -54,5 +54,11 @@ int main(void)
         return 1;
     if (lcfg.struct_size != sizeof(lcfg))
         return 1;
+    /* v4 listener capability set is usable from strict C99 */
+    if (lcfg.webtransport_profiles != 0)
+        return 1;
+    lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
+    if (lcfg.webtransport_profiles != WTQ_WEBTRANSPORT_PROFILES_ALL)
+        return 1;
     return 0;
 }

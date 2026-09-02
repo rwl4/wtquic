@@ -101,9 +101,36 @@ typedef struct wtq_msquic_listener_cfg_v1 {
     void *user;
 } wtq_msquic_listener_cfg_v1_t;
 
-#define WTQ_MSQ_FROZEN_OFF(cur, v1, f)                                       \
-    _Static_assert(offsetof(cur, f) == offsetof(v1, f),                     \
-                   "v1 field " #f " moved from its frozen 07570ae offset")
+/*
+ * FROZEN v3 listener layout: the struct exactly as it stood when
+ * webtransport_profile was its last field, i.e. what a caller compiled
+ * against that release passes. Separate from the v1 shadow above and
+ * derived the same way — spelled out rather than computed from the current
+ * struct, so a future prefix change cannot silently move both together and
+ * hide an overread.
+ */
+typedef struct wtq_msquic_listener_cfg_v3 {
+    uint32_t struct_size;
+    const char *bind_address;
+    uint16_t port;
+    const char *cert_file;
+    const char *key_file;
+    const wtq_serve_config_t *paths;
+    size_t path_count;
+    const wtq_session_events_t *events;
+    void *user;
+    wtq_msquic_accept_prepare_fn accept_prepare;
+    wtq_msquic_accept_abandon_fn accept_abandon;
+    wtq_msquic_transport_quiesced_fn on_transport_quiesced;
+    uint32_t webtransport_profile;
+} wtq_msquic_listener_cfg_v3_t;
+
+/* Pin a field to the offset a FROZEN layout shadow records for it. Used for
+ * every frozen generation, so the diagnostic names the field and both types
+ * rather than one particular version. */
+#define WTQ_MSQ_FROZEN_OFF(cur, frozen, f)                                   \
+    _Static_assert(offsetof(cur, f) == offsetof(frozen, f),                 \
+                   "field " #f " moved from its frozen offset in " #frozen)
 
 WTQ_MSQ_FROZEN_OFF(wtq_msquic_client_cfg_t, wtq_msquic_client_cfg_v1_t,
                    struct_size);
@@ -157,6 +184,70 @@ _Static_assert(offsetof(wtq_msquic_listener_cfg_t, webtransport_profile) ==
 _Static_assert(offsetof(wtq_msquic_listener_cfg_t, webtransport_profile) >=
                    sizeof(wtq_msquic_listener_cfg_v1_t),
                "listener v3 profile must begin at or after frozen v1");
+
+/* Every v3 field sits where a v3 caller expects it. */
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   struct_size);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   bind_address);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   port);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   cert_file);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   key_file);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   paths);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   path_count);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   events);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   user);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   accept_prepare);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   accept_abandon);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   on_transport_quiesced);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v3_t,
+                   webtransport_profile);
+
+/*
+ * The v4 set must begin at or after the END of a complete frozen v3 object.
+ * This is the load-bearing pin: webtransport_profile is a uint32_t and v3
+ * carries tail padding after it, so a uint32_t v4 field would have landed
+ * INSIDE that padding and a v3 caller's struct_size would have exposed
+ * uninitialised bytes as a capability set. The 8-byte alignment of the set
+ * pushes it past the padding; this assert proves that on every ABI rather
+ * than trusting it.
+ */
+_Static_assert(offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles) >=
+                   sizeof(wtq_msquic_listener_cfg_v3_t),
+               "listener v4 set must begin at or after the end of frozen v3 "
+               "- otherwise a v3 caller's tail padding reads as a set");
+
+/*
+ * The public capability masks and the engine's internal masks are separate
+ * types by design (the proto header never includes a public header), so the
+ * conversion at this boundary is only safe while the bit values agree. Pin
+ * every one of them, and pin the profile enum values they are derived from.
+ */
+_Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT ==
+                   (uint64_t)WTQ_H3_WT_PROFILES_CURRENT,
+               "public/internal CURRENT profile mask must agree");
+_Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT ==
+                   (uint64_t)WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+               "public/internal D13/14 profile mask must agree");
+_Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_ALL ==
+                   (uint64_t)WTQ_H3_WT_PROFILES_ALL,
+               "public/internal ALL profile mask must agree");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT ==
+                   (int)WTQ_H3_WT_PROFILE_CURRENT,
+               "public/internal CURRENT profile value must agree");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT ==
+                   (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT,
+               "public/internal D13/14 profile value must agree");
 
 /* Mirrors of the engine's accept-policy limits (wtq_conn copies the
  * table with these bounds at serve time). */
@@ -373,9 +464,13 @@ struct wtq_msquic_listener {
     wtq_msquic_accept_prepare_fn accept_prepare;
     wtq_msquic_accept_abandon_fn accept_abandon;
     wtq_msquic_transport_quiesced_fn on_transport_quiesced;
-    /* WebTransport wire profile every accepted connection speaks (copied
-     * from the cfg's struct_size-gated tail; 0 = current draft-16). */
+    /* Legacy singleton source, kept only so a caller that set just this
+     * field still derives a one-member set. */
     int webtransport_profile;
+    /* The NORMALISED capability set every accepted connection advertises.
+     * Authoritative; selection from the peer's settings happens per
+     * connection in the engine. */
+    wtq_h3_wt_profile_set_t webtransport_profiles;
     size_t path_count;
     struct {
         char path[WTQ_MSQ_PATH_CAP + 1];

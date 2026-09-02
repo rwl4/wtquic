@@ -70,6 +70,25 @@ int main(void)
         (void)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
     }
 
+    /* public capability-set constants + negotiated-profile query */
+    {
+        wtq_webtransport_profile_set_t set =
+            WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
+        wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+        if (set != WTQ_WEBTRANSPORT_PROFILES_ALL)
+            return 1;
+        if (WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT ==
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT)
+            return 1;
+        if (wtq_session_webtransport_profile(NULL, &prof) !=
+            WTQ_ERR_INVALID_ARG)
+            return 1;
+        /* failure leaves the output untouched */
+        if (prof != (wtq_webtransport_profile_t)0x7f)
+            return 1;
+    }
+
     if (!wtq_version())
         return 1;
     if (wtq_app_error_to_h3(0) == 0)

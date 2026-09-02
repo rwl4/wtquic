@@ -42,8 +42,9 @@ typedef struct app_state {
 } app_state_t;
 
 static void cb_established(wtq_conn_t *c, const char *sel, size_t len,
-                           void *ctx)
+                           wtq_h3_wt_profile_t profile, void *ctx)
 {
+    (void)profile;
     app_state_t *st = ctx;
 
     (void)c;

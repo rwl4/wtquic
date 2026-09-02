@@ -38,6 +38,9 @@ int main()
     (void)open_fn;
     (void)close_fn;
     (void)cinit; (void)cinit_ex; (void)linit; (void)linit_ex;
+    lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
+    if (lcfg.webtransport_profiles != WTQ_WEBTRANSPORT_PROFILES_ALL)
+        return 1;
     return (cfg.struct_size == sizeof(cfg) &&
             tuning.struct_size == sizeof(tuning) &&
             ccfg.struct_size == sizeof(ccfg) &&

@@ -245,6 +245,7 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
         .drv = drv,
         .ops = wtq_msq_driver_ops(),
         .webtransport_profile = l->webtransport_profile,
+        .webtransport_profiles = l->webtransport_profiles,
     };
     wtq_session_t *session = NULL;
     if (wtq_api_session_create(&scfg, &session) != WTQ_OK || fail_stage == 2) {
@@ -362,13 +363,47 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
                      offsetof(wtq_msquic_listener_cfg_t, webtransport_profile),
                      sizeof(cfg.webtransport_profile)))
         cfg.webtransport_profile = WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+    /* Same whole-field rule for the v4 capability set: a struct_size landing
+     * inside it treats the field as entirely absent. A frozen-v3 caller can
+     * never reach it — the set begins at or after the end of a complete v3
+     * object (asserted in msq_internal.h), so v3 tail padding is never read
+     * as a set. */
+    if (!wtq_cfg_has(cfg_in->struct_size,
+                     offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles),
+                     sizeof(cfg.webtransport_profiles)))
+        cfg.webtransport_profiles = 0;
 
     if (cfg.cert_file == NULL || cfg.key_file == NULL ||
         cfg.events == NULL || cfg.events->struct_size == 0)
         return WTQ_ERR_INVALID_ARG;
-    if (cfg.webtransport_profile != WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT &&
-        cfg.webtransport_profile != WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
-        return WTQ_ERR_INVALID_ARG;
+    /*
+     * Normalise to ONE authoritative capability set.
+     *
+     * Zero set: derive a one-member set from the singular field, which is
+     * validated exactly as before — every existing caller keeps today's
+     * behavior byte for byte.
+     *
+     * Non-zero set: the set IS the configuration. The singular field has no
+     * role at all then, so it is deliberately NOT validated: a value naming
+     * a non-member, or even one out of range, is accepted and ignored
+     * rather than rejected for an input nobody reads. Unknown bits, or a
+     * set with no known member, are rejected here — before any allocation
+     * or listener side effect.
+     */
+    wtq_h3_wt_profile_set_t profiles;
+    if (cfg.webtransport_profiles == 0) {
+        if (cfg.webtransport_profile != WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT &&
+            cfg.webtransport_profile !=
+                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
+            return WTQ_ERR_INVALID_ARG;
+        profiles = wtq_h3_wt_profile_bit(
+            (wtq_h3_wt_profile_t)cfg.webtransport_profile);
+    } else {
+        profiles = (wtq_h3_wt_profile_set_t)cfg.webtransport_profiles;
+        if ((profiles & ~(wtq_h3_wt_profile_set_t)WTQ_H3_WT_PROFILES_ALL) != 0 ||
+            (profiles & (wtq_h3_wt_profile_set_t)WTQ_H3_WT_PROFILES_ALL) == 0)
+            return WTQ_ERR_INVALID_ARG;
+    }
     /* Admission is paired: accept_prepare requires accept_abandon (and
      * vice versa) so every admitted-then-failed connection is cleaned up. */
     if ((cfg.accept_prepare != NULL) != (cfg.accept_abandon != NULL))
@@ -391,6 +426,10 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
     l->accept_abandon = cfg.accept_abandon;
     l->on_transport_quiesced = cfg.on_transport_quiesced;
     l->webtransport_profile = (int)cfg.webtransport_profile;
+    /* The normalised set is what every accepted connection advertises: one
+     * source of truth, so a listener can never advertise one set and hand a
+     * different one to its sessions. */
+    l->webtransport_profiles = profiles;
 
     wtq_result_t rc = copy_paths(l, cfg.paths, cfg.path_count);
     if (rc != WTQ_OK) {

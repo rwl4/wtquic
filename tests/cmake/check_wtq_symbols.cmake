@@ -34,6 +34,7 @@ set(ALLOWED_SYMBOLS
     wtq_session_status
     wtq_session_transport_error
     wtq_session_subprotocol
+    wtq_session_webtransport_profile
     wtq_session_set_user
     wtq_session_get_user
     wtq_stream_add_ref

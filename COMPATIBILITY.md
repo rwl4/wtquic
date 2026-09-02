@@ -14,55 +14,92 @@ CONTENT is otherwise exactly the preview.2 dependency point.)
 
 ## WebTransport profile selection
 
-Both peers pick one WebTransport-over-HTTP/3 wire profile
-(`wtq_webtransport_profile_t`), latched before any control-stream
-SETTINGS are emitted. A client selects per connection
-(`wtq_connect_config_t.webtransport_profile`); a server selects per
-listener, connection-wide
-(`wtq_msquic_listener_cfg_t.webtransport_profile`) — one profile for
-every connection that listener accepts, never auto-negotiated:
+wtquic speaks two WebTransport-over-HTTP/3 wire profiles
+(`wtq_webtransport_profile_t`):
 
 - `WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT` (0, the default): draft-16 —
-  `:protocol = webtransport-h3`, WT_ENABLED = 1.
-- `WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT` (1, opt-in): the
-  native-H3 drafts-13/14 dialect — `:protocol = webtransport`,
-  WT_MAX_SESSIONS (0x14e9cd29) = 1, no WT flow control. It never
-  advertises the current settings and never emits the drafts-7–12
+  `:protocol = webtransport-h3`, WT_ENABLED (0x2c7cf000) = 1.
+- `WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT` (1): the native-H3
+  drafts-13/14 dialect — `:protocol = webtransport`, WT_MAX_SESSIONS
+  (0x14e9cd29) = 1, no WT flow control. It never emits the drafts-7–12
   codepoint (0xc671706a).
 
-The server is symmetric with the client: it emits its profile's SETTINGS
-before it processes any request, and admits ONLY that profile's CONNECT
-`:protocol` token (current → `webtransport-h3`, compat → bare
-`webtransport`). A cross-profile token is answered with a generic 400;
-the server never emits one profile's SETTINGS while honouring the other's
-token. So a wtquic compat client and a wtquic compat listener loopback
-is self-consistent — the server is not stuck current-only.
+**These two are the whole set. They do not provide stock-browser
+compatibility** — see the browser note below.
 
-ABI: on both the client connect-config and the listener config the
-profile is a versioned tail field; a config from an older caller
-(smaller `struct_size`) reads as `H3_CURRENT`. Use
-`wtq_connect_config_init` / `wtq_msquic_listener_cfg_init` (frozen v1) or
-the `_ex(cfg, struct_size)` forms. An out-of-range value is rejected
-(`WTQ_ERR_INVALID_ARG`) — at connect for a client, at
-`wtq_msquic_listener_start` for a listener; a compat profile requested
-after the client already started is `WTQ_ERR_STATE`.
+### Configured set vs selected profile
 
-Evidence for the single compat profile (captured 2026-07-15): proxygen
+A **client** requests a single profile
+(`wtq_connect_config_t.webtransport_profile`); its connect stays a
+singleton.
+
+A **server** configures a capability SET per listener,
+`wtq_msquic_listener_cfg_t.webtransport_profiles`
+(`wtq_webtransport_profile_set_t`, with the
+`WTQ_WEBTRANSPORT_PROFILES_*` constants). Every accepted connection
+advertises the deterministic union of that set in its control-stream
+settings — advertisement, not selection — and then selects exactly ONE
+profile from the peer's settings, by explicit newest-first precedence,
+before it processes the extended CONNECT.
+
+The CONNECT `:protocol` token then **validates** that selection; it never
+chooses it. Several draft generations share the bare `webtransport`
+token, so a token cannot identify a generation on its own. A token that
+does not match the selected profile is answered with a generic 400 and
+the connection stays usable. If the peers share no profile, nothing is
+selected, the request gets one generic 400 that discloses no path or
+subprotocol policy, and the session simply does not establish: there is
+**no fallback and no retry**.
+
+Query the outcome per session with `wtq_session_webtransport_profile()`.
+It returns `WTQ_ERR_STATE` until establishment, then `WTQ_OK` with the
+selected profile — valid from inside `on_established`, and stable on a
+retained handle after the session ends. On any failure the output is left
+untouched, so "not selected yet" can never be misread as the
+zero-valued current profile.
+
+ABI: the listener set is a versioned tail field. Absent, partial, or zero
+derives a one-member set from the older singular
+`webtransport_profile`, so **every existing caller keeps exactly its
+previous behavior**; a non-zero set is authoritative and the singular
+field is then ignored entirely. Unknown bits, or a non-zero set with no
+known member, fail `wtq_msquic_listener_start` with
+`WTQ_ERR_INVALID_ARG`. Use `wtq_msquic_listener_cfg_init` (frozen v1) or
+`_ex(cfg, struct_size)`. A client profile changed after start is
+`WTQ_ERR_STATE`.
+
+### Interop evidence
+
+Evidence for the D13/14 compat profile (captured 2026-07-15): proxygen
 2026.05.25.00 uses `H3_WT_MAX_SESSIONS = 0x14e9cd29` with no D07
 codepoint anywhere in its tree; the picoquic h3zero family (moqx,
 pico_wt) sends both 0x14e9cd29 and 0xc671706a and accepts either. No
 D13/14 compat interop target uses 0xc671706a instead of 0x14e9cd29, so
 one D13/14 compat profile suffices.
 
-imquic is NOT a current-profile (draft-16) peer: HEAD 99fa77d sends
-`:protocol = webtransport` with `ENABLE_WEBTRANSPORT` (0x2b603742) and
-`WEBTRANSPORT_MAX_SESSIONS` (0xc671706a) and `sec-webtransport-http3-
-draft02` — the Chrome/draft02 dialect. That is neither the current
-profile (WT_ENABLED, `webtransport-h3`) nor the D13/14 compat profile
-(WT_MAX_SESSIONS 0x14e9cd29, `webtransport`). Interoperating with imquic
-would require a SEPARATE third typed profile (D07/Chrome); it is
-proposed for a future slice and the compat profile is deliberately NOT
-widened to accept D07/Chrome signals.
+### Browsers are NOT supported by these profiles
+
+What a peer ACCEPTS and what it EMITS are separate observations, and only
+the emitted dialect tells you which generation it speaks.
+
+Published evidence points at stable Chrome and Firefox emitting the older
+**draft-02** signal `ENABLE_WEBTRANSPORT` (0x2b603742). That is a
+different generation from the drafts-7–12 `WEBTRANSPORT_MAX_SESSIONS`
+(0xc671706a), and neither is enabled here: wtquic emits neither codepoint
+and implements no profile that would select on them. Do not read the two
+as one "browser" dialect.
+
+No Safari support is claimed. Any such claim needs a packet/qlog capture
+of what Safari actually emits, which has not been taken.
+
+Adding a browser-compatible profile is future work gated on that capture
+evidence; it is not part of the current profiles.
+
+### Known conformance gap
+
+`H3_CURRENT` does not implement `RESET_STREAM_AT` (transport parameter
+0x1d), which draft-16 §3.1 lists as required for both roles. This is a
+pre-existing gap, unchanged by profile negotiation.
 
 ## Network.framework backend availability
 

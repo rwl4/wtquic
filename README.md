@@ -33,56 +33,75 @@ Network.framework client backend carries its own lifecycle, loopback
 
 ## WebTransport profiles
 
-Both peers select one WebTransport-over-HTTP/3 wire profile, latched
-before any control-stream SETTINGS are emitted. A **client** selects per
-connection (`wtq_connect_config_t.webtransport_profile`); a **server**
-selects per listener, connection-wide
-(`wtq_msquic_listener_cfg_t.webtransport_profile`) — every connection a
-listener accepts speaks that one profile. The two profiles never mix on
-one connection and are never auto-negotiated:
+wtquic speaks two WebTransport-over-HTTP/3 wire profiles. A **client**
+requests one per connection (`wtq_connect_config_t.webtransport_profile`).
+A **server** configures a capability SET per listener
+(`wtq_msquic_listener_cfg_t.webtransport_profiles`), advertises the union
+of it, and then selects ONE profile per connection from the peer's
+settings:
 
-| | `H3_CURRENT` (default) | `H3_DRAFT_13_14_COMPAT` (opt-in) |
+| | `H3_CURRENT` (default) | `H3_DRAFT_13_14_COMPAT` |
 |---|---|---|
 | extended CONNECT `:protocol` | `webtransport-h3` | `webtransport` |
-| WebTransport SETTINGS emitted | WT_ENABLED = 1 | WT_MAX_SESSIONS (0x14e9cd29) = 1 |
+| WebTransport setting emitted | WT_ENABLED (0x2c7cf000) = 1 | WT_MAX_SESSIONS (0x14e9cd29) = 1 |
 | WT flow-control settings | none | none (flow control disabled) |
-| peer-SETTINGS accepted as WT | WT_ENABLED = 1 only | WT_MAX_SESSIONS > 0 only |
-| server accepts `:protocol` | `webtransport-h3` only | `webtransport` only |
+| peer setting accepted as WT | WT_ENABLED = 1 | WT_MAX_SESSIONS > 0 |
 | interop | wtquic draft-16 self-loopback | proxygen/moxygen, picoquic h3zero (moqx, pico_wt) |
 
-The server side mirrors the client exactly: a `H3_CURRENT` listener emits
-WT_ENABLED and admits only a `webtransport-h3` CONNECT; a
-`H3_DRAFT_13_14_COMPAT` listener emits WT_MAX_SESSIONS and admits only a
-bare `webtransport` CONNECT. The cross-profile token is answered with a
-generic 400 — the server never emits one profile's SETTINGS while
-honouring the other's token — and mismatched peers fail earlier still, at
-SETTINGS validation, because one profile's WT signal never satisfies the
-other's predicate. So a wtquic `H3_DRAFT_13_14_COMPAT` server and client
-loopback is self-consistent, not a client-only claim.
+Selection happens once, from the peer's settings, by explicit
+newest-first precedence, and before the extended CONNECT is processed.
+The `:protocol` token then **validates** that selection rather than
+choosing it — several draft generations share the bare `webtransport`
+token, so a token cannot identify one on its own. A token that does not
+match the selected profile gets a generic 400 and the connection stays
+usable; peers sharing no profile simply never establish, with **no
+fallback and no retry**.
+
+```c
+/* one listener serving both generations */
+lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
+
+/* what THIS session actually selected (valid from on_established on) */
+wtq_webtransport_profile_t prof;
+if (wtq_session_webtransport_profile(session, &prof) == WTQ_OK)
+    use(prof);
+```
+
+A listener that leaves the set zero keeps the older singular
+`webtransport_profile` behavior exactly, so existing callers are
+unaffected.
+
+**These two profiles do not provide stock-browser compatibility.**
+Published evidence points at stable Chrome and Firefox emitting the older
+draft-02 `ENABLE_WEBTRANSPORT` (0x2b603742) — a different generation from
+the drafts-7–12 codepoint (0xc671706a) — and wtquic emits neither. No
+Safari support is claimed without capture evidence. See COMPATIBILITY.md.
 
 No live third-party draft-16 relay (a peer signalling WT_ENABLED with
 `:protocol = webtransport-h3`) is available here, so the current profile
-is exercised by wtquic self-loopback. Notably **imquic is NOT a
-draft-16 current-profile peer**: HEAD 99fa77d sends
-`:protocol = webtransport` with `ENABLE_WEBTRANSPORT` (0x2b603742) and
-`WEBTRANSPORT_MAX_SESSIONS` (0xc671706a, the drafts-7–12 codepoint) plus
-`sec-webtransport-http3-draft02` — the Chrome/draft02 dialect, distinct
-from both profiles here. Interoperating with it would need a **separate
-third typed profile** (D07/Chrome), proposed but deliberately NOT added
-in this slice; the D13/14 compat profile is not broadened to include it.
+is exercised by wtquic self-loopback.
+
+On imquic, note that what a peer ACCEPTS and what it EMITS are separate
+observations. HEAD 99fa77d **emits** `:protocol = webtransport` with
+`ENABLE_WEBTRANSPORT` (0x2b603742) — the draft-02 generation — alongside
+`WEBTRANSPORT_MAX_SESSIONS` (0xc671706a), which is the distinct
+drafts-7–12 generation. Those are two different generations and are not
+one "Chrome" dialect; wtquic emits neither codepoint and implements no
+profile that selects on them. Interoperating would need a separately
+typed, separately evidenced profile, which is not added here.
 
 Both profiles share everything below the H3 SETTINGS/CONNECT layer —
 stream preambles, quarter-stream-ID datagrams, application <!-- api-boundary-exempt: deliberate profile-scope description -->
 error-code mapping, RESET_STREAM_AT requirements, and CLOSE / DRAIN /
-teardown are identical. The compatibility profile is safe only because
-it is EXPLICIT: the bare `webtransport` token also names capsule-based
-WebTransport in the current architecture, so it is used only when the
-caller pairs it with the historical drafts-13/14 H3 SETTINGS dialect.
+teardown are identical. The compatibility profile is safe only because it
+is EXPLICIT: the bare `webtransport` token also names capsule-based
+WebTransport in the current architecture, so it is used only when paired
+with the historical drafts-13/14 H3 SETTINGS dialect.
 `H3_DRAFT_13_14_COMPAT` never advertises the current settings and never
-emits the drafts-7–12 codepoint (0xc671706a). Server profile selection is
-connection-wide, fixed at the listener, and admits only that profile's
-`:protocol` token — it is never a heuristic or a per-request fallback,
-and it is not broadened to the D07/Chrome dialect.
+emits the drafts-7–12 codepoint (0xc671706a). A server's selection is
+per connection and is driven by the peer's settings intersected with the
+listener's configured set — never by a heuristic, a per-request fallback,
+or the CONNECT token alone.
 
 ## Compliance note (reliable reset)
 

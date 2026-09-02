@@ -198,15 +198,33 @@ typedef struct wtq_session_events {
 WTQ_API void wtq_session_events_init(wtq_session_events_t *events);
 
 /*
- * The WebTransport-over-HTTP/3 client profile: which WT wire dialect the
- * connection speaks. Latched at connect and committed BEFORE the control
- * stream's SETTINGS are emitted; it cannot change afterwards.
+ * The WebTransport-over-HTTP/3 wire profile a connection speaks. Two
+ * notions are kept strictly apart:
  *
- * These are two distinct, mutually-exclusive wire profiles — never mixed
- * on one connection, never auto-negotiated. The compatibility profile is
- * an explicit opt-in for peers speaking the historical native-H3
- * WebTransport SETTINGS dialect; it is NOT a superset, and enabling it
- * does not also advertise the current settings.
+ *   CONFIGURED CAPABILITY SET — what an endpoint may advertise and may
+ *     accept. A server configures a set (see
+ *     wtq_webtransport_profile_set_t and the MsQuic listener config) and
+ *     advertises every member of it at once. A client configures a single
+ *     requested profile; its connect request stays a singleton.
+ *
+ *   SELECTED PROFILE — the one profile actually in force. It is chosen
+ *     ONCE, from the profiles both peers advertised in their control-stream
+ *     settings, by an explicit newest-first precedence. Selection happens
+ *     before the extended CONNECT is processed, and never changes
+ *     afterwards. Query the outcome with
+ *     wtq_session_webtransport_profile().
+ *
+ * The extended-CONNECT :protocol token and any draft headers VALIDATE the
+ * selected profile; they never choose it. Several draft generations share
+ * the bare "webtransport" token, so a token cannot identify a generation on
+ * its own.
+ *
+ * There is NO automatic fallback and NO retry: if the peers share no
+ * profile, the session simply does not establish. Zero-initialised and
+ * older callers get WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT, exactly as before.
+ *
+ * These two profiles are the only ones wtquic implements. They do NOT
+ * provide stock-browser compatibility (see COMPATIBILITY.md).
  */
 typedef enum wtq_webtransport_profile {
     /*
@@ -230,6 +248,50 @@ typedef enum wtq_webtransport_profile {
      */
     WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT = 1
 } wtq_webtransport_profile_t;
+
+/*
+ * A SET of the profiles above — an endpoint's configured capabilities.
+ *
+ * Membership is spelled with explicit constants rather than a shift macro:
+ * a generic 1u << p would be undefined behaviour for an out-of-range
+ * profile value. There is deliberately no "none" member: an empty set is
+ * expressed as 0, and the absence of a selection is reported through the
+ * result of wtq_session_webtransport_profile(), never through a sentinel
+ * profile value (WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT is numeric zero and
+ * could not be told apart from one).
+ */
+typedef uint64_t wtq_webtransport_profile_set_t;
+
+#define WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT \
+    UINT64_C(0x1)
+#define WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT \
+    UINT64_C(0x2)
+/* Every profile this build knows. */
+#define WTQ_WEBTRANSPORT_PROFILES_ALL                                     \
+    (WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |                               \
+     WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT)
+
+/*
+ * The profile this session actually selected.
+ *
+ *   WTQ_OK               *profile_out holds the selected profile. Valid
+ *                        from inside on_established onwards, including on
+ *                        a retained handle after the session has ended.
+ *   WTQ_ERR_STATE        no selection yet (before start, while connecting,
+ *                        or after a failure that never established).
+ *   WTQ_ERR_INVALID_ARG  session or profile_out is NULL.
+ *
+ * On any failure *profile_out is left untouched, so a caller can never
+ * mistake "not selected yet" for the zero-valued current profile.
+ *
+ * THREADING: this is a session query and obeys the normal session-domain
+ * rule stated at the top of this header exactly like the other queries
+ * below — for a guarded session, an outside thread still enters the domain
+ * by holding the caller guard. "Read-only" here means only that it reports
+ * stored state: it mutates nothing and changes no callback accounting.
+ */
+WTQ_API wtq_result_t wtq_session_webtransport_profile(
+    const wtq_session_t *session, wtq_webtransport_profile_t *profile_out);
 
 /*
  * Client connect parameters (what to CONNECT to and which application

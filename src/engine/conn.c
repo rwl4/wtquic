@@ -379,9 +379,13 @@ static void session_established(wtq_conn_t *conn, struct wtq_estream *es,
     (void)wtq_varint_encode(conn->session_id / 4, conn->qsid_prefix,
                             sizeof(conn->qsid_prefix), &qlen);
     conn->qsid_prefix_len = (uint8_t)qlen;
+    /* Selection is latched before a session can establish — the CONNECT
+     * that got us here was decoded under the latched profile — so the
+     * profile handed to the callback is always meaningful. */
     if (conn->cb.on_session_established != NULL)
         conn->cb.on_session_established(conn, conn->selected,
-                                        conn->selected_len, conn->cb.ctx);
+                                        conn->selected_len, conn->wt_profile,
+                                        conn->cb.ctx);
 }
 
 /*
@@ -560,25 +564,36 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
     if (cfg->perspective != WTQ_PERSPECTIVE_CLIENT &&
         cfg->perspective != WTQ_PERSPECTIVE_SERVER)
         return WTQ_ERR_INVALID_ARG;
-    if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
-        cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
-        return WTQ_ERR_INVALID_ARG;
     /*
-     * The configured capability SET. A zero set derives the one-bit set
-     * from the singular field, so every caller that knows only the singular
-     * field stays byte-for-byte single-profile; a non-zero set is
-     * authoritative. Unknown bits, or a set with no known member, are
-     * rejected HERE — before any allocation or I/O — so a mistake fails
-     * loudly at the boundary rather than reaching the codec, whose
-     * CURRENT-only fallback is defence in depth and never acceptance.
+     * The configured capability SET, with the AUTHORITATIVE-SET rule held
+     * end to end.
+     *
+     * Zero set: the singular field is the only source, so it is validated
+     * and a one-member set is derived from it — every caller that knows
+     * only the singular field stays byte-for-byte single-profile.
+     *
+     * Non-zero set: the set IS the configuration and the singular input is
+     * ignored ENTIRELY, including an out-of-range value. Validating an
+     * input nobody reads would make the backend's documented rule
+     * unreachable: a listener that legitimately accepts such a config would
+     * then fail here when it built the accepted session.
+     *
+     * Unknown bits, or a set with no known member, are rejected HERE —
+     * before any allocation or I/O — so a mistake fails loudly at the
+     * boundary rather than reaching the codec, whose CURRENT-only fallback
+     * is defence in depth and never acceptance.
      */
     wtq_h3_wt_profile_set_t profiles = cfg->webtransport_profiles;
-    if (profiles == 0)
+    if (profiles == 0) {
+        if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
+            cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
+            return WTQ_ERR_INVALID_ARG;
         profiles = wtq_h3_wt_profile_bit(
             (wtq_h3_wt_profile_t)cfg->webtransport_profile);
-    else if ((profiles & ~WTQ_H3_WT_PROFILES_ALL) != 0 ||
-             (profiles & WTQ_H3_WT_PROFILES_ALL) == 0)
+    } else if ((profiles & ~WTQ_H3_WT_PROFILES_ALL) != 0 ||
+               (profiles & WTQ_H3_WT_PROFILES_ALL) == 0) {
         return WTQ_ERR_INVALID_ARG;
+    }
 
     wtq_conn_t *conn = cfg->alloc->alloc(sizeof(*conn), cfg->alloc->ctx);
     if (conn == NULL)
@@ -598,7 +613,15 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
      * singleton in wtq_conn_client_connect, before start emits SETTINGS.
      */
     conn->wt_profiles = profiles;
-    conn->wt_profile = (wtq_h3_wt_profile_t)cfg->webtransport_profile;
+    /* Never carry an IGNORED singular into live state: when the set is
+     * authoritative the incoming value may be out of range, so seed the
+     * placeholder deterministically instead of casting it. Nothing reads
+     * this before selection — profile_latched is the sole authority for
+     * whether a selection exists. */
+    conn->wt_profile = (profiles == wtq_h3_wt_profile_bit(
+                                        WTQ_H3_WT_PROFILE_D13_14_COMPAT))
+                           ? WTQ_H3_WT_PROFILE_D13_14_COMPAT
+                           : WTQ_H3_WT_PROFILE_CURRENT;
     conn->profile_latched = false;
 
     *out = conn;
@@ -1719,15 +1742,6 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         return;
     }
 
-    /* Profile symmetry: honour ONLY our profile's extended-CONNECT
-     * :protocol token — a compat server accepts the bare "webtransport"
-     * token, a current server accepts "webtransport-h3". req.legacy_protocol
-     * records which token matched; a mismatch is answered like any other
-     * non-WebTransport request (a generic 400, connection lives), so the
-     * server never emits one profile's SETTINGS while honouring the other's
-     * CONNECT token. (STRICT already rejects the bare token before here, so
-     * for the current profile legacy_protocol is always false and this never
-     * false-rejects.) */
     /*
      * The token VALIDATES the latch; it never selects. A CURRENT latch
      * accepts only "webtransport-h3"; a D13/14 latch accepts only the bare

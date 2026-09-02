@@ -55,6 +55,14 @@ struct wtq_session {
     bool terminal_fired;     /* exactly-one terminal event guard */
     bool established_seen;
     bool failed;             /* terminal without establishment */
+    /* The negotiated wire profile, published by adapt_established BEFORE
+     * the application's on_established runs, so the public query is already
+     * answerable inside that callback. profile_available is the only
+     * authority: the selected value is never inferred from the enum,
+     * because the current profile is numeric zero. Immutable once set, and
+     * still readable on a retained terminal handle. */
+    bool profile_available;
+    wtq_webtransport_profile_t profile;
 
     struct wtq_stream streams[WTQ_API_MAX_STREAMS];
 };
@@ -345,14 +353,46 @@ static struct wtq_stream *handle_of(wtq_estream_t *es)
     return (struct wtq_stream *)wtq_estream_get_user(es);
 }
 
+/*
+ * Explicit, exhaustive internal -> public profile conversion. A switch, not
+ * a cast: an internally added profile with no public counterpart becomes a
+ * compile diagnostic here instead of a silent numeric reinterpretation. The
+ * asserts below pin the values these cases rely on, and unlike the backend's
+ * mask assertions they are compiled in EVERY build — including a core-only
+ * one with no backend enabled, which is exactly where the exported query
+ * would otherwise depend on an unchecked numeric equivalence.
+ */
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT ==
+                   (int)WTQ_H3_WT_PROFILE_CURRENT,
+               "public/internal CURRENT profile value must agree");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT ==
+                   (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT,
+               "public/internal D13/14 profile value must agree");
+
+static wtq_webtransport_profile_t api_public_profile(wtq_h3_wt_profile_t p)
+{
+    switch (p) {
+    case WTQ_H3_WT_PROFILE_CURRENT:
+        return WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+    case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
+        return WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+    }
+    return WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+}
+
 static void adapt_established(wtq_conn_t *conn, const char *sel,
-                              size_t sel_len, void *ctx)
+                              size_t sel_len, wtq_h3_wt_profile_t profile,
+                              void *ctx)
 {
     wtq_session_t *s = ctx;
 
     (void)conn;
     session_enter(s);
     s->established_seen = true;
+    /* Publish BEFORE the application callback: a query from inside
+     * on_established must already see the selected profile. */
+    s->profile = api_public_profile(profile);
+    s->profile_available = true;
     if (s->ev.on_established != NULL) {
         wtq_str_t sub = { sel, sel_len };
         s->ev.on_established(s, sub, s->user);
@@ -641,6 +681,7 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
         .perspective = cfg->perspective,
         .enable_connect_protocol = true,
         .webtransport_profile = cfg->webtransport_profile,
+        .webtransport_profiles = cfg->webtransport_profiles,
         .callbacks = { .on_conn_error = adapt_conn_error,
                        .on_session_established = adapt_established,
                        .on_session_rejected = adapt_rejected,
@@ -943,6 +984,26 @@ wtq_session_status_t wtq_session_status(const wtq_session_t *s)
     default:
         return WTQ_SESSION_STATUS_CONNECTING;
     }
+}
+
+/*
+ * The negotiated wire profile. Like the other read-only queries here it
+ * reports stored state and takes no session_enter/session_exit
+ * destruction-deferral bracket and mutates no callback depth — which is NOT
+ * an exemption from the session-domain rule: the caller is required to be
+ * on the domain exactly as for every other session query. On any failure
+ * *profile_out is untouched, so "not selected yet" can never be mistaken
+ * for the zero-valued current profile.
+ */
+wtq_result_t wtq_session_webtransport_profile(
+    const wtq_session_t *s, wtq_webtransport_profile_t *profile_out)
+{
+    if (s == NULL || profile_out == NULL)
+        return WTQ_ERR_INVALID_ARG;
+    if (!s->profile_available)
+        return WTQ_ERR_STATE;
+    *profile_out = s->profile;
+    return WTQ_OK;
 }
 
 wtq_str_t wtq_session_subprotocol(const wtq_session_t *s)

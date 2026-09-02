@@ -30,6 +30,7 @@ struct side {
     char label;
     /* app state */
     int established;
+    int failed;
     int draining;
     int closed;
     uint32_t closed_code;
@@ -45,16 +46,35 @@ struct side {
     size_t dgram_len;
     int completions;
     bool echo; /* respond to bidi data with an echo + FIN */
+    /* the negotiated-profile query sampled INSIDE on_established, which is
+     * what proves the value is published BEFORE the callback rather than
+     * merely by the time the pump finishes */
+    int cb_query_rc;
+    int cb_profile;
+    int cb_status_after_query;
     wtq_estream_t *es_for_slot[FAKE_MAX_STREAMS];
 };
 
 static void on_established(wtq_session_t *s, wtq_str_t sub, void *user)
 {
     side_t *sd = user;
+    wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
 
-    (void)s;
     (void)sub;
     sd->established++;
+    sd->cb_query_rc = (int)wtq_session_webtransport_profile(s, &prof);
+    sd->cb_profile = (int)prof;
+    /* a following status query from the same callback still behaves
+     * normally — this records that STATUS, not callback depth */
+    sd->cb_status_after_query = (int)wtq_session_status(s);
+}
+
+static void on_failed(wtq_session_t *s, wtq_connect_failure_t why,
+                      void *user)
+{
+    (void)s;
+    (void)why;
+    ((side_t *)user)->failed++;
 }
 
 static void on_draining(wtq_session_t *s, void *user)
@@ -136,7 +156,16 @@ static void on_datagram(wtq_session_t *s, const uint8_t *data, size_t len,
         memcpy(sd->dgram, data, sd->dgram_len);
 }
 
+static int side_up_profiles(side_t *sd, char label, bool client,
+                            int singular, uint64_t set, int *fp);
+
 static int side_up(side_t *sd, char label, bool client, int *fp)
+{
+    return side_up_profiles(sd, label, client, 0, 0, fp);
+}
+
+static int side_up_profiles(side_t *sd, char label, bool client,
+                            int singular, uint64_t set, int *fp)
 {
     int failures = 0;
     wtq_session_events_t ev;
@@ -146,6 +175,7 @@ static int side_up(side_t *sd, char label, bool client, int *fp)
     fake_driver_init(&sd->drv, client);
     wtq_session_events_init(&ev);
     ev.on_established = on_established;
+    ev.on_failed = on_failed;
     ev.on_draining = on_draining;
     ev.on_closed = on_closed;
     ev.on_stream_opened = on_stream_opened;
@@ -162,6 +192,8 @@ static int side_up(side_t *sd, char label, bool client, int *fp)
         .user = sd,
         .drv = &sd->drv,
         .ops = fake_driver_ops(),
+        .webtransport_profile = singular,
+        .webtransport_profiles = set,
     };
     WTQ_TEST_CHECK(wtq_api_session_create(&cfg, &sd->s) == WTQ_OK);
     if (sd->s == NULL) {
@@ -371,12 +403,275 @@ static int scenario_api_pair(uint64_t seed, int *fp)
     return failures;
 }
 
+/*
+ * The public negotiated-profile query. One MULTI-PROFILE server is driven
+ * against a CURRENT client and a D13/14 client on separate connections, and
+ * each side is asked what IT selected — never merely what it was configured
+ * with.
+ */
+static int scenario_profile_query(uint64_t seed, int client_profile,
+                                  int expect, int *fp)
+{
+    int failures = 0;
+    static side_t c;
+    static side_t s;
+    const uint64_t BOTH = WTQ_WEBTRANSPORT_PROFILES_ALL;
+
+    if (side_up_profiles(&c, 'c', true, client_profile, 0, fp) != 0 ||
+        side_up_profiles(&s, 's', false, 0, BOTH, fp) != 0)
+        return 1;
+
+    /* before establishment: no selection exists, and the output is left
+     * untouched so it can never be read as the zero-valued current profile */
+    {
+        wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(c.s, &prof),
+            (int)WTQ_ERR_STATE);
+        WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f);
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(s.s, &prof),
+            (int)WTQ_ERR_STATE);
+        WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f);
+        /* NULL arguments, output still untouched */
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(NULL, &prof),
+            (int)WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f);
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(c.s, NULL),
+            (int)WTQ_ERR_INVALID_ARG);
+    }
+
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+    wtq_connect_config_t cc;
+    wtq_connect_config_init(&cc);
+    cc.authority = "example.com";
+    cc.path = "/app";
+    cc.subprotocols = OFFER;
+    cc.subprotocol_count = 1;
+    cc.webtransport_profile = (uint32_t)client_profile;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    pump(seed, &c, &s);
+
+    WTQ_TEST_CHECK_EQ_INT(c.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(s.established, 1);
+
+    /* INSIDE on_established the query already answered, with the profile
+     * this connection selected — the multi-profile server reports the
+     * client's generation, not its own configured set or a default */
+    WTQ_TEST_CHECK_EQ_INT(s.cb_query_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(s.cb_profile, expect);
+    WTQ_TEST_CHECK_EQ_INT(c.cb_query_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(c.cb_profile, expect);
+    /* The query is legal from inside the callback and the session is still
+     * usable there. This pins callback-time LEGALITY only: it does NOT
+     * observe callback depth. That the query mutates no session state is
+     * enforced by its implementation — a const session, no
+     * session_enter/exit bracket, no counter touched — verified by
+     * inspection, not by this assertion. */
+    WTQ_TEST_CHECK_EQ_INT(s.cb_status_after_query,
+                          (int)WTQ_SESSION_STATUS_ESTABLISHED);
+
+    /* and afterwards, from outside any callback */
+    {
+        wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(s.s, &prof), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)prof, expect);
+    }
+
+    /* stable on a RETAINED handle past the session terminal */
+    wtq_session_add_ref(s.s);
+    WTQ_TEST_CHECK(wtq_session_close(s.s, 0, NULL, 0) == WTQ_OK);
+    pump(seed, &c, &s);
+    /* CAUSAL: prove the handle really is POST-TERMINAL before querying it.
+     * Without this the close could have failed to complete and the query
+     * would still answer from the live session, passing without ever
+     * exercising the dead-but-valid state this case exists to cover. */
+    WTQ_TEST_CHECK_EQ_INT(s.closed, 1);
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_session_status(s.s),
+                          (int)WTQ_SESSION_STATUS_CLOSED);
+    {
+        wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+        WTQ_TEST_CHECK_EQ_INT(
+            (int)wtq_session_webtransport_profile(s.s, &prof), (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT((int)prof, expect);
+    }
+    wtq_session_release(s.s);
+
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+    *fp += failures;
+    return 0;
+}
+
+/*
+ * The public lifecycle states in which no selection exists yet. Each is
+ * pinned separately even though profile_available is the single authority,
+ * because these are distinct states an application can actually be in.
+ */
+static int scenario_profile_query_states(uint64_t seed, int *fp)
+{
+    int failures = 0;
+    static side_t c;
+    static side_t s;
+    wtq_webtransport_profile_t prof;
+
+    /* (a) CREATED but not started */
+    {
+        side_t only;
+        wtq_session_events_t ev;
+
+        memset(&only, 0, sizeof(only));
+        only.label = 'x';
+        fake_driver_init(&only.drv, true);
+        wtq_session_events_init(&ev);
+        wtq_api_session_cfg_t cfg = {
+            .alloc = wtq_alloc_default(),
+            .perspective = WTQ_PERSPECTIVE_CLIENT,
+            .events = &ev,
+            .user = &only,
+            .drv = &only.drv,
+            .ops = fake_driver_ops(),
+        };
+        WTQ_TEST_CHECK(wtq_api_session_create(&cfg, &only.s) == WTQ_OK);
+        if (only.s != NULL) {
+            prof = (wtq_webtransport_profile_t)0x7f;
+            WTQ_TEST_CHECK_EQ_INT(
+                (int)wtq_session_webtransport_profile(only.s, &prof),
+                (int)WTQ_ERR_STATE);
+            WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f); /* untouched */
+            wtq_session_release(only.s);
+        }
+    }
+
+    /* (b) reached a TERMINAL FAILURE without ever establishing: a
+     * deterministic no-mutual-profile pairing (CURRENT client vs a
+     * D13/14-only server) fails at settings validation. A RETAINED handle
+     * must still report no selection, with the output untouched. */
+    if (side_up_profiles(&c, 'c', true,
+                         (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT, 0,
+                         fp) != 0 ||
+        side_up_profiles(&s, 's', false, 0,
+                         WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT,
+                         fp) != 0)
+        return 1;
+
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+    wtq_connect_config_t cc;
+    wtq_connect_config_init(&cc);
+    cc.authority = "example.com";
+    cc.path = "/app";
+    cc.subprotocols = OFFER;
+    cc.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    pump(seed, &c, &s);
+
+    /* CAUSAL: prove this really reached a TERMINAL FAILURE and did not
+     * merely stall in CONNECTING — `established == 0` alone cannot tell
+     * those apart. */
+    WTQ_TEST_CHECK_EQ_INT(c.established, 0);
+    WTQ_TEST_CHECK_EQ_INT(s.established, 0);
+    WTQ_TEST_CHECK_EQ_INT(c.failed, 1);
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_session_status(c.s),
+                          (int)WTQ_SESSION_STATUS_FAILED);
+    prof = (wtq_webtransport_profile_t)0x7f;
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_session_webtransport_profile(c.s, &prof),
+        (int)WTQ_ERR_STATE);
+    WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)wtq_session_webtransport_profile(s.s, &prof),
+        (int)WTQ_ERR_STATE);
+    WTQ_TEST_CHECK_EQ_INT((int)prof, 0x7f);
+
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+    *fp += failures;
+    return 0;
+}
+
+/*
+ * The AUTHORITATIVE-SET rule, end to end. A server configured with a valid
+ * non-zero set AND an out-of-range singular profile must build, negotiate
+ * and establish normally: once the set is given the singular input has no
+ * role, so validating it would make the documented backend rule
+ * unreachable. A test that stopped at listener normalisation would not
+ * catch the engine rejecting it.
+ */
+static int scenario_authoritative_set_ignores_singular(uint64_t seed, int *fp)
+{
+    int failures = 0;
+    static side_t c;
+    static side_t s;
+
+    /* 99 is deliberately out of range; the set is what counts */
+    if (side_up_profiles(&c, 'c', true,
+                         (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
+                         0, fp) != 0 ||
+        side_up_profiles(&s, 's', false, 99,
+                         WTQ_WEBTRANSPORT_PROFILES_ALL, fp) != 0)
+        return 1;
+
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+    wtq_connect_config_t cc;
+    wtq_connect_config_init(&cc);
+    cc.authority = "example.com";
+    cc.path = "/app";
+    cc.subprotocols = OFFER;
+    cc.subprotocol_count = 1;
+    cc.webtransport_profile =
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    pump(seed, &c, &s);
+
+    /* it negotiated normally, and selected from the SET */
+    WTQ_TEST_CHECK_EQ_INT(s.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(c.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(s.cb_query_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        s.cb_profile, (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT);
+
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+    *fp += failures;
+    return 0;
+}
+
 int main(void)
 {
     int failures = 0;
 
     (void)scenario_api_pair(0xAB1E, &failures);
     (void)scenario_api_pair(0x5EED, &failures); /* other chunking */
+    (void)scenario_profile_query(0xC0FFEE,
+                                 (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
+                                 (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
+                                 &failures);
+    (void)scenario_profile_query(
+        0xDECAF, (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
+        (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT, &failures);
+    (void)scenario_authoritative_set_ignores_singular(0xBADF00D, &failures);
+    (void)scenario_profile_query_states(0x5747E5, &failures);
 
     if (failures > 0) {
         fprintf(stderr, "FAILED: test_api_pair (%d)\n", failures);

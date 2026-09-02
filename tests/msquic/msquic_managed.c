@@ -946,9 +946,224 @@ static int test_abi_listener_oversized(void)
     return failures;
 }
 
-/* Start a heap-backed listener cfg of a given struct_size and return the
- * profile the retained listener latched (or -1 if start failed). The buffer is
- * exactly struct_size, so ASan trips any read past it. */
+/*
+ * Heap-backed v4 fixture: writes the (possibly partial) singular profile AND
+ * capability-set bytes at their real field offsets in an object of EXACTLY
+ * struct_size bytes, so ASan bounds any overread. Returns the listener's
+ * NORMALISED set, or 0 when start failed.
+ */
+static uint64_t abi_listener_set_start(uint32_t struct_size,
+                                       const unsigned char *profile_bytes,
+                                       size_t profile_len,
+                                       const unsigned char *set_bytes,
+                                       size_t set_len,
+                                       int *singular_out,
+                                       wtq_result_t *rc_out)
+{
+    struct wtq_msquic_env env;
+    QUIC_API_TABLE api;
+    abi_env_init(&env, &api);
+    wtq_serve_config_t serve;
+    abi_serve(&serve);
+    wtq_session_events_t ev;
+    wtq_session_events_init(&ev);
+
+    uint64_t set = 0;
+    if (singular_out != NULL)
+        *singular_out = -1;
+    *rc_out = WTQ_ERR_NOMEM;
+    /* The object is EXACTLY struct_size whenever that is a real config, so
+     * ASan bounds any overread past the caller's declared size. The
+     * short-prefix rejection row is the one exception: it declares a size
+     * below the v1 prefix on purpose, and the v1 writer needs the full
+     * prefix to exist, so allocate that much and let the SHORT struct_size
+     * be what the library sees. */
+    size_t alloc_len = struct_size;
+    if (alloc_len < sizeof(wtq_msquic_listener_cfg_v1_t))
+        alloc_len = sizeof(wtq_msquic_listener_cfg_v1_t);
+    unsigned char *buf = malloc(alloc_len);
+    if (buf != NULL) {
+        memset(buf, 0, alloc_len);
+        /* POISON everything beyond the current struct: an oversized future
+         * caller's unknown tail must be ignored, and zeroes would not prove
+         * that. */
+        if (alloc_len > sizeof(wtq_msquic_listener_cfg_t))
+            memset(buf + sizeof(wtq_msquic_listener_cfg_t), 0xA5,
+                   alloc_len - sizeof(wtq_msquic_listener_cfg_t));
+        abi_set_listener_v1(buf, (uint32_t)alloc_len, &serve, &ev, NULL);
+        ((wtq_msquic_listener_cfg_t *)(void *)buf)->struct_size = struct_size;
+        if (profile_len > 0)
+            memcpy(buf + offsetof(wtq_msquic_listener_cfg_t,
+                                  webtransport_profile),
+                   profile_bytes, profile_len);
+        if (set_len > 0)
+            memcpy(buf + offsetof(wtq_msquic_listener_cfg_t,
+                                  webtransport_profiles),
+                   set_bytes, set_len);
+        wtq_msquic_listener_t *l = NULL;
+        *rc_out = wtq_msquic_listener_start(&env, (void *)buf, &l);
+        if (*rc_out == WTQ_OK && l != NULL) {
+            set = l->webtransport_profiles;
+            if (singular_out != NULL)
+                *singular_out = l->webtransport_profile;
+            wtq_msquic_listener_stop(l);
+        }
+        free(buf);
+    }
+    abi_env_destroy(&env);
+    return set;
+}
+
+/*
+ * The listener v4 capability-set ABI matrix. The old-layout rows use the
+ * FROZEN shadow sizes, never a size derived from the current struct, so an
+ * implementation change cannot move the test object with it.
+ */
+static int test_abi_listener_profile_set(void)
+{
+    int failures = 0;
+    const size_t v1 = sizeof(wtq_msquic_listener_cfg_v1_t);
+    const size_t v3 = sizeof(wtq_msquic_listener_cfg_v3_t);
+    const size_t full = sizeof(wtq_msquic_listener_cfg_t);
+    const size_t soff =
+        offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles);
+    const size_t slen =
+        sizeof(((wtq_msquic_listener_cfg_t *)0)->webtransport_profiles);
+    /* These are host C-ABI fields, not wire values, so build them as NATIVE
+     * objects and copy their object representations. Hand-rolled
+     * little-endian byte arrays would silently mis-encode on a big-endian
+     * host. */
+    const uint32_t v_current = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+    const uint32_t v_compat =
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+    const uint32_t v_bad = 99u;
+    const uint64_t m_cur = WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT;
+    const uint64_t m_cmp = WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
+    const uint64_t m_both = WTQ_WEBTRANSPORT_PROFILES_ALL;
+    const uint64_t m_unknown = UINT64_C(1) << 3;
+    const uint64_t m_mixed = WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
+                             (UINT64_C(1) << 3);
+    const unsigned char *CURRENT = (const unsigned char *)&v_current;
+    const unsigned char *COMPAT = (const unsigned char *)&v_compat;
+    const unsigned char *BAD_SINGULAR = (const unsigned char *)&v_bad;
+    const unsigned char *SET_CUR = (const unsigned char *)&m_cur;
+    const unsigned char *SET_CMP = (const unsigned char *)&m_cmp;
+    const unsigned char *SET_BOTH = (const unsigned char *)&m_both;
+    const unsigned char *SET_UNKNOWN = (const unsigned char *)&m_unknown;
+    const unsigned char *SET_MIXED = (const unsigned char *)&m_mixed;
+    wtq_result_t rc;
+    int singular;
+
+    /* the derived layout itself: the set begins at/after a COMPLETE v3 */
+    WTQ_TEST_CHECK(soff >= v3);
+    WTQ_TEST_CHECK_EQ_SIZE(full, soff + slen);
+
+    /* (1) exact frozen v1: accepted, defaults CURRENT */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)v1, NULL, 0, NULL, 0, &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* (2) prefix minus one: rejected */
+    (void)abi_listener_set_start((uint32_t)(v1 - 1), NULL, 0, NULL, 0, NULL,
+                                 &rc);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_ERR_INVALID_ARG);
+
+    /* (3) exact frozen v3: singular still governs, no v4 overread */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)v3, COMPAT, 4, NULL, 0, &singular,
+                               &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)v3, CURRENT, 4, NULL, 0, &singular,
+                               &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    /* a v3 caller's out-of-range singular is still rejected */
+    (void)abi_listener_set_start((uint32_t)v3, BAD_SINGULAR, 4, NULL, 0, NULL,
+                                 &rc);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_ERR_INVALID_ARG);
+
+    /* (4) struct_size landing INSIDE the set: field ignored WHOLLY, the
+     * singular fallback governs. The partial bytes are a real prefix of a
+     * NATIVE mask object, not a hand-built array. */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)(soff + slen - 1), COMPAT, 4,
+                               SET_CUR, slen - 1, &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* (5) exact current object, zero set: singular fallback */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, COMPAT, 4, NULL, 0, &singular,
+                               &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* (6)(7)(8) explicit sets are authoritative */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_CUR, slen,
+                               &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT);
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_CMP, slen,
+                               &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_BOTH, slen,
+                               &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_ALL);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* (9) authoritative set + a valid singular NON-MEMBER: set wins, the
+     * singular is accepted and ignored (membership is NOT required) */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, COMPAT, 4, SET_CUR, slen,
+                               &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    /* ... and even an OUT-OF-RANGE singular is ignored once the set is
+     * authoritative: it has no role, so it is not validated as if it did */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, BAD_SINGULAR, 4, SET_CMP, slen,
+                               &singular, &rc),
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* (10) unknown bits, and a nonzero set with no known member: rejected */
+    (void)abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_MIXED, slen,
+                                 NULL, &rc);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_ERR_INVALID_ARG);
+    (void)abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_UNKNOWN, slen,
+                                 NULL, &rc);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_ERR_INVALID_ARG);
+
+    /* (11) oversized future struct whose unknown tail is POISONED (0xA5,
+     * see the fixture): accepted, known set honoured, tail ignored */
+    {
+        uint32_t big = (uint32_t)(full + 32);
+        WTQ_TEST_CHECK_EQ_U64(
+            abi_listener_set_start(big, CURRENT, 4, SET_BOTH, slen, &singular,
+                                   &rc),
+            WTQ_WEBTRANSPORT_PROFILES_ALL);
+        WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    }
+
+    /* (12) the sized initializer zeroes the set; the frozen bare symbol
+     * still writes only v1 */
+    {
+        wtq_msquic_listener_cfg_t c;
+        wtq_msquic_listener_cfg_init_ex(&c, sizeof(c));
+        WTQ_TEST_CHECK_EQ_U64(c.webtransport_profiles, 0);
+        WTQ_TEST_CHECK_EQ_INT((int)c.struct_size, (int)sizeof(c));
+    }
+
+    if (failures == 0)
+        printf("PASS: abi_listener_profile_set\n");
+    return failures;
+}
+
 static int abi_listener_profile_start(uint32_t struct_size,
                                       const unsigned char *profile_bytes,
                                       size_t profile_len,
@@ -1429,6 +1644,7 @@ int main(void)
     failures += test_abi_listener_partial_quiesce();
     failures += test_abi_listener_oversized();
     failures += test_abi_listener_profile();
+    failures += test_abi_listener_profile_set();
     failures += test_abi_env_partial_tuning();
     failures += test_client_unwind_oversized();
     failures += test_client_unwind_start_fail();

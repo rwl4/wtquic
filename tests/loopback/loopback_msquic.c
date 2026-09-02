@@ -46,6 +46,10 @@ struct side {
     size_t dgram_max;
     uint16_t refused_status;
     int failed_why;
+    /* the negotiated-profile query, taken INSIDE the real public
+     * on_established callback of the real MsQuic backend */
+    int prof_rc;
+    int prof;
     uint32_t closed_code;
     bool closed_clean;
     char closed_reason[64];
@@ -228,6 +232,29 @@ static bool side_wait(struct side *sd, const int *flag)
     return set;
 }
 
+/*
+ * Wait until a CUMULATIVE counter reaches `want`. side_wait() only tests
+ * "non-zero", which is already satisfied on a second connection and would
+ * let a reader observe the previous connection's value (or a poison) instead
+ * of the one it is waiting for. Same wall deadline; the counter is read only
+ * under sd->mu.
+ */
+static bool side_wait_count(struct side *sd, const int *counter, int want)
+{
+    struct timespec deadline;
+    bool ok = true;
+    bool reached;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += WAIT_SECS;
+    pthread_mutex_lock(&sd->mu);
+    while (*counter < want && ok)
+        ok = pthread_cond_timedwait(&sd->cv, &sd->mu, &deadline) == 0;
+    reached = *counter >= want;
+    pthread_mutex_unlock(&sd->mu);
+    return reached;
+}
+
 /* --- callbacks (MsQuic worker context) ------------------------------------ */
 
 static void cb_established(wtq_session_t *s, wtq_str_t sub, void *user)
@@ -242,6 +269,11 @@ static void cb_established(wtq_session_t *s, wtq_str_t sub, void *user)
         memcpy(sd->sub, sub.data, sd->sub_len);
     /* datagram availability is settled by establishment time */
     sd->dgram_max = wtq_session_datagram_max_size(s);
+    {
+        wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+        sd->prof_rc = (int)wtq_session_webtransport_profile(s, &prof);
+        sd->prof = (int)prof;
+    }
     pthread_mutex_unlock(&sd->mu);
 
     if (sd->ping_in_established) {
@@ -794,6 +826,11 @@ static int certs_locate(const char *argv1)
     return 0;
 }
 
+static wtq_result_t listener_up_profiles(wtq_msquic_env_t *env,
+                                         struct side *sd, const char *path,
+                                         uint64_t profiles,
+                                         wtq_msquic_listener_t **l_out);
+
 static wtq_result_t listener_up(wtq_msquic_env_t *env, struct side *sd,
                                 const char *path,
                                 wtq_msquic_listener_t **l_out)
@@ -817,6 +854,61 @@ static wtq_result_t listener_up(wtq_msquic_env_t *env, struct side *sd,
     cfg.events = &ev;
     cfg.user = sd;
     return wtq_msquic_listener_start(env, &cfg, l_out);
+}
+
+/* One listener advertising a capability SET; every accepted connection
+ * selects from its peer's settings. */
+static wtq_result_t listener_up_profiles(wtq_msquic_env_t *env,
+                                         struct side *sd, const char *path,
+                                         uint64_t profiles,
+                                         wtq_msquic_listener_t **l_out)
+{
+    static const char *const protos[] = { "wtq-test" };
+    wtq_session_events_t ev;
+    wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
+    wtq_msquic_listener_cfg_t cfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
+
+    events_for(&ev);
+    serve.path = path;
+    serve.subprotocols = protos;
+    serve.subprotocol_count = 1;
+
+    cfg.bind_address = "127.0.0.1";
+    cfg.port = 0;
+    cfg.cert_file = cert_path;
+    cfg.key_file = key_path;
+    cfg.paths = &serve;
+    cfg.path_count = 1;
+    cfg.events = &ev;
+    cfg.user = sd;
+    cfg.webtransport_profiles = profiles;
+    return wtq_msquic_listener_start(env, &cfg, l_out);
+}
+
+static wtq_result_t client_up_profile(wtq_msquic_env_t *env, struct side *sd,
+                                      uint16_t port, const char *path,
+                                      uint32_t profile,
+                                      wtq_session_t **s_out)
+{
+    static const char *const protos[] = { "wtq-test" };
+    wtq_session_events_t ev;
+    wtq_connect_config_t connect = WTQ_CONNECT_CONFIG_INIT;
+    wtq_msquic_client_cfg_t cfg = WTQ_MSQUIC_CLIENT_CFG_INIT;
+
+    events_for(&ev);
+    connect.authority = "localhost";
+    connect.path = path;
+    connect.subprotocols = protos;
+    connect.subprotocol_count = 1;
+    connect.webtransport_profile = profile;
+
+    cfg.server_name = "127.0.0.1";
+    cfg.port = port;
+    cfg.insecure_skip_verify = true;
+    cfg.connect = &connect;
+    cfg.events = &ev;
+    cfg.user = sd;
+    return wtq_msquic_client_connect(env, &cfg, s_out);
 }
 
 static wtq_result_t client_up(wtq_msquic_env_t *env, struct side *sd,
@@ -1102,6 +1194,98 @@ out:
     side_destroy(&sv);
     if (failures == 0)
         printf("PASS: sequential_conns\n");
+    return failures;
+}
+
+/*
+ * REAL-BACKEND negotiation causality. ONE MsQuic listener advertising the
+ * whole capability set accepts a CURRENT client and then a D13/14 client as
+ * separate sequential connections, and BOTH sides query the negotiated
+ * profile from inside the real public on_established callback. This is the
+ * only lane that exercises listener -> accepted-session pass-through ->
+ * engine selection -> public query through the actual backend; the unit
+ * tests each cover one side of that line and cannot see a break in it.
+ */
+static int t_profile_negotiation(void)
+{
+    int failures = 0;
+    wtq_msquic_env_cfg_t ecfg = WTQ_MSQUIC_ENV_CFG_INIT;
+    wtq_msquic_env_t *env = NULL;
+    wtq_msquic_listener_t *listener = NULL;
+    struct side sv;
+    static const uint32_t cases[] = {
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
+    };
+
+    side_init(&sv);
+    WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&ecfg, &env), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        listener_up_profiles(env, &sv, "/echo",
+                             WTQ_WEBTRANSPORT_PROFILES_ALL, &listener),
+        WTQ_OK);
+    if (env == NULL || listener == NULL)
+        goto out;
+    uint16_t port = wtq_msquic_listener_port(listener);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct side cl;
+        wtq_session_t *cs = NULL;
+
+        side_init(&cl);
+        cl.close_in_established = true;
+        cl.close_code = 0;
+        cl.close_reason = "done";
+        cl.release_in_closed = true;
+
+        /* Poison the server observer so a stale or unpublished value is
+         * distinguishable from this connection's real result. */
+        pthread_mutex_lock(&sv.mu);
+        sv.prof_rc = -12345;
+        sv.prof = -1;
+        pthread_mutex_unlock(&sv.mu);
+
+        WTQ_TEST_CHECK_EQ_INT(
+            client_up_profile(env, &cl, port, "/echo", cases[i], &cs),
+            WTQ_OK);
+        WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
+        WTQ_TEST_CHECK_EQ_INT(cl.established, 1);
+
+        /* the CLIENT's own callback saw its requested profile selected */
+        WTQ_TEST_CHECK_EQ_INT(cl.prof_rc, (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(cl.prof, (int)cases[i]);
+
+        /* Wait for the SERVER's OWN i-th establishment before reading its
+         * query. sv.established is cumulative, so a non-zero test would be
+         * satisfied on the second connection by the first one's callback and
+         * could read the poison: the response send is asynchronous and the
+         * server callback may still be running on another worker when the
+         * client's close completes. */
+        WTQ_TEST_CHECK(side_wait_count(&sv, &sv.established, (int)i + 1));
+        pthread_mutex_lock(&sv.mu);
+        int srv_rc = sv.prof_rc;
+        int srv_prof = sv.prof;
+        pthread_mutex_unlock(&sv.mu);
+        WTQ_TEST_CHECK_EQ_INT(srv_rc, (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(srv_prof, (int)cases[i]);
+
+        side_destroy(&cl);
+    }
+
+    wtq_msquic_listener_stop(listener);
+    listener = NULL;
+    wtq_msquic_env_close(env);
+    env = NULL;
+    WTQ_TEST_CHECK_EQ_INT(sv.established, 2);
+
+out:
+    if (listener != NULL)
+        wtq_msquic_listener_stop(listener);
+    if (env != NULL)
+        wtq_msquic_env_close(env);
+    side_destroy(&sv);
+    if (failures == 0)
+        printf("PASS: profile_negotiation\n");
     return failures;
 }
 
@@ -1755,6 +1939,7 @@ int main(int argc, char **argv)
     failures += t_unknown_path_404();
     failures += t_release_after_env_close();
     failures += t_sequential_conns();
+    failures += t_profile_negotiation();
     failures += t_bidi_pingpong();
     failures += t_send_budget();
     failures += t_oversized_send();

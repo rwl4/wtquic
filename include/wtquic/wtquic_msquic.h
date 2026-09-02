@@ -300,19 +300,46 @@ typedef struct wtq_msquic_listener_cfg {
     wtq_msquic_accept_prepare_fn accept_prepare;
     wtq_msquic_accept_abandon_fn accept_abandon;
     wtq_msquic_transport_quiesced_fn on_transport_quiesced;
-    /* v3 (struct_size-gated): the WebTransport wire profile EVERY accepted
-     * connection speaks (wtq_webtransport_profile_t; see session.h). It is
-     * listener-wide, not per served path: one profile per listener, fixed
-     * for the lifetime of each connection, never auto-negotiated. A partial
-     * or absent tail — every caller compiled before this field — defaults to
+    /* v3 (struct_size-gated), LEGACY SINGLETON SOURCE. Historically this
+     * fixed the one profile every accepted connection spoke. It is now
+     * superseded by webtransport_profiles below, and its only remaining
+     * role is to supply a one-member capability set when that set is
+     * absent or zero — which is what keeps every caller compiled before
+     * the set behaving exactly as it did. Listener-wide, never per served
+     * path. A partial or absent tail defaults to
      * WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT (0). An out-of-range value fails
-     * wtq_msquic_listener_start with WTQ_ERR_INVALID_ARG. */
+     * wtq_msquic_listener_start with WTQ_ERR_INVALID_ARG — but only when
+     * this field is actually used, i.e. when the set is absent or zero.
+     *
+     * SUPERSEDED by webtransport_profiles below: this single value is only
+     * the source of a one-member default set. When the set is present and
+     * non-zero it is authoritative and this field is not consulted at all
+     * (see there). */
     uint32_t webtransport_profile;
+    /* v4 (struct_size-gated): the capability SET this listener advertises,
+     * listener-wide and never path-specific. Every accepted connection
+     * advertises every member, then selects ONE from the peer's settings
+     * before it processes the extended CONNECT; query the outcome per
+     * session with wtq_session_webtransport_profile().
+     *
+     *   absent / partial / zero — derive a one-member set from
+     *     webtransport_profile above, so every existing caller keeps
+     *     exactly today's behavior;
+     *   non-zero — AUTHORITATIVE. webtransport_profile is then ignored
+     *     entirely, including a value that is out of range or names a
+     *     profile outside the set: it has no role once the set is given, so
+     *     it is not validated as if it did.
+     *
+     * An unknown bit, or a non-zero set with no known member, fails
+     * wtq_msquic_listener_start with WTQ_ERR_INVALID_ARG. Configuring
+     * several members enables negotiation; it does not select anything, and
+     * it adds no fallback or retry. */
+    wtq_webtransport_profile_set_t webtransport_profiles;
 } wtq_msquic_listener_cfg_t;
 
 #define WTQ_MSQUIC_LISTENER_CFG_INIT                              \
     { (uint32_t)sizeof(wtq_msquic_listener_cfg_t), NULL, 0, NULL, \
-      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0 }
+      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0 }
 
 /*
  * Initialise a listener config. Same ABI rule as the client (see above):

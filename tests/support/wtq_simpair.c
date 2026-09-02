@@ -62,8 +62,10 @@ static void on_conn_error(wtq_conn_t *conn, uint64_t h3_err, void *ctx)
 }
 
 static void on_established(wtq_conn_t *conn, const char *sel,
-                           size_t len, void *ctx)
+                           size_t len, wtq_h3_wt_profile_t profile,
+                           void *ctx)
 {
+    (void)profile;
     wtq_simpair_side_t *side = ctx;
 
     (void)conn;

@@ -55,5 +55,20 @@ int main()
     (void)WTQ_RECEIVE_PAUSE_DELIVERY_ONLY;
     (void)WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
 
+    {
+        wtq_webtransport_profile_set_t set =
+            WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
+        wtq_webtransport_profile_t prof =
+            static_cast<wtq_webtransport_profile_t>(0x7f);
+        if (set != WTQ_WEBTRANSPORT_PROFILES_ALL)
+            return 1;
+        if (wtq_session_webtransport_profile(nullptr, &prof) !=
+            WTQ_ERR_INVALID_ARG)
+            return 1;
+        if (prof != static_cast<wtq_webtransport_profile_t>(0x7f))
+            return 1;
+    }
+
     return wtq_version() ? 0 : 1;
 }

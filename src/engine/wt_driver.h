@@ -276,8 +276,13 @@ typedef struct wtq_conn_callbacks {
     /* The WT session is established (2xx exchanged). selected is the
      * negotiated subprotocol ("" when none), borrowed until the
      * connection is destroyed. */
+    /* The SELECTED wire profile, carried as its own type rather than a raw
+     * int so the value cannot drift across this boundary. The engine
+     * guarantees selection is latched before this fires, so it is always
+     * meaningful here. */
     void (*on_session_established)(wtq_conn_t *conn, const char *selected,
-                                   size_t selected_len, void *ctx);
+                                   size_t selected_len,
+                                   wtq_h3_wt_profile_t profile, void *ctx);
     /* Client only: the server answered non-2xx. */
     void (*on_session_rejected)(wtq_conn_t *conn, uint16_t status,
                                 void *ctx);
@@ -367,7 +372,9 @@ typedef struct wtq_conn_cfg {
      * below is zero, this single value becomes the connection's configured
      * capability set. It is configuration, not a negotiated outcome — it
      * fixes what may be advertised, never what the connection ends up
-     * speaking. Out-of-range is WTQ_ERR_INVALID_ARG. */
+     * speaking. Out-of-range is WTQ_ERR_INVALID_ARG only when this field is
+     * actually consulted, i.e. when webtransport_profiles is zero; a
+     * non-zero valid set is authoritative and this field is then ignored. */
     int webtransport_profile;
     /* Optional capability SET (wtq_h3_wt_profile_set_t). AUTHORITATIVE when
      * nonzero; zero derives the one-bit set from webtransport_profile

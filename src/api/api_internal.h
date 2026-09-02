@@ -65,11 +65,17 @@ typedef struct wtq_api_session_cfg {
     wtq_driver_t *drv;               /* backend connection context */
     const wtq_driver_ops_t *ops;     /* backend vtable */
     /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
-     * The connection-wide WebTransport wire profile. A listener passes its
-     * configured profile so a SERVER session latches it before SETTINGS.
-     * A client leaves it 0 (current) — the client latches its real profile
-     * via wtq_api_session_connect. Out-of-range fails session create. */
+     * The legacy SINGLETON source: it supplies a one-member capability set
+     * when webtransport_profiles below is zero, and is validated only then.
+     * It is configuration, never a negotiated outcome — nothing is selected
+     * until the peer's settings choose it. A client leaves it 0 and states
+     * its request via wtq_api_session_connect. */
     int webtransport_profile;
+    /* The connection's configured capability SET (internal mask). Zero
+     * derives a one-member set from webtransport_profile above; non-zero is
+     * authoritative. Converted from the public mask at the backend
+     * boundary, which static-asserts the two agree. */
+    wtq_h3_wt_profile_set_t webtransport_profiles;
 } wtq_api_session_cfg_t;
 
 /* Create a session (refcount 1, owned by the caller) over a driver.
