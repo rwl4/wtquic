@@ -363,14 +363,20 @@ typedef struct wtq_conn_cfg {
     wtq_perspective_t perspective;
     bool enable_connect_protocol;    /* outgoing SETTINGS knob */
     /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
-     * The WebTransport wire profile this connection speaks. For a SERVER
-     * it is latched here at create — before any SETTINGS can be emitted —
-     * and fixes both the outgoing SETTINGS dialect and which extended
-     * CONNECT :protocol token inbound requests must carry. A CLIENT passes
-     * current (0) here and latches its real profile later in
-     * wtq_conn_client_connect (which runs before start emits SETTINGS);
-     * out-of-range is WTQ_ERR_INVALID_ARG. */
+     * The backward-compatible SINGLETON source: when webtransport_profiles
+     * below is zero, this single value becomes the connection's configured
+     * capability set. It is configuration, not a negotiated outcome — it
+     * fixes what may be advertised, never what the connection ends up
+     * speaking. Out-of-range is WTQ_ERR_INVALID_ARG. */
     int webtransport_profile;
+    /* Optional capability SET (wtq_h3_wt_profile_set_t). AUTHORITATIVE when
+     * nonzero; zero derives the one-bit set from webtransport_profile
+     * above, so a caller that knows only the singular field is unchanged.
+     * Unknown bits, or a set with no known member, are
+     * WTQ_ERR_INVALID_ARG. The selected profile is chosen later, from the
+     * peer's SETTINGS — configuring a multi-member set advertises a union
+     * and selects nothing. Engine-internal. */
+    wtq_h3_wt_profile_set_t webtransport_profiles;
     wtq_conn_callbacks_t callbacks;  /* copied */
 } wtq_conn_cfg_t;
 
@@ -550,8 +556,11 @@ typedef struct wtq_client_connect_cfg {
     size_t protocol_count;      /* <= WTQ_CONN_MAX_OFFERED */
     bool require_protocol;
     /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
-     * Latched before SETTINGS are emitted; a compat request after the
-     * client has already started (SETTINGS out) is WTQ_ERR_STATE. */
+     * The client's REQUESTED singleton, committed as configuration before
+     * SETTINGS are emitted; the connection's selected profile is still
+     * latched only from the peer's SETTINGS. Requesting a different
+     * profile after the client has started (SETTINGS out) is
+     * WTQ_ERR_STATE. */
     int webtransport_profile;
 } wtq_client_connect_cfg_t;
 
@@ -809,6 +818,12 @@ const char *wtq_conn_request_authority(const wtq_conn_t *conn,
 bool wtq_conn_peer_settings_received(const wtq_conn_t *conn);
 bool wtq_conn_peer_supports_wt(const wtq_conn_t *conn);
 const wtq_h3_settings_t *wtq_conn_peer_settings(const wtq_conn_t *conn);
+/* The LATCHED wire profile: true with *profile_out written once selection
+ * has happened, false before that. Read-only introspection (internal, not
+ * exported, not part of the public surface) — latch state is never inferred
+ * from the enum value, since CURRENT is numeric zero. Not a wire-semantic
+ * branch site. */
+bool wtq_conn_wt_profile_latched(const wtq_conn_t *conn, int *profile_out);
 WTQ_SPI bool wtq_conn_is_closed(const wtq_conn_t *conn);
 WTQ_SPI uint64_t wtq_conn_close_code(const wtq_conn_t *conn);
 

@@ -97,11 +97,28 @@ struct wtq_conn {
     wtq_driver_ops_t ops;
     wtq_conn_callbacks_t cb;
     bool ecp;
-    /* The connection-latched WebTransport wire profile. Committed before
-     * the control-stream SETTINGS are emitted; selects both the emitted
-     * WT SETTINGS and the extended-CONNECT :protocol token. Defaults to
-     * current (draft-16); a client latches it at wtq_conn_client_connect. */
+    /*
+     * PROFILE STATE. Two distinct notions, deliberately not conflated:
+     *
+     *  CONFIGURED  wt_profiles is the capability SET this connection may
+     *              advertise and accept. It is fixed before the local
+     *              control-stream SETTINGS are emitted, and it selects
+     *              nothing — a multi-member set is advertised as a union.
+     *              A client's pre-start requested profile is configuration
+     *              too: it narrows the set to a singleton, it is not a
+     *              negotiated outcome.
+     *
+     *  SELECTED    wt_profile becomes authoritative only when the PEER's
+     *              SETTINGS choose it and profile_latched turns true. That
+     *              selection then fixes the inbound CONNECT decode policy
+     *              and the token the connection accepts, and never changes.
+     *
+     * profile_latched is the ONLY authority for whether a selection exists:
+     * it is never inferred from the enum, because CURRENT is numeric zero.
+     */
+    wtq_h3_wt_profile_set_t wt_profiles;
     wtq_h3_wt_profile_t wt_profile;
+    bool profile_latched;
 
     bool started;            /* start ATTEMPTED (one-shot latch) */
     bool locals_attempted;   /* the ONE-SHOT local-bootstrap attempt is
@@ -205,6 +222,30 @@ static const wtq_connect_opts_t CONN_STRICT_OPTS = { false, false };
  * CONN_STRICT_OPTS (webtransport-h3 only). Either profile still rejects the
  * OTHER profile's token — see the symmetry gate in server_request_done. */
 static const wtq_connect_opts_t CONN_SERVER_COMPAT_OPTS = { false, true };
+
+/*
+ * The ONE mapping from a latched profile to its inbound-CONNECT decode
+ * policy and the token that profile expects. Centralized deliberately: a
+ * future typed profile that is not handled here fails CLOSED (this returns
+ * false and the request is answered generically), so it cannot accidentally
+ * bypass the latch or inherit another generation's token rules.
+ */
+static bool conn_connect_policy(wtq_h3_wt_profile_t profile,
+                                const wtq_connect_opts_t **opts_out,
+                                bool *expect_legacy_token)
+{
+    switch (profile) {
+    case WTQ_H3_WT_PROFILE_CURRENT:
+        *opts_out = &CONN_STRICT_OPTS;
+        *expect_legacy_token = false;
+        return true;
+    case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
+        *opts_out = &CONN_SERVER_COMPAT_OPTS;
+        *expect_legacy_token = true;
+        return true;
+    }
+    return false;
+}
 
 /*
  * Can this engine carry `p` as a negotiated subprotocol at all? Decided
@@ -522,6 +563,22 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
     if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
         cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
         return WTQ_ERR_INVALID_ARG;
+    /*
+     * The configured capability SET. A zero set derives the one-bit set
+     * from the singular field, so every caller that knows only the singular
+     * field stays byte-for-byte single-profile; a non-zero set is
+     * authoritative. Unknown bits, or a set with no known member, are
+     * rejected HERE — before any allocation or I/O — so a mistake fails
+     * loudly at the boundary rather than reaching the codec, whose
+     * CURRENT-only fallback is defence in depth and never acceptance.
+     */
+    wtq_h3_wt_profile_set_t profiles = cfg->webtransport_profiles;
+    if (profiles == 0)
+        profiles = wtq_h3_wt_profile_bit(
+            (wtq_h3_wt_profile_t)cfg->webtransport_profile);
+    else if ((profiles & ~WTQ_H3_WT_PROFILES_ALL) != 0 ||
+             (profiles & WTQ_H3_WT_PROFILES_ALL) == 0)
+        return WTQ_ERR_INVALID_ARG;
 
     wtq_conn_t *conn = cfg->alloc->alloc(sizeof(*conn), cfg->alloc->ctx);
     if (conn == NULL)
@@ -534,11 +591,15 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
     conn->ops = *ops;
     conn->cb = cfg->callbacks;
     conn->ecp = cfg->enable_connect_protocol;
-    /* Latched here for the SERVER (fixes its SETTINGS dialect + the inbound
-     * CONNECT token it accepts, before any stream opens). A CLIENT is created
-     * with current (0) and re-latches its real profile in
-     * wtq_conn_client_connect, before start emits SETTINGS. */
+    /*
+     * The set fixes what this connection ADVERTISES; it does not select.
+     * Selection happens once, from the peer's SETTINGS, and only then is
+     * profile_latched set. A client overwrites both with its requested
+     * singleton in wtq_conn_client_connect, before start emits SETTINGS.
+     */
+    conn->wt_profiles = profiles;
     conn->wt_profile = (wtq_h3_wt_profile_t)cfg->webtransport_profile;
+    conn->profile_latched = false;
 
     *out = conn;
     return WTQ_OK;
@@ -563,9 +624,10 @@ static wtq_result_t conn_open_locals(wtq_conn_t *conn)
 {
     /* Control stream: type 0x00 + our SETTINGS frame. */
     uint8_t buf[1 + 8 + 64];
-    wtq_h3_settings_encode_cfg_t scfg = {
-        conn->ecp, wtq_h3_wt_profile_bit(conn->wt_profile)
-    };
+    /* Advertise the configured capability SET. A multi-profile server emits
+     * the deterministic union BEFORE it can know the peer's choice — this is
+     * capability advertisement, not selection. */
+    wtq_h3_settings_encode_cfg_t scfg = { conn->ecp, conn->wt_profiles };
     size_t flen = 0;
 
     buf[0] = 0x00;
@@ -870,9 +932,25 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                 }
                 conn->peer_settings = s;
                 conn->settings_received = true;
-                conn->wt_supported = wtq_h3_settings_peer_supports_wt(
-                    &s, conn->persp == WTQ_PERSPECTIVE_CLIENT,
-                    conn->wt_profile);
+                /*
+                 * SELECT AND LATCH, before on_peer_settings and before any
+                 * parked CONNECT is released. The highest mutual profile is
+                 * chosen from our configured SET intersected with what the
+                 * peer advertised; the token plays no part. On no mutual
+                 * profile nothing is latched and wt_supported stays false.
+                 * A client runs the same selector with its singleton set, so
+                 * a cross-profile peer signal cannot satisfy it.
+                 */
+                wtq_h3_wt_profile_t sel;
+                if (wtq_h3_settings_select_profile(
+                        &s, conn->persp == WTQ_PERSPECTIVE_CLIENT,
+                        conn->wt_profiles, &sel)) {
+                    conn->wt_profile = sel;
+                    conn->profile_latched = true;
+                    conn->wt_supported = true;
+                } else {
+                    conn->wt_supported = false;
+                }
                 if (conn->cb.on_peer_settings != NULL)
                     conn->cb.on_peer_settings(conn, conn->wt_supported,
                                               conn->cb.ctx);
@@ -1370,6 +1448,15 @@ const wtq_h3_settings_t *wtq_conn_peer_settings(const wtq_conn_t *conn)
     return conn->settings_received ? &conn->peer_settings : NULL;
 }
 
+bool wtq_conn_wt_profile_latched(const wtq_conn_t *conn, int *profile_out)
+{
+    if (conn == NULL || !conn->profile_latched)
+        return false;
+    if (profile_out != NULL)
+        *profile_out = (int)conn->wt_profile;
+    return true;
+}
+
 bool wtq_conn_is_closed(const wtq_conn_t *conn)
 {
     return conn->closed;
@@ -1562,12 +1649,47 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
     wtq_sf_str_t offered[WTQ_CONN_MAX_OFFERED];
     size_t offered_count = 0;
     char scratch[512];
-    /* Decode under OUR profile: the compat server tolerates the bare
-     * "webtransport" token; the current server (STRICT) rejects it as
-     * NOT_WEBTRANSPORT. The cross-profile token is rejected below. */
-    const bool compat = conn->wt_profile == WTQ_H3_WT_PROFILE_D13_14_COMPAT;
-    const wtq_connect_opts_t *opts =
-        compat ? &CONN_SERVER_COMPAT_OPTS : &CONN_STRICT_OPTS;
+
+    /*
+     * RAW PARK GATE — ahead of every profile-specific decode or token
+     * check. Until the peer's SETTINGS select a profile there is no decode
+     * POLICY to apply, so a completed request is parked as untouched bytes.
+     * This also keeps the pre-SETTINGS rule intact (draft-15 s3.1: a server
+     * must not process WT requests before the client's SETTINGS, and must
+     * not reveal path or subprotocol policy before then). Exactly one
+     * completed request is parked — one WT session per connection; extras
+     * get a generic stream refusal, because an HTTP response would itself
+     * be processing the request before SETTINGS.
+     */
+    if (!conn->settings_received) {
+        if (conn->parked_es != NULL) {
+            request_stream_refuse(conn, es);
+            return;
+        }
+        conn->parked_es = es;
+        conn->parked_fill = es->set_fill;
+        memcpy(conn->parked_buf, es->set_buf, es->set_fill);
+        return;
+    }
+
+    /*
+     * NO DECODE POLICY EXISTS UNTIL SELECTION IS LATCHED. SETTINGS are in,
+     * so selection has run — but if it found no mutual profile there is
+     * nothing latched, and therefore no profile-specific CONNECT decoder to
+     * apply. Answer with ONE generic 400 and return BEFORE any decode, so
+     * malformed/capacity, path and subprotocol distinctions are never
+     * exposed while no profile exists. The connection stays live.
+     */
+    const wtq_connect_opts_t *opts = NULL;
+    bool expect_legacy = false;
+    if (!conn->wt_supported || !conn->profile_latched ||
+        !conn_connect_policy(conn->wt_profile, &opts, &expect_legacy)) {
+        server_send_response(conn, es->ds, 400, NULL);
+        es->request_dead = true;
+        return;
+    }
+
+    /* Latched: decode under THAT profile's policy from the central map. */
     wtq_connect_status_t st = wtq_connect_decode_request(
         es->set_buf, es->set_fill, opts, &req, offered,
         WTQ_CONN_MAX_OFFERED, &offered_count, scratch, sizeof(scratch));
@@ -1606,7 +1728,16 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
      * CONNECT token. (STRICT already rejects the bare token before here, so
      * for the current profile legacy_protocol is always false and this never
      * false-rejects.) */
-    if (req.legacy_protocol != compat) {
+    /*
+     * The token VALIDATES the latch; it never selects. A CURRENT latch
+     * accepts only "webtransport-h3"; a D13/14 latch accepts only the bare
+     * "webtransport". req.legacy_protocol records which token matched, and
+     * the expected value comes from the central policy map — so generations
+     * that share a bare token can never be told apart here. A mismatch is
+     * answered like any other non-WebTransport request: a generic 400, and
+     * the connection lives. (STRICT already rejects the bare token before
+     * here, so a CURRENT latch never false-rejects.) */
+    if (req.legacy_protocol != expect_legacy) {
         server_send_response(conn, es->ds, 400, NULL);
         es->request_dead = true;
         return;
@@ -1615,30 +1746,6 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
     /* One WT session per connection: reset extras, never respond. */
     if (conn->session_established) {
         request_stream_refuse(conn, es);
-        return;
-    }
-
-    /* A server must not process WT requests until the client's SETTINGS
-     * arrive (draft-15 s3.1) — and must not reveal path or subprotocol
-     * policy before then, so this gate precedes lookup. Exactly one
-     * completed request is parked (one WT session per connection);
-     * extras are refused generically. */
-    if (!conn->settings_received) {
-        if (conn->parked_es != NULL) {
-            /* over the one-request bound: a generic stream refusal —
-             * an HTTP response would itself be processing the request
-             * before SETTINGS */
-            request_stream_refuse(conn, es);
-            return;
-        }
-        conn->parked_es = es;
-        conn->parked_fill = es->set_fill;
-        memcpy(conn->parked_buf, es->set_buf, es->set_fill);
-        return;
-    }
-    if (!conn->wt_supported) {
-        server_send_response(conn, es->ds, 400, NULL);
-        es->request_dead = true;
         return;
     }
 
@@ -2126,8 +2233,12 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
 
     /* Committed: every fallible check passed. Commit the profile HERE —
      * before the CONNECT section is stored/sent and before start can
-     * emit SETTINGS — so a failed preflight above left it untouched. */
+     * emit SETTINGS — so a failed preflight above left wt_profiles,
+     * wt_profile AND profile_latched untouched. A client advertises a
+     * SINGLETON set, so the selector cannot latch a profile it did not
+     * request; the latch itself is still only set from peer SETTINGS. */
     conn->wt_profile = req_profile;
+    conn->wt_profiles = wtq_h3_wt_profile_bit(req_profile);
 
     /* Copy the offer into connection-owned storage (needed later to
      * validate the server's WT-Protocol pick). */

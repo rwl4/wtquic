@@ -26,6 +26,8 @@ extern "C" {
 
 typedef struct wtq_simpair wtq_simpair_t;
 
+#define WTQ_SIMPAIR_NO_PROFILE (-1)
+
 typedef struct wtq_simpair_side {
     struct wtq_driver drv;
     wtq_conn_t *conn;
@@ -33,6 +35,12 @@ typedef struct wtq_simpair_side {
     char label; /* 'c' or 's' */
     int settings_events;
     bool wt_supported;
+    /* Profile state sampled INSIDE on_peer_settings, so a test can prove the
+     * selection was latched BEFORE the callback rather than merely by the
+     * time the run reaches quiescence. cb_profile stays at the sentinel
+     * when no latch existed during that callback. */
+    bool cb_profile_latched;
+    int cb_profile; /* WTQ_SIMPAIR_NO_PROFILE when absent */
     int error_events;
     uint64_t last_error;
     int established_events;
@@ -70,6 +78,8 @@ typedef struct wtq_simpair_side {
 
 struct wtq_simpair {
     uint64_t seed;
+    /* 0 = derive the singleton from server_profile */
+    wtq_h3_wt_profile_set_t server_profile_set;
     uint64_t now_us;
     size_t step;
     wtq_simpair_side_t c;
@@ -85,12 +95,21 @@ struct wtq_simpair {
 
 /* Create both engines and start them (control/QPACK streams open). */
 int wtq_simpair_create(wtq_simpair_t *sp, uint64_t seed);
-/* As wtq_simpair_create, but each side latches an explicit WebTransport wire
- * profile (wtq_h3_wt_profile_t: 0 = current draft-16, 1 = D13/14 compat). The
- * caller must pass the client's profile again in wtq_simpair_client_connect so
- * the CONNECT token matches the SETTINGS the client emitted at start. */
+/* As wtq_simpair_create, but each side is CONFIGURED with an explicit
+ * WebTransport wire profile (wtq_h3_wt_profile_t: 0 = current draft-16, 1 =
+ * D13/14 compat). The caller must pass the client's profile again in
+ * wtq_simpair_client_connect so the CONNECT token matches the SETTINGS the
+ * client emitted at start. Configuration only — each side still selects and
+ * latches from its peer's SETTINGS. */
 int wtq_simpair_create_profiles(wtq_simpair_t *sp, uint64_t seed,
                                 int client_profile, int server_profile);
+/* As above, but the SERVER is configured with a capability SET
+ * (wtq_h3_wt_profile_set_t) and advertises the union of its members; the
+ * client stays a singleton. The server then selects and latches exactly one
+ * profile from the client's SETTINGS. */
+int wtq_simpair_create_profile_set(wtq_simpair_t *sp, uint64_t seed,
+                                   int client_profile,
+                                   wtq_h3_wt_profile_set_t server_set);
 void wtq_simpair_destroy(wtq_simpair_t *sp);
 
 /* Deliver matured wire bytes both directions once. Returns the number

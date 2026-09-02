@@ -37,9 +37,15 @@ static void on_peer_settings(wtq_conn_t *conn, bool wt_supported,
 {
     wtq_simpair_side_t *side = ctx;
 
-    (void)conn;
     side->settings_events++;
     side->wt_supported = wt_supported;
+    /* Sample the latch DURING the callback: this is what makes
+     * "latched before on_peer_settings" causally testable. */
+    side->cb_profile = WTQ_SIMPAIR_NO_PROFILE;
+    side->cb_profile_latched =
+        wtq_conn_wt_profile_latched(conn, &side->cb_profile);
+    if (!side->cb_profile_latched)
+        side->cb_profile = WTQ_SIMPAIR_NO_PROFILE;
     trace(side->sp, "e side=%c settings wt=%d\n", side->label,
           wt_supported ? 1 : 0);
 }
@@ -204,7 +210,8 @@ static void on_send_done(wtq_conn_t *conn, void *cookie, bool canceled,
 }
 
 static int side_up(wtq_simpair_t *sp, wtq_simpair_side_t *side,
-                   char label, wtq_perspective_t persp, int profile)
+                   char label, wtq_perspective_t persp, int profile,
+                   wtq_h3_wt_profile_set_t profile_set)
 {
     side->sp = sp;
     side->label = label;
@@ -215,6 +222,7 @@ static int side_up(wtq_simpair_t *sp, wtq_simpair_side_t *side,
         .perspective = persp,
         .enable_connect_protocol = true,
         .webtransport_profile = profile,
+        .webtransport_profiles = profile_set,
         .callbacks = { .on_peer_settings = on_peer_settings,
                        .on_conn_error = on_conn_error,
                        .on_session_established = on_established,
@@ -247,13 +255,36 @@ int wtq_simpair_create_profiles(wtq_simpair_t *sp, uint64_t seed,
     trace(sp, "create seed=0x%llx cprof=%d sprof=%d\n",
           (unsigned long long)seed, client_profile, server_profile);
 
-    /* The client latches its profile at create so the SETTINGS it emits at
-     * this pair's start-on-create reflect it; the matching client_connect
-     * profile below re-latches identically. The server latches here too and
-     * emits its SETTINGS on the first inbound (deferred open). */
-    if (side_up(sp, &sp->c, 'c', WTQ_PERSPECTIVE_CLIENT, client_profile) != 0)
+    /* Both sides are CONFIGURED here: the client's requested profile fixes
+     * the SETTINGS it emits at this pair's start-on-create, and the
+     * matching client_connect profile below re-states the same request.
+     * The server is configured here too and emits its SETTINGS on the
+     * first inbound (deferred open). Neither side has SELECTED anything
+     * yet — the latch comes only from the peer's SETTINGS. */
+    if (side_up(sp, &sp->c, 'c', WTQ_PERSPECTIVE_CLIENT, client_profile,
+                0) != 0)
         return -1;
-    if (side_up(sp, &sp->s, 's', WTQ_PERSPECTIVE_SERVER, server_profile) != 0)
+    if (side_up(sp, &sp->s, 's', WTQ_PERSPECTIVE_SERVER, server_profile,
+                sp->server_profile_set) != 0)
+        return -1;
+    return 0;
+}
+
+int wtq_simpair_create_profile_set(wtq_simpair_t *sp, uint64_t seed,
+                                   int client_profile,
+                                   wtq_h3_wt_profile_set_t server_set)
+{
+    memset(sp, 0, sizeof(*sp));
+    sp->seed = seed;
+    sp->now_us = 1000;
+    sp->server_profile_set = server_set;
+    trace(sp, "create seed=0x%llx cprof=%d sset=0x%llx\n",
+          (unsigned long long)seed, client_profile,
+          (unsigned long long)server_set);
+    if (side_up(sp, &sp->c, 'c', WTQ_PERSPECTIVE_CLIENT, client_profile,
+                0) != 0)
+        return -1;
+    if (side_up(sp, &sp->s, 's', WTQ_PERSPECTIVE_SERVER, 0, server_set) != 0)
         return -1;
     return 0;
 }

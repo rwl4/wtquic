@@ -239,9 +239,11 @@ static wtq_result_t do_connect(rig_t *r, bool require)
     return wtq_conn_client_connect(r->conn, &cfg);
 }
 
-/* #6: the WebTransport profile is LATCHED at client_connect, committed
- * BEFORE the control-stream SETTINGS are emitted at start, and a
- * non-default profile requested after start is WTQ_ERR_STATE. */
+/* #6: the client's REQUESTED profile is committed at client_connect —
+ * configuration, before the control-stream SETTINGS are emitted at start —
+ * and a different profile requested after start is WTQ_ERR_STATE. The
+ * connection's SELECTED profile is latched separately, from peer
+ * SETTINGS. */
 static bool ctrl_contains(const struct wtq_dstream *ctrl,
                           const uint8_t *pat, size_t plen)
 {
@@ -260,7 +262,7 @@ static void test_profile_latch(int *fp)
     static const uint8_t WT_ENABLED_ID[] = { 0xac, 0x7c, 0xf0, 0x00 };
     static const uint8_t WT_MAXSESS_ID[] = { 0x94, 0xe9, 0xcd, 0x29 };
 
-    /* (a) PRE-START compat connect (production order): latched, and the
+    /* (a) PRE-START compat connect (production order): committed, and the
      * emitted SETTINGS carry WT_MAX_SESSIONS, not WT_ENABLED. */
     {
         rig_t r;
@@ -285,6 +287,69 @@ static void test_profile_latch(int *fp)
                                      sizeof(WT_MAXSESS_ID)));
         WTQ_TEST_CHECK(!ctrl_contains(ctrl, WT_ENABLED_ID,
                                       sizeof(WT_ENABLED_ID)));
+        rig_down(&r);
+    }
+
+    /* (a2) AUDIT: a successful current-profile client connect performed
+     * AFTER matching peer SETTINGS must not clear or change an existing
+     * latch. Reachable shape: create + start (SETTINGS emitted) with NO
+     * connect yet, so sess_state stays SS_IDLE; peer SETTINGS then latch
+     * CURRENT; the later connect succeeds and must preserve the latch.
+     * profile_latched is written in exactly two places — at create (false)
+     * and on a successful selection (true) — and client_connect writes
+     * neither. */
+    {
+        rig_t r;
+        static const setting_pair_t CUR_SERVER[] = {
+            { WTQ_H3_SET_WT_ENABLED, 1 },
+            { WTQ_H3_SET_H3_DATAGRAM, 1 },
+            { WTQ_H3_SET_ENABLE_CONNECT_PROTOCOL, 1 } };
+
+        memset(&r.app, 0, sizeof(r.app));
+        fake_driver_init(&r.drv, true);
+        wtq_conn_cfg_t cfg = {
+            .alloc = wtq_alloc_default(),
+            .perspective = WTQ_PERSPECTIVE_CLIENT,
+            .enable_connect_protocol = true,
+            .callbacks = { .on_peer_settings = cb_settings,
+                           .on_conn_error = cb_error,
+                           .on_session_established = cb_established,
+                           .on_session_rejected = cb_rejected,
+                           .on_session_failed = cb_failed,
+                           .on_session_closed = cb_closed,
+                           .ctx = &r.app },
+        };
+        WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r.drv, fake_driver_ops(),
+                                       &r.conn) == WTQ_OK);
+        WTQ_TEST_CHECK(wtq_conn_start(r.conn, 1000) == WTQ_OK);
+        WTQ_TEST_CHECK(!wtq_conn_wt_profile_latched(r.conn, NULL));
+
+        /* matching server SETTINGS: the client selects and latches CURRENT
+         * even though no CONNECT is outstanding */
+        deliver_peer_settings_pairs(&r, CUR_SERVER, 3, fp);
+        int latched = -1;
+        WTQ_TEST_CHECK(wtq_conn_wt_profile_latched(r.conn, &latched));
+        WTQ_TEST_CHECK_EQ_INT(latched, (int)WTQ_H3_WT_PROFILE_CURRENT);
+
+        /* the later successful connect leaves the latch exactly as it was */
+        wtq_client_connect_cfg_t cc = {
+            "example.com", "/moq", NULL, OFFER, 2, false,
+            (int)WTQ_H3_WT_PROFILE_CURRENT };
+        WTQ_TEST_CHECK(wtq_conn_client_connect(r.conn, &cc) == WTQ_OK);
+        int after = -1;
+        WTQ_TEST_CHECK(wtq_conn_wt_profile_latched(r.conn, &after));
+        WTQ_TEST_CHECK_EQ_INT(after, latched);
+
+        /* a cross-profile request after start is still refused, with the
+         * latch untouched */
+        wtq_client_connect_cfg_t bad = {
+            "example.com", "/moq", NULL, OFFER, 2, false,
+            (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT };
+        WTQ_TEST_CHECK(wtq_conn_client_connect(r.conn, &bad) ==
+                       WTQ_ERR_STATE);
+        int still = -1;
+        WTQ_TEST_CHECK(wtq_conn_wt_profile_latched(r.conn, &still));
+        WTQ_TEST_CHECK_EQ_INT(still, latched);
         rig_down(&r);
     }
 
@@ -339,7 +404,8 @@ static void test_profile_latch(int *fp)
         WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r.drv, fake_driver_ops(),
                                        &r.conn) == WTQ_OK);
         /* a control char is not a valid Structured-Fields string, so
-         * this fails in protocol_check (preflight), after the latch. */
+         * this fails in protocol_check (preflight), after the range and
+         * state checks but BEFORE anything is committed. */
         static const char *const BAD_OFFER[] = { "\x01" "bad" };
         wtq_client_connect_cfg_t poison = {
             "example.com", "/moq", NULL, BAD_OFFER, 1, false,
@@ -853,8 +919,8 @@ static size_t build_request_token(uint8_t *dst, size_t cap, const char *path,
     return hl + slen;
 }
 
-/* Bring up a SERVER rig latched to a specific WebTransport wire profile,
- * started, with /moq served. */
+/* Bring up a SERVER rig CONFIGURED with a single WebTransport wire profile
+ * (its capability set is that one member), started, with /moq served. */
 static void server_up_profile(rig_t *r, int profile, bool require, int *fp)
 {
     int failures = 0;
@@ -882,11 +948,133 @@ static void server_up_profile(rig_t *r, int profile, bool require, int *fp)
     *fp += failures;
 }
 
+/* Bring up a SERVER rig configured with a multi-member capability SET: it
+ * advertises the union and selects one profile from the peer's SETTINGS. */
+static void server_up_profile_set(rig_t *r, wtq_h3_wt_profile_set_t set,
+                                  bool require, int *fp)
+{
+    int failures = 0;
+
+    memset(&r->app, 0, sizeof(r->app));
+    fake_driver_init(&r->drv, false);
+    wtq_conn_cfg_t cfg = {
+        .alloc = wtq_alloc_default(),
+        .perspective = WTQ_PERSPECTIVE_SERVER,
+        .enable_connect_protocol = true,
+        .webtransport_profiles = set,
+        .callbacks = { .on_peer_settings = cb_settings,
+                       .on_conn_error = cb_error,
+                       .on_session_established = cb_established,
+                       .on_session_rejected = cb_rejected,
+                       .on_session_failed = cb_failed,
+                       .on_session_closed = cb_closed,
+                       .ctx = &r->app },
+    };
+    WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r->drv, fake_driver_ops(),
+                                   &r->conn) == WTQ_OK);
+    WTQ_TEST_CHECK(wtq_conn_start(r->conn, 1000) == WTQ_OK);
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require };
+    WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
+    *fp += failures;
+}
+
 /*
- * Server profile symmetry: the server latches its listener's profile at
- * create, emits THAT profile's WT SETTINGS (on the deferred open, which the
- * peer's SETTINGS stream triggers BEFORE the CONNECT is processed), and
- * honours ONLY that profile's extended-CONNECT :protocol token. The
+ * THE LOAD-BEARING ORDERING CASE. A multi-profile server has no CONNECT
+ * decode policy until the peer's SETTINGS select one, so a CONNECT that
+ * completes FIRST must be parked as RAW BYTES — decoded and token-checked
+ * only afterwards, under the latched profile. Both generations are driven
+ * through the same server binary, including the bare "webtransport" token
+ * that a STRICT (unlatched) decode would reject outright.
+ */
+static void test_multi_server_connect_before_settings(int *fp)
+{
+    int failures = 0;
+    static const uint8_t WT_ENABLED_ID[] = { 0xac, 0x7c, 0xf0, 0x00 };
+    static const uint8_t WT_MAXSESS_ID[] = { 0x94, 0xe9, 0xcd, 0x29 };
+    static const setting_pair_t CUR_CLIENT[] = {
+        { WTQ_H3_SET_WT_ENABLED, 1 }, { WTQ_H3_SET_H3_DATAGRAM, 1 } };
+    static const setting_pair_t CMP_CLIENT[] = {
+        { WTQ_H3_SET_WT_MAX_SESSIONS_D13, 1 }, { WTQ_H3_SET_H3_DATAGRAM, 1 } };
+    static const setting_pair_t NOWT_CLIENT[] = {
+        { WTQ_H3_SET_H3_DATAGRAM, 1 } };
+    const wtq_h3_wt_profile_set_t BOTH =
+        WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT;
+
+    static const struct {
+        const setting_pair_t *client;
+        size_t nclient;
+        const char *token;
+        uint16_t status;
+        int established;
+        int latched;      /* -1 = must NOT be latched */
+    } cases[] = {
+        /* CONNECT parked first, then SETTINGS select CURRENT */
+        { CUR_CLIENT, 2, WTQ_CONNECT_PROTOCOL_TOKEN, 200, 1,
+          (int)WTQ_H3_WT_PROFILE_CURRENT },
+        /* the SAME server parks a bare-token CONNECT and, once SETTINGS
+         * select D13/14, accepts it — a STRICT pre-latch decode could not */
+        { CMP_CLIENT, 2, WTQ_CONNECT_PROTOCOL_TOKEN_LEGACY, 200, 1,
+          (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        /* token that does not match the latch: generic 400, conn usable */
+        { CMP_CLIENT, 2, WTQ_CONNECT_PROTOCOL_TOKEN, 400, 0,
+          (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        { CUR_CLIENT, 2, WTQ_CONNECT_PROTOCOL_TOKEN_LEGACY, 400, 0,
+          (int)WTQ_H3_WT_PROFILE_CURRENT },
+        /* no mutual WT signal at all: generic 400, nothing latched, and no
+         * path or subprotocol policy is disclosed */
+        { NOWT_CLIENT, 1, WTQ_CONNECT_PROTOCOL_TOKEN, 400, 0, -1 },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rig_t r;
+        uint8_t req[512];
+        size_t qlen = build_request_token(req, sizeof(req), "/moq", OFFER, 2,
+                                          cases[i].token);
+        WTQ_TEST_CHECK(qlen > 0);
+        server_up_profile_set(&r, BOTH, true, fp);
+
+        /* CONNECT completes BEFORE any peer SETTINGS: parked, unanswered,
+         * and nothing is latched yet. */
+        struct wtq_dstream *ds = feed_request(&r, 0, req, qlen, 11, fp);
+        WTQ_TEST_CHECK(ds != NULL && ds->len == 0); /* no response bytes */
+        WTQ_TEST_CHECK(!wtq_conn_wt_profile_latched(r.conn, NULL));
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+
+        /* SETTINGS arrive: select + latch, THEN the parked bytes are decoded
+         * under that exact profile. */
+        deliver_peer_settings_pairs(&r, cases[i].client, cases[i].nclient,
+                                    fp);
+        int latched = -1;
+        bool is_latched = wtq_conn_wt_profile_latched(r.conn, &latched);
+        if (cases[i].latched < 0) {
+            WTQ_TEST_CHECK(!is_latched);
+        } else {
+            WTQ_TEST_CHECK(is_latched);
+            WTQ_TEST_CHECK_EQ_INT(latched, cases[i].latched);
+        }
+        expect_response_status(ds, cases[i].status, fp);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events,
+                              cases[i].established);
+        /* the union was advertised regardless of which side won */
+        const struct wtq_dstream *ctrl = fake_driver_local(&r.drv, 0);
+        WTQ_TEST_CHECK(ctrl_contains(ctrl, WT_ENABLED_ID,
+                                     sizeof(WT_ENABLED_ID)));
+        WTQ_TEST_CHECK(ctrl_contains(ctrl, WT_MAXSESS_ID,
+                                     sizeof(WT_MAXSESS_ID)));
+        /* the connection stays usable after a 400 */
+        WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 0);
+        rig_down(&r);
+    }
+
+    *fp += failures;
+}
+
+/*
+ * Server profile symmetry for a SINGLE-member capability set: the server is
+ * configured with one profile at create, emits THAT profile's WT SETTINGS
+ * (on the deferred open, which the peer's SETTINGS stream triggers BEFORE
+ * the CONNECT is processed), selects it from the peer's matching SETTINGS,
+ * and then honours ONLY that profile's extended-CONNECT :protocol token. The
  * cross-profile token is answered with a generic 400 — the server never
  * emits one profile's SETTINGS while accepting the other's token.
  */
@@ -1438,6 +1626,94 @@ static void test_server_non_wt_request(int *fp)
         expect_fresh_connect_works(&r, 4, fp);
         rig_down(&r);
     }
+    *fp += failures;
+}
+
+/*
+ * NO DECODE WITHOUT A LATCH. When peer SETTINGS carry no mutual WT signal
+ * nothing is latched, so no profile-specific CONNECT decoder exists and the
+ * request must get ONE generic 400 — never a stream-level classification.
+ * The probe is a request the STRICT decoder deterministically calls
+ * MALFORMED (a GET carrying :protocol), so the two possible orderings are
+ * causally distinguishable: decoding before the latch yields reset+
+ * H3_MESSAGE_ERROR with no response body, the correct gate yields a 400
+ * response with no reset. Both arrival orders are driven.
+ */
+static void test_no_mutual_never_decodes(int *fp)
+{
+    int failures = 0;
+    /* GET with :protocol — structurally invalid, not merely non-WT */
+    static const wtq_qpack_field_t BAD_PSEUDO_F[] = {
+        { ":method", 7, "GET", 3, false },
+        { ":scheme", 7, "https", 5, false },
+        { ":authority", 10, "example.com", 11, false },
+        { ":path", 5, "/moq", 4, false },
+        { ":protocol", 9, "webtransport-h3", 15, false },
+    };
+    static const setting_pair_t NOWT_CLIENT[] = {
+        { WTQ_H3_SET_H3_DATAGRAM, 1 } };
+    static const setting_pair_t CUR_CLIENT[] = {
+        { WTQ_H3_SET_WT_ENABLED, 1 }, { WTQ_H3_SET_H3_DATAGRAM, 1 } };
+    const wtq_h3_wt_profile_set_t BOTH =
+        WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT;
+
+    for (int order = 0; order < 2; order++) {
+        rig_t r;
+        uint8_t req[512];
+        size_t qlen = build_headers(req, sizeof(req), BAD_PSEUDO_F, 5);
+        struct wtq_dstream *ds;
+
+        WTQ_TEST_CHECK(qlen > 0);
+        server_up_profile_set(&r, BOTH, true, fp);
+
+        if (order == 0) {
+            /* malformed request completes FIRST: parked as raw bytes,
+             * unanswered, unclassified, nothing latched */
+            ds = feed_request(&r, 0, req, qlen, 11, fp);
+            WTQ_TEST_CHECK(ds != NULL && ds->len == 0);
+            WTQ_TEST_CHECK(ds != NULL && !ds->reset);
+            WTQ_TEST_CHECK(!wtq_conn_wt_profile_latched(r.conn, NULL));
+            deliver_peer_settings_pairs(&r, NOWT_CLIENT, 1, fp);
+        } else {
+            /* SETTINGS with no mutual signal arrive first */
+            deliver_peer_settings_pairs(&r, NOWT_CLIENT, 1, fp);
+            WTQ_TEST_CHECK(!wtq_conn_wt_profile_latched(r.conn, NULL));
+            ds = feed_request(&r, 0, req, qlen, 11, fp);
+        }
+
+        /* Identical outcome either way: ONE generic 400, and NOT a
+         * stream-level error — the malformed-ness was never classified. */
+        expect_response_status(ds, 400, fp);
+        WTQ_TEST_CHECK(ds != NULL && !ds->reset);
+        WTQ_TEST_CHECK(ds != NULL && !ds->stopped);
+        WTQ_TEST_CHECK_EQ_INT(ds != NULL ? ds->shutdown_count : -1, 0);
+        WTQ_TEST_CHECK(!wtq_conn_wt_profile_latched(r.conn, NULL));
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 0); /* conn still live */
+        rig_down(&r);
+    }
+
+    /* CONTRAST — the fix must not turn every malformed request into a 400.
+     * With a profile LATCHED, the same bytes still take the stream-error
+     * path: reset+stop with H3_MESSAGE_ERROR and no response. */
+    {
+        rig_t r;
+        uint8_t req[512];
+        size_t qlen = build_headers(req, sizeof(req), BAD_PSEUDO_F, 5);
+
+        WTQ_TEST_CHECK(qlen > 0);
+        server_up_profile_set(&r, BOTH, true, fp);
+        deliver_peer_settings_pairs(&r, CUR_CLIENT, 2, fp);
+        WTQ_TEST_CHECK(wtq_conn_wt_profile_latched(r.conn, NULL));
+        struct wtq_dstream *ds = feed_request(&r, 0, req, qlen, 11, fp);
+        WTQ_TEST_CHECK(ds != NULL && ds->reset);
+        WTQ_TEST_CHECK_EQ_U64(ds != NULL ? ds->reset_err : 0,
+                              WTQ_H3_MESSAGE_ERROR);
+        WTQ_TEST_CHECK_EQ_U64(ds != NULL ? ds->len : 1, 0); /* no response */
+        WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 0);
+        rig_down(&r);
+    }
+
     *fp += failures;
 }
 
@@ -3184,6 +3460,8 @@ int main(void)
     test_request_reset_before_establish(&failures);
     test_profile_latch(&failures);
     test_server_profile_symmetry(&failures);
+    test_multi_server_connect_before_settings(&failures);
+    test_no_mutual_never_decodes(&failures);
 
     WTQ_TEST_PASS("test_engine_connect");
     return failures;
