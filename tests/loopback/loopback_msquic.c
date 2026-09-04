@@ -901,6 +901,10 @@ static wtq_result_t client_up_profile(wtq_msquic_env_t *env, struct side *sd,
     connect.subprotocols = protos;
     connect.subprotocol_count = 1;
     connect.webtransport_profile = profile;
+    /* D02/RFC9297 requires an Origin (draft-02 s3.3). */
+    if (profile ==
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT)
+        connect.origin = "https://localhost:443";
 
     cfg.server_name = "127.0.0.1";
     cfg.port = port;
@@ -1206,6 +1210,97 @@ out:
  * engine selection -> public query through the actual backend; the unit
  * tests each cover one side of that line and cannot see a break in it.
  */
+
+/*
+ * A D02-only listener configured through the ABI-compatible SINGULAR field
+ * (webtransport_profiles left 0), proving the singular path is not hidden
+ * by an authoritative set. 0014e finding C.4.
+ */
+static int t_profile_d02_singular_listener(void)
+{
+    int failures = 0;
+    wtq_msquic_env_cfg_t ecfg = WTQ_MSQUIC_ENV_CFG_INIT;
+    wtq_msquic_env_t *env = NULL;
+    wtq_msquic_listener_t *listener = NULL;
+    struct side sv;
+    struct side cl;
+    wtq_session_t *cs = NULL;
+
+    side_init(&sv);
+    side_init(&cl);
+    WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&ecfg, &env), WTQ_OK);
+    if (env == NULL)
+        goto out;
+
+    {
+        static const char *const protos[] = { "wtq-test" };
+        wtq_session_events_t ev;
+        wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
+        wtq_msquic_listener_cfg_t cfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
+        events_for(&ev);
+        serve.path = "/echo";
+        serve.subprotocols = protos;
+        serve.subprotocol_count = 1;
+        cfg.bind_address = "127.0.0.1";
+        cfg.port = 0;
+        cfg.cert_file = cert_path;
+        cfg.key_file = key_path;
+        cfg.paths = &serve;
+        cfg.path_count = 1;
+        cfg.events = &ev;
+        cfg.user = &sv;
+        /* SINGULAR only; the set stays 0 so the singular field governs. */
+        cfg.webtransport_profile =
+            (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
+        WTQ_TEST_CHECK_EQ_INT(wtq_msquic_listener_start(env, &cfg,
+                                                        &listener), WTQ_OK);
+    }
+    if (listener == NULL)
+        goto out;
+
+    cl.close_in_established = true;
+    cl.close_code = 0;
+    cl.close_reason = "done";
+    cl.release_in_closed = true;
+    pthread_mutex_lock(&sv.mu);
+    sv.prof_rc = -12345;
+    sv.prof = -1;
+    pthread_mutex_unlock(&sv.mu);
+
+    WTQ_TEST_CHECK_EQ_INT(
+        client_up_profile(env, &cl, wtq_msquic_listener_port(listener),
+                          "/echo",
+                          (uint32_t)
+                              WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT,
+                          &cs),
+        WTQ_OK);
+    WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
+    WTQ_TEST_CHECK_EQ_INT(cl.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(cl.prof_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        cl.prof, (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT);
+
+    WTQ_TEST_CHECK(side_wait_count(&sv, &sv.established, 1));
+    pthread_mutex_lock(&sv.mu);
+    const int srv_rc = sv.prof_rc;
+    const int srv_prof = sv.prof;
+    pthread_mutex_unlock(&sv.mu);
+    WTQ_TEST_CHECK_EQ_INT(srv_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(
+        srv_prof, (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT);
+
+out:
+    if (listener != NULL)
+        wtq_msquic_listener_stop(listener);
+    if (env != NULL)
+        wtq_msquic_env_close(env);
+    side_destroy(&cl);
+    side_destroy(&sv);
+    if (failures == 0)
+        WTQ_TEST_PASS("profile_d02_singular_listener");
+    return failures;
+}
+
 static int t_profile_negotiation(void)
 {
     int failures = 0;
@@ -1216,6 +1311,7 @@ static int t_profile_negotiation(void)
     static const uint32_t cases[] = {
         (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
         (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT,
     };
 
     side_init(&sv);
@@ -1276,7 +1372,8 @@ static int t_profile_negotiation(void)
     listener = NULL;
     wtq_msquic_env_close(env);
     env = NULL;
-    WTQ_TEST_CHECK_EQ_INT(sv.established, 2);
+    WTQ_TEST_CHECK_EQ_INT(sv.established,
+                          (int)(sizeof(cases) / sizeof(cases[0])));
 
 out:
     if (listener != NULL)
@@ -1940,6 +2037,7 @@ int main(int argc, char **argv)
     failures += t_release_after_env_close();
     failures += t_sequential_conns();
     failures += t_profile_negotiation();
+    failures += t_profile_d02_singular_listener();
     failures += t_bidi_pingpong();
     failures += t_send_budget();
     failures += t_oversized_send();

@@ -108,10 +108,12 @@ static void test_default_roundtrip(int *fp)
     WTQ_TEST_CHECK(!s.has_wt_max_sessions_d07);
     WTQ_TEST_CHECK(!s.has_wt_enabled);
 
-    /* BYTE-EXACT MULTI-VERSION advertisement: both profiles in ONE payload,
-     * in ascending identifier order (0x14e9cd29 before 0x2c7cf000), sharing
-     * the identical base prefix. This is a capability offer, not a
-     * selection (draft-16 s7.1). The D07 codepoint still never appears. */
+    /* BYTE-EXACT MULTI-VERSION advertisement: all three profiles in ONE payload,
+     * in ascending identifier order (0x14e9cd29, 0x2b603742, 0x2c7cf000),
+     * sharing the identical base prefix. This is a capability offer, not a
+     * selection (draft-16 s7.1 and draft-02 s6 both say so). The D07
+     * codepoint 0xc671706a and the legacy datagram codepoint 0xffd277
+     * still never appear. */
     wtq_h3_settings_encode_cfg_t both = { true, WTQ_H3_WT_PROFILES_ALL };
     WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&both, buf, sizeof(buf),
                                                   &out_len) ==
@@ -121,8 +123,9 @@ static void test_default_roundtrip(int *fp)
         0x07, 0x00,
         0x08, 0x01,
         0x33, 0x01,
-        0x94, 0xe9, 0xcd, 0x29, 0x01, /* WT_MAX_SESSIONS 0x14e9cd29 = 1 */
-        0xac, 0x7c, 0xf0, 0x00, 0x01, /* WT_ENABLED      0x2c7cf000 = 1 */
+        0x94, 0xe9, 0xcd, 0x29, 0x01, /* WT_MAX_SESSIONS    0x14e9cd29 = 1 */
+        0xab, 0x60, 0x37, 0x42, 0x01, /* ENABLE_WEBTRANSPORT 0x2b603742 = 1 */
+        0xac, 0x7c, 0xf0, 0x00, 0x01, /* WT_ENABLED          0x2c7cf000 = 1 */
     };
     WTQ_TEST_CHECK_EQ_SIZE(out_len, sizeof(both_expect));
     WTQ_TEST_CHECK(memcmp(buf, both_expect, out_len) == 0);
@@ -252,6 +255,42 @@ static void test_select_profile(int *fp)
             WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
     }
 
+    /* --- D02/RFC9297 negative selection rows (0014a negative 3) --- */
+    {
+        /* A peer advertising the D02 signal but NO RFC 9297 0x33 must not
+         * select D02: 0xffd277 is never accepted as datagram capability,
+         * because wtquic implements only RFC 9297 framing. */
+        wtq_h3_settings_t p2;
+        memset(&p2, 0, sizeof(p2));
+        p2.has_enable_webtransport_leg = true;
+        p2.enable_webtransport_leg = 1;
+        /* deliberately no has_h3_datagram; a legacy-only peer is modelled
+         * by the unknown-setting path, which never sets it */
+        sel = (wtq_h3_wt_profile_t)0x7f;
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &p2, false, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
+
+        /* value 0 never selects, even with datagrams present */
+        wtq_h3_settings_t p3;
+        memset(&p3, 0, sizeof(p3));
+        p3.has_enable_webtransport_leg = true;
+        p3.enable_webtransport_leg = 0;
+        p3.has_h3_datagram = true;
+        p3.h3_datagram = 1;
+        sel = (wtq_h3_wt_profile_t)0x7f;
+        WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &p3, false, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
+
+        /* both present and 1 -> selects D02 */
+        p3.enable_webtransport_leg = 1;
+        WTQ_TEST_CHECK(wtq_h3_settings_select_profile(
+            &p3, false, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel,
+                              (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT);
+    }
+
     /* --- the profile-independent requirements gate every profile --- */
     /* no ENABLE_CONNECT_PROTOCOL: fine for a server judging a client,
      * fatal for a client judging a server */
@@ -262,8 +301,19 @@ static void test_select_profile(int *fp)
                        WTQ_H3_SETTINGS_OK);
         WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, n, &peer) ==
                        WTQ_H3_SETTINGS_OK);
+        /* CURRENT and D13/14 still require the peer server's 0x08, so a
+         * set holding only those two selects nothing here. */
         WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
+            &peer, true,
+            WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+            &sel));
+        /* D02/RFC9297 deliberately does NOT require it (draft-02 s3.2:
+         * ENABLE_WEBTRANSPORT implies extended CONNECT), so the full set
+         * selects D02 rather than nothing. */
+        WTQ_TEST_CHECK(wtq_h3_settings_select_profile(
             &peer, true, WTQ_H3_WT_PROFILES_ALL, &sel));
+        WTQ_TEST_CHECK_EQ_INT((int)sel,
+                              (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT);
         WTQ_TEST_CHECK(wtq_h3_settings_select_profile(
             &peer, false, WTQ_H3_WT_PROFILES_ALL, &sel));
         WTQ_TEST_CHECK_EQ_INT((int)sel, (int)WTQ_H3_WT_PROFILE_CURRENT);
@@ -281,7 +331,10 @@ static void test_select_profile(int *fp)
         WTQ_TEST_CHECK(!wtq_h3_settings_select_profile(
             &peer, false, WTQ_H3_WT_PROFILES_ALL, &sel));
     }
-    /* a D07-only / Chrome-only peer matches NEITHER supported profile:
+    /* A D07-only peer matches no supported profile (0xc671706a is
+     * receive-only and is never a member). A draft-02-signal peer WITHOUT
+     * RFC 9297 0x33 = 1 also matches none, because D02/RFC9297 requires
+     * that datagram signal — the missing 0x33 is what excludes it:
      * a signal outside our set never selects anything on its own */
     {
         const uint8_t d07_only[] = {

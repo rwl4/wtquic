@@ -251,6 +251,7 @@ wtq_connect_status_t wtq_connect_decode_request(
     const wtq_qpack_field_t *path = NULL;
     const wtq_qpack_field_t *protocol = NULL;
     const wtq_qpack_field_t *origin = NULL;
+    const wtq_qpack_field_t *d02_marker = NULL;
     const wtq_qpack_field_t *wtap = NULL;
     const wtq_qpack_field_t *host = NULL;
 
@@ -277,6 +278,10 @@ wtq_connect_status_t wtq_connect_decode_request(
             if (origin != NULL)
                 return WTQ_CONNECT_MALFORMED;
             origin = f;
+        } else if (name_is(f, "sec-webtransport-http3-draft02")) {
+            if (d02_marker != NULL)
+                return WTQ_CONNECT_MALFORMED; /* singleton */
+            d02_marker = f;
         } else if (name_is(f, "wt-available-protocols")) {
             if (wtap != NULL)
                 return WTQ_CONNECT_MALFORMED;
@@ -388,6 +393,9 @@ wtq_connect_status_t wtq_connect_decode_request(
     out->authority_len = authority->value_len;
     out->path = path->value;
     out->path_len = path->value_len;
+    out->has_d02_marker = d02_marker != NULL;
+    out->d02_marker = (d02_marker != NULL) ? d02_marker->value : "";
+    out->d02_marker_len = (d02_marker != NULL) ? d02_marker->value_len : 0;
     out->has_origin = origin != NULL;
     out->origin = (origin != NULL) ? origin->value : "";
     out->origin_len = (origin != NULL) ? origin->value_len : 0;
@@ -428,6 +436,7 @@ wtq_connect_status_t wtq_connect_decode_response(
 
     const wtq_qpack_field_t *status = NULL;
     const wtq_qpack_field_t *wtp = NULL;
+    const wtq_qpack_field_t *rmark = NULL;
 
     for (size_t i = 0; i < w.count; i++) {
         const wtq_qpack_field_t *f = &w.fields[i];
@@ -437,6 +446,10 @@ wtq_connect_status_t wtq_connect_decode_response(
             if (status != NULL)
                 return WTQ_CONNECT_MALFORMED;
             status = f;
+        } else if (name_is(f, "sec-webtransport-http3-draft")) {
+            if (rmark != NULL)
+                return WTQ_CONNECT_MALFORMED; /* singleton */
+            rmark = f;
         } else if (name_is(f, "wt-protocol")) {
             if (wtp != NULL)
                 return WTQ_CONNECT_MALFORMED;
@@ -457,6 +470,9 @@ wtq_connect_status_t wtq_connect_decode_response(
         return WTQ_CONNECT_MALFORMED;
 
     out->status = code;
+    out->has_d02_marker = rmark != NULL;
+    out->d02_marker = (rmark != NULL) ? rmark->value : "";
+    out->d02_marker_len = (rmark != NULL) ? rmark->value_len : 0;
     out->has_protocol = false;
     out->protocol.data = "";
     out->protocol.len = 0;
@@ -498,6 +514,19 @@ wtq_connect_status_t wtq_connect_encode_request_ex(
     const char *protocol_token, size_t protocol_token_len, uint8_t *dst,
     size_t cap, size_t *out_len)
 {
+    return wtq_connect_encode_request_d02(
+        authority, authority_len, path, path_len, origin, origin_len,
+        protocols, protocol_count, protocol_token, protocol_token_len,
+        false, dst, cap, out_len);
+}
+
+wtq_connect_status_t wtq_connect_encode_request_d02(
+    const char *authority, size_t authority_len, const char *path,
+    size_t path_len, const char *origin, size_t origin_len,
+    const wtq_sf_str_t *protocols, size_t protocol_count,
+    const char *protocol_token, size_t protocol_token_len,
+    bool emit_d02_marker, uint8_t *dst, size_t cap, size_t *out_len)
+{
     if (authority == NULL || authority_len == 0 || path == NULL ||
         path_len == 0)
         return WTQ_CONNECT_MALFORMED;
@@ -532,7 +561,7 @@ wtq_connect_status_t wtq_connect_encode_request_ex(
             return WTQ_CONNECT_MALFORMED;
     }
 
-    wtq_qpack_field_t fields[8];
+    wtq_qpack_field_t fields[9];
     size_t n = 0;
     fields[n++] = (wtq_qpack_field_t){ ":method", 7, "CONNECT", 7, false };
     fields[n++] = (wtq_qpack_field_t){ ":scheme", 7, "https", 5, false };
@@ -545,6 +574,9 @@ wtq_connect_status_t wtq_connect_encode_request_ex(
     if (origin != NULL && origin_len > 0)
         fields[n++] = (wtq_qpack_field_t){ "origin", 6, origin, origin_len,
                                            false };
+    if (emit_d02_marker)
+        fields[n++] = (wtq_qpack_field_t){
+            "sec-webtransport-http3-draft02", 30, "1", 1, false };
     if (protocol_count > 0)
         fields[n++] = (wtq_qpack_field_t){ "wt-available-protocols", 22,
                                            sf_staging, sf_len, false };
@@ -559,6 +591,14 @@ wtq_connect_status_t wtq_connect_encode_request_ex(
 wtq_connect_status_t wtq_connect_encode_response(
     uint16_t status, const wtq_sf_str_t *selected, uint8_t *dst,
     size_t cap, size_t *out_len)
+{
+    return wtq_connect_encode_response_ex(status, selected, false, dst, cap,
+                                          out_len);
+}
+
+wtq_connect_status_t wtq_connect_encode_response_ex(
+    uint16_t status, const wtq_sf_str_t *selected, bool emit_d02_marker,
+    uint8_t *dst, size_t cap, size_t *out_len)
 {
     if (status < 100 || status > 999)
         return WTQ_CONNECT_MALFORMED;
@@ -584,9 +624,12 @@ wtq_connect_status_t wtq_connect_encode_response(
             return WTQ_CONNECT_MALFORMED;
     }
 
-    wtq_qpack_field_t fields[2];
+    wtq_qpack_field_t fields[3];
     size_t n = 0;
     fields[n++] = (wtq_qpack_field_t){ ":status", 7, code, 3, false };
+    if (emit_d02_marker)
+        fields[n++] = (wtq_qpack_field_t){
+            "sec-webtransport-http3-draft", 28, "draft02", 7, false };
     if (selected != NULL)
         fields[n++] = (wtq_qpack_field_t){ "wt-protocol", 11, sf_staging,
                                            sf_len, false };

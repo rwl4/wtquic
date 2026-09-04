@@ -239,6 +239,9 @@ _Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT ==
 _Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT ==
                    (uint64_t)WTQ_H3_WT_PROFILES_D13_14_COMPAT,
                "public/internal D13/14 profile mask must agree");
+_Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT ==
+                   (uint64_t)WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+               "public/internal D02/RFC9297 profile mask must agree");
 _Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_ALL ==
                    (uint64_t)WTQ_H3_WT_PROFILES_ALL,
                "public/internal ALL profile mask must agree");
@@ -248,6 +251,38 @@ _Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT ==
 _Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT ==
                    (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT,
                "public/internal D13/14 profile value must agree");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT ==
+                   (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT,
+               "public/internal D02/RFC9297 profile value must agree");
+/* Member identity, not just the ALL aggregate. `ALL == a|b|c` alone does
+ * NOT prove the three are distinct, so assert pairwise non-overlap and
+ * non-zero explicitly, then the union. */
+_Static_assert(WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT != 0 &&
+                   WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT != 0 &&
+                   WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT != 0,
+               "every profile mask member must be non-zero");
+_Static_assert((WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT &
+                WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT) == 0,
+               "CURRENT and D13/14 masks must not overlap");
+_Static_assert((WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT &
+                WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT) == 0,
+               "CURRENT and D02 masks must not overlap");
+_Static_assert((WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT &
+                WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT) == 0,
+               "D13/14 and D02 masks must not overlap");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT !=
+                       (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT &&
+                   (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT !=
+                       (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT &&
+                   (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT !=
+                       (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT,
+               "profile enum values must be pairwise distinct");
+_Static_assert((uint64_t)WTQ_WEBTRANSPORT_PROFILES_ALL ==
+                   ((uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
+                    (uint64_t)WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT |
+                    (uint64_t)
+                        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT),
+               "public ALL must be exactly the union of its members");
 
 /* Mirrors of the engine's accept-policy limits (wtq_conn copies the
  * table with these bounds at serve time). */

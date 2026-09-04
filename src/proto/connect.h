@@ -73,6 +73,12 @@ typedef struct wtq_connect_req {
     size_t origin_len;
     bool has_origin;
     bool legacy_protocol; /* matched via the legacy token */
+    /* draft-02 s6 request marker "sec-webtransport-http3-draft02". The
+     * value is exposed so the engine can require the exact "1"; a second
+     * occurrence is malformed like any other singleton. */
+    const char *d02_marker;
+    size_t d02_marker_len;
+    bool has_d02_marker;
 } wtq_connect_req_t;
 
 /* Decoded CONNECT response. 2xx means the session was accepted
@@ -82,6 +88,12 @@ typedef struct wtq_connect_resp {
     uint16_t status;
     bool has_protocol; /* wt-protocol header present */
     wtq_sf_str_t protocol;
+    /* draft-02 s6 RESPONSE marker "sec-webtransport-http3-draft".
+     * The field name deliberately DIFFERS from the request name; the
+     * version travels in the value. A duplicate is malformed. */
+    const char *d02_marker;
+    size_t d02_marker_len;
+    bool has_d02_marker;
 } wtq_connect_resp_t;
 
 /* CONTRACT: success is draft-wide 2xx — draft-15 defines acceptance via
@@ -170,6 +182,19 @@ wtq_connect_status_t wtq_connect_encode_request(
  * NULL/0 token defaults to the current token (so the bare
  * wtq_connect_encode_request is exactly this with the current token).
  */
+/*
+ * As _ex, plus an explicit draft-02 marker decision: when
+ * emit_d02_marker is true exactly one "sec-webtransport-http3-draft02: 1"
+ * request field is added. The decision is the caller's (the engine's
+ * central profile policy), never inferred from the token.
+ */
+wtq_connect_status_t wtq_connect_encode_request_d02(
+    const char *authority, size_t authority_len, const char *path,
+    size_t path_len, const char *origin, size_t origin_len,
+    const wtq_sf_str_t *protocols, size_t protocol_count,
+    const char *protocol_token, size_t protocol_token_len,
+    bool emit_d02_marker, uint8_t *dst, size_t cap, size_t *out_len);
+
 wtq_connect_status_t wtq_connect_encode_request_ex(
     const char *authority, size_t authority_len, const char *path,
     size_t path_len, const char *origin, size_t origin_len,
@@ -184,6 +209,16 @@ wtq_connect_status_t wtq_connect_encode_request_ex(
 wtq_connect_status_t wtq_connect_encode_response(
     uint16_t status, const wtq_sf_str_t *selected, uint8_t *dst,
     size_t cap, size_t *out_len);
+
+/*
+ * As above, plus the draft-02 s6 response marker
+ * "sec-webtransport-http3-draft: draft02" when emit_d02_marker is true.
+ * The response field name deliberately DIFFERS from the request name:
+ * the request carries the version in the name, the response in the value.
+ */
+wtq_connect_status_t wtq_connect_encode_response_ex(
+    uint16_t status, const wtq_sf_str_t *selected, bool emit_d02_marker,
+    uint8_t *dst, size_t cap, size_t *out_len);
 
 /*
  * Server-side selection: first client-offered protocol (preference

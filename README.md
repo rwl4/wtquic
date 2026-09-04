@@ -33,7 +33,7 @@ Network.framework client backend carries its own lifecycle, loopback
 
 ## WebTransport profiles
 
-wtquic speaks two WebTransport-over-HTTP/3 wire profiles. A **client**
+wtquic speaks three WebTransport-over-HTTP/3 wire profiles. A **client**
 requests one per connection (`wtq_connect_config_t.webtransport_profile`).
 A **server** configures a capability SET per listener
 (`wtq_msquic_listener_cfg_t.webtransport_profiles`), advertises the union
@@ -71,10 +71,20 @@ A listener that leaves the set zero keeps the older singular
 `webtransport_profile` behavior exactly, so existing callers are
 unaffected.
 
-**These two profiles do not provide stock-browser compatibility.**
+**`H3_CURRENT` and `H3_DRAFT_13_14_COMPAT` do not provide stock-browser
+compatibility.** A third profile, `H3_DRAFT_02_RFC9297_COMPAT`, does:
+draft-02 WebTransport signaling and the 8-bit outbound stream-error contract
+carried over **RFC 9297** datagrams. It is **not** byte-faithful draft-02/-05:
+the legacy datagram codepoint `0xffd277` is neither emitted nor accepted, no
+datagram context/registration is implemented, and D07 `0xc671706a` is not
+supported. Evidence status: **proven against exact Google Chrome
+152.0.7977.66**; Firefox 155 is source-coherent but has **no exact-binary live
+row yet**; **no Safari claim**. Profile selection is from peer SETTINGS only,
+with an explicit Origin requirement and **no heuristic fallback**.
 Published evidence points at stable Chrome and Firefox emitting the older
 draft-02 `ENABLE_WEBTRANSPORT` (0x2b603742) — a different generation from
-the drafts-7–12 codepoint (0xc671706a) — and wtquic emits neither. No
+the drafts-7–12 codepoint (0xc671706a). wtquic emits **`0x2b603742`** for
+`H3_DRAFT_02_RFC9297_COMPAT` and **never** emits `0xc671706a`. No
 Safari support is claimed without capture evidence. See COMPATIBILITY.md.
 
 No live third-party draft-16 relay (a peer signalling WT_ENABLED with
@@ -86,11 +96,11 @@ observations. HEAD 99fa77d **emits** `:protocol = webtransport` with
 `ENABLE_WEBTRANSPORT` (0x2b603742) — the draft-02 generation — alongside
 `WEBTRANSPORT_MAX_SESSIONS` (0xc671706a), which is the distinct
 drafts-7–12 generation. Those are two different generations and are not
-one "Chrome" dialect; wtquic emits neither codepoint and implements no
+one "Chrome" dialect. wtquic emits `0x2b603742` only, never `0xc671706a`, and implements no
 profile that selects on them. Interoperating would need a separately
 typed, separately evidenced profile, which is not added here.
 
-Both profiles share everything below the H3 SETTINGS/CONNECT layer —
+All three profiles share everything below the H3 SETTINGS/CONNECT layer —
 stream preambles, quarter-stream-ID datagrams, application <!-- api-boundary-exempt: deliberate profile-scope description -->
 error-code mapping, RESET_STREAM_AT requirements, and CLOSE / DRAIN /
 teardown are identical. The compatibility profile is safe only because it

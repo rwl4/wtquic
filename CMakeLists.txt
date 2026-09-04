@@ -94,6 +94,15 @@ set_target_properties(wtquic PROPERTIES
     SOVERSION ${PROJECT_VERSION_MINOR}
 )
 target_compile_definitions(wtquic PRIVATE WTQ_BUILDING)
+
+# Evidence instrumentation is OFF by default. An ordinary default/Release/
+# shared/install build compiles the production layout with no ledger strings,
+# evidence symbols, environment hooks, or pthread ledger dependency. The
+# isolated evidence harness turns this on explicitly.
+option(WTQ_EVIDENCE "Build test-only D02 evidence instrumentation" OFF)
+if(WTQ_EVIDENCE)
+    target_compile_definitions(wtquic PRIVATE WTQ_TESTING=1)
+endif()
 if(NOT BUILD_SHARED_LIBS)
     target_compile_definitions(wtquic PUBLIC WTQ_STATIC)
 endif()

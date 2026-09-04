@@ -74,13 +74,32 @@ int main(void)
     {
         wtq_webtransport_profile_set_t set =
             WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
-            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT |
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
         wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
         if (set != WTQ_WEBTRANSPORT_PROFILES_ALL)
             return 1;
         if (WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT ==
             WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT)
             return 1;
+        /* Name, assign and distinguish the exact D02 enum and mask, not
+         * merely reach them through PROFILES_ALL. */
+        {
+            wtq_webtransport_profile_t d02_named =
+                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
+            wtq_webtransport_profile_set_t d02_mask =
+                WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
+            if (d02_named == WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT)
+                return 1;
+            if (d02_named == WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
+                return 1;
+            if (d02_mask == WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT)
+                return 1;
+            if (d02_mask == WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT)
+                return 1;
+            if ((WTQ_WEBTRANSPORT_PROFILES_ALL & d02_mask) != d02_mask)
+                return 1;
+        }
         if (wtq_session_webtransport_profile(NULL, &prof) !=
             WTQ_ERR_INVALID_ARG)
             return 1;

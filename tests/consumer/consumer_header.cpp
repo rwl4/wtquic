@@ -58,7 +58,8 @@ int main()
     {
         wtq_webtransport_profile_set_t set =
             WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
-            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT |
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
         wtq_webtransport_profile_t prof =
             static_cast<wtq_webtransport_profile_t>(0x7f);
         if (set != WTQ_WEBTRANSPORT_PROFILES_ALL)

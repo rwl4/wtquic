@@ -394,7 +394,9 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
     if (cfg.webtransport_profiles == 0) {
         if (cfg.webtransport_profile != WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT &&
             cfg.webtransport_profile !=
-                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
+                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT &&
+            cfg.webtransport_profile !=
+                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT)
             return WTQ_ERR_INVALID_ARG;
         profiles = wtq_h3_wt_profile_bit(
             (wtq_h3_wt_profile_t)cfg.webtransport_profile);

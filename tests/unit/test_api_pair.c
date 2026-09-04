@@ -5,6 +5,7 @@
 #include "fake_driver.h"
 
 #include "test_support.h"
+#include "wtq_fault_alloc.h"
 
 /*
  * Two PUBLIC sessions talking through the fake transports: everything
@@ -158,6 +159,9 @@ static void on_datagram(wtq_session_t *s, const uint8_t *data, size_t len,
 
 static int side_up_profiles(side_t *sd, char label, bool client,
                             int singular, uint64_t set, int *fp);
+static int side_up_profiles_alloc(side_t *sd, char label, bool client,
+                                  int singular, uint64_t set,
+                                  const wtq_alloc_t *alloc, int *fp);
 
 static int side_up(side_t *sd, char label, bool client, int *fp)
 {
@@ -166,6 +170,14 @@ static int side_up(side_t *sd, char label, bool client, int *fp)
 
 static int side_up_profiles(side_t *sd, char label, bool client,
                             int singular, uint64_t set, int *fp)
+{
+    return side_up_profiles_alloc(sd, label, client, singular, set,
+                                  wtq_alloc_default(), fp);
+}
+
+static int side_up_profiles_alloc(side_t *sd, char label, bool client,
+                                  int singular, uint64_t set,
+                                  const wtq_alloc_t *alloc, int *fp)
 {
     int failures = 0;
     wtq_session_events_t ev;
@@ -185,7 +197,7 @@ static int side_up_profiles(side_t *sd, char label, bool client,
     ev.on_datagram = on_datagram;
 
     wtq_api_session_cfg_t cfg = {
-        .alloc = wtq_alloc_default(),
+        .alloc = alloc,
         .perspective = client ? WTQ_PERSPECTIVE_CLIENT
                               : WTQ_PERSPECTIVE_SERVER,
         .events = &ev,
@@ -409,6 +421,276 @@ static int scenario_api_pair(uint64_t seed, int *fp)
  * each side is asked what IT selected — never merely what it was configured
  * with.
  */
+
+/*
+ * PUBLIC-API D02 symmetry (0014d finding 1). Everything below goes through
+ * wtq_connect_config_t / wtq_api_session_* — the boundary the internal
+ * engine self-pair bypassed. A whitelist that omits D02 fails these
+ * directly at wtq_api_session_connect.
+ */
+#define API_D02 WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT
+#define API_D02_SET WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT
+
+static int scenario_public_d02(uint64_t seed, uint64_t server_set, int *fp)
+{
+    int failures = 0;
+    static side_t c;
+    static side_t s;
+    /* Allocation oracle: proves BOTH references are released and BOTH
+     * sessions/connections are destroyed, independent of any platform leak
+     * reporting default. */
+    static wtq_fault_alloc_t fa_c;
+    static wtq_fault_alloc_t fa_s;
+    wtq_fault_alloc_init(&fa_c);
+    wtq_fault_alloc_init(&fa_s);
+
+    if (side_up_profiles_alloc(&c, 'c', true, API_D02, 0,
+                               wtq_fault_alloc_vtable(&fa_c), fp) != 0 ||
+        side_up_profiles_alloc(&s, 's', false, 0, server_set,
+                               wtq_fault_alloc_vtable(&fa_s), fp) != 0)
+        return 1;
+    WTQ_TEST_CHECK(fa_c.live > 0);
+
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+    wtq_connect_config_t cc;
+    wtq_connect_config_init_ex(&cc, sizeof(cc));
+    cc.authority = "example.com";
+    cc.path = "/app";
+    cc.origin = "https://example.com:443";
+    cc.subprotocols = OFFER;
+    cc.subprotocol_count = 1;
+    cc.webtransport_profile = API_D02;
+    /* THE public boundary: this call is what a D02-less whitelist rejects. */
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    pump(seed, &c, &s);
+    WTQ_TEST_CHECK(c.established == 1);
+    WTQ_TEST_CHECK(s.established == 1);
+
+    /* both sides report D02 from INSIDE on_established */
+    WTQ_TEST_CHECK_EQ_INT(c.cb_query_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(s.cb_query_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(c.cb_profile, (int)API_D02);
+    WTQ_TEST_CHECK_EQ_INT(s.cb_profile, (int)API_D02);
+
+    /* and the public query still reports D02 after establishment */
+    wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_session_webtransport_profile(c.s, &prof),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT((int)prof, (int)API_D02);
+
+    /* retained post-terminal handle keeps reporting D02 */
+    wtq_session_add_ref(c.s);
+    WTQ_TEST_CHECK(wtq_session_close(c.s, 3, NULL, 0) == WTQ_OK);
+    pump(seed, &c, &s);
+    prof = (wtq_webtransport_profile_t)0x7f;
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_session_webtransport_profile(c.s, &prof),
+                          (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT((int)prof, (int)API_D02);
+    WTQ_TEST_CHECK(wtq_session_status(c.s) == WTQ_SESSION_STATUS_CLOSED);
+
+    /* Release BOTH references: the extra one taken above, and the original
+     * from creation. Releasing only once leaks the client session. */
+    wtq_session_release(c.s);
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+
+    /* Causal destruction proof: every allocation on both sides is returned
+     * and the allocator saw no invalid/double free. */
+    WTQ_TEST_CHECK_EQ_INT(fa_c.live, 0);
+    WTQ_TEST_CHECK_EQ_INT(fa_s.live, 0);
+    WTQ_TEST_CHECK_EQ_INT(fa_c.errors, 0);
+    WTQ_TEST_CHECK_EQ_INT(fa_s.errors, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(fa_c.live_bytes, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(fa_s.live_bytes, 0);
+    *fp += failures;
+    return 0;
+}
+
+/* An out-of-range COMPLETE profile tail is rejected before effect, and a
+ * D02 config is accepted — proving the whitelist is exact, not permissive. */
+static void scenario_public_d02_config_bounds(int *fp)
+{
+    int failures = 0;
+    static side_t c;
+    if (side_up_profiles(&c, 'c', true, API_D02, 0, fp) != 0)
+        return;
+
+    wtq_connect_config_t cc;
+    wtq_connect_config_init_ex(&cc, sizeof(cc));
+    cc.authority = "example.com";
+    cc.path = "/app";
+    cc.origin = "https://example.com:443";
+    cc.webtransport_profile = (wtq_webtransport_profile_t)99;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_ERR_INVALID_ARG);
+
+    /* zero effect: the valid D02 config still works afterwards */
+    cc.webtransport_profile = API_D02;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    wtq_session_release(c.s);
+    *fp += failures;
+}
+
+
+/*
+ * PUBLIC connect-config ABI matrix (0014e finding B), driven through
+ * wtq_api_session_connect on heap-backed, poisoned objects. The v1 layout
+ * is spelled out INDEPENDENTLY here rather than derived from the current
+ * struct, so it cannot drift with the implementation.
+ */
+typedef struct abi_connect_v1 {
+    uint32_t struct_size;
+    const char *authority;
+    const char *path;
+    const char *origin;
+    const char *const *subprotocols;
+    size_t subprotocol_count;
+    bool require_subprotocol;
+} abi_connect_v1_t;
+
+/*
+ * Build a poisoned heap object of EXACTLY `bytes` — no slack. An old or
+ * partial caller's object really ends at its declared extent, so a read past
+ * it is a genuine ASan heap-buffer-overflow rather than a read into padding
+ * we generously allocated. Only the bytes physically present are written.
+ */
+static void *abi_cfg_new(size_t bytes, uint32_t declared, bool with_profile,
+                         uint32_t profile_value)
+{
+    unsigned char *p = malloc(bytes);          /* EXACT extent, no slack */
+    if (p == NULL)
+        return NULL;
+    memset(p, 0xA5, bytes);                    /* poison everything */
+    abi_connect_v1_t v1;
+    memset(&v1, 0, sizeof(v1));
+    v1.struct_size = declared;
+    v1.authority = "example.com";
+    v1.path = "/app";
+    v1.origin = "https://example.com:443";
+    v1.subprotocols = OFFER;
+    v1.subprotocol_count = 1;
+    v1.require_subprotocol = false;
+    memcpy(p, &v1, bytes < sizeof(v1) ? bytes : sizeof(v1));
+    if (with_profile) {
+        const size_t off =
+            offsetof(wtq_connect_config_t, webtransport_profile);
+        const size_t fsz =
+            sizeof(((wtq_connect_config_t *)0)->webtransport_profile);
+        uint32_t v = profile_value;             /* native representation */
+        if (off < bytes) {
+            /* write ONLY the bytes physically present */
+            const size_t avail = bytes - off;
+            memcpy(p + off, &v, avail < fsz ? avail : fsz);
+        }
+    }
+    return p;
+}
+
+static void scenario_public_connect_abi(int *fp)
+{
+    int failures = 0;
+    const size_t v1_size = sizeof(abi_connect_v1_t);
+    const size_t cur_size = sizeof(wtq_connect_config_t);
+    const size_t poff = offsetof(wtq_connect_config_t, webtransport_profile);
+    const size_t psz = sizeof(((wtq_connect_config_t *)0)->webtransport_profile);
+
+    /* the frozen shadow must still match the real v1 prefix */
+    WTQ_TEST_CHECK(poff >= v1_size);
+
+    struct row { const char *name; size_t bytes; uint32_t declared;
+                 bool with_profile; uint32_t val; wtq_result_t want;
+                 int client_singular; };
+    const struct row rows[] = {
+        /* 1. exact frozen v1, allocated at its REAL extent */
+        { "exact_v1", v1_size, (uint32_t)v1_size, false, 0, WTQ_OK,
+          (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT  },
+        /* 2. one byte short of the profile field's offset: the required v1
+         *    prefix is still whole, so this is accepted and defaults
+         *    CURRENT (documented rule: the tail is honoured only when the
+         *    WHOLE field fits). */
+        { "poff_minus_1", poff - 1, (uint32_t)(poff - 1), false, 0, WTQ_OK,
+          (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT  },
+        /* 3a-3d. EVERY mid-field boundary, including the final byte
+         *    missing: the whole field is absent -> CURRENT, poison never
+         *    interpreted, and no read past the real object. */
+        { "straddle_1", poff + 1, (uint32_t)(poff + 1), true,
+          (uint32_t)API_D02, WTQ_OK,
+          (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT },
+        { "straddle_2", poff + 2, (uint32_t)(poff + 2), true,
+          (uint32_t)API_D02, WTQ_OK,
+          (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT },
+        { "straddle_last_byte_missing", poff + psz - 1,
+          (uint32_t)(poff + psz - 1), true, (uint32_t)API_D02, WTQ_OK,
+          (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT },
+        /* 4. exact current size carrying D02: reaches the D02 engine path */
+        { "exact_d02", cur_size, (uint32_t)cur_size, true,
+          (uint32_t)API_D02, WTQ_OK, (int)API_D02  },
+        /* 5. oversized future object: D02 honoured, unknown tail ignored */
+        { "oversized_d02", cur_size + 32, (uint32_t)(cur_size + 32), true,
+          (uint32_t)API_D02, WTQ_OK, (int)API_D02  },
+        /* 6. complete out-of-range value: rejected before effect */
+        { "out_of_range", cur_size, (uint32_t)cur_size, true, 99u,
+          WTQ_ERR_INVALID_ARG, (int)API_D02  },
+    };
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        static side_t c;
+        static side_t s;
+        if (side_up_profiles(&c, 'c', true, rows[i].client_singular, 0,
+                             fp) != 0 ||
+            side_up_profiles(&s, 's', false, 0,
+                             WTQ_WEBTRANSPORT_PROFILES_ALL, fp) != 0)
+            return;
+        wtq_serve_config_t path;
+        wtq_serve_config_init(&path);
+        path.path = "/app";
+        path.subprotocols = OFFER;
+        path.subprotocol_count = 1;
+        WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+        void *obj = abi_cfg_new(rows[i].bytes, rows[i].declared,
+                                rows[i].with_profile, rows[i].val);
+        WTQ_TEST_CHECK(obj != NULL);
+        const wtq_result_t got =
+            wtq_api_session_connect(c.s, (const wtq_connect_config_t *)obj);
+        WTQ_TEST_CHECK_EQ_INT((int)got, (int)rows[i].want);
+
+        if (rows[i].want == WTQ_OK) {
+            pump(0xAB1 + i, &c, &s);
+            WTQ_TEST_CHECK(c.established == 1);
+            wtq_webtransport_profile_t prof =
+                (wtq_webtransport_profile_t)0x7f;
+            WTQ_TEST_CHECK(wtq_session_webtransport_profile(c.s, &prof) ==
+                           WTQ_OK);
+            /* each row states the profile it must negotiate */
+            WTQ_TEST_CHECK_EQ_INT((int)prof, rows[i].client_singular);
+        } else {
+            /* 7. a rejected row leaves the session usable */
+            WTQ_TEST_CHECK(c.established == 0);
+            wtq_connect_config_t ok;
+            wtq_connect_config_init_ex(&ok, sizeof(ok));
+            ok.authority = "example.com";
+            ok.path = "/app";
+            ok.origin = "https://example.com:443";
+            ok.subprotocols = OFFER;
+            ok.subprotocol_count = 1;
+            ok.webtransport_profile = API_D02;
+            WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &ok) == WTQ_OK);
+            pump(0xAB1 + i, &c, &s);
+            WTQ_TEST_CHECK(c.established == 1);
+        }
+        free(obj);
+        wtq_session_release(c.s);
+        wtq_session_release(s.s);
+    }
+    *fp += failures;
+}
+
 static int scenario_profile_query(uint64_t seed, int client_profile,
                                   int expect, int *fp)
 {
@@ -663,6 +945,11 @@ int main(void)
 
     (void)scenario_api_pair(0xAB1E, &failures);
     (void)scenario_api_pair(0x5EED, &failures); /* other chunking */
+    (void)scenario_public_d02(0xD02A11, API_D02_SET, &failures);
+    (void)scenario_public_d02(0xD02A12, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                              &failures);
+    scenario_public_d02_config_bounds(&failures);
+    scenario_public_connect_abi(&failures);
     (void)scenario_profile_query(0xC0FFEE,
                                  (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
                                  (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,

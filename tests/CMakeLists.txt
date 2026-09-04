@@ -124,7 +124,7 @@ wtq_add_engine_test(api_async_id)
 wtq_add_engine_test(api_abort)
 wtq_add_engine_test(api_transport_error)
 wtq_add_engine_test(api_stream)
-wtq_add_engine_test(api_pair)
+wtq_add_engine_test(api_pair support/wtq_fault_alloc.c)
 wtq_add_engine_test(api_pause)
 wtq_add_engine_test(simpair_bootstrap support/wtq_simpair.c)
 wtq_add_engine_test(engine_profile support/wtq_simpair.c)
@@ -385,6 +385,12 @@ if(WTQ_MSQUIC_ENABLED)
     # Real-transport loopback: self-signed certs generated into the build
     # dir by the fixture, ephemeral ports, real MsQuic on localhost.
     find_package(Threads REQUIRED)
+    if(WTQ_EVIDENCE)
+        add_executable(d02_evidence_server d02_evidence_server.c)
+        target_link_libraries(d02_evidence_server PRIVATE wtq::msquic
+            Threads::Threads)
+    endif()
+
     add_executable(loopback_msquic loopback/loopback_msquic.c)
     target_link_libraries(loopback_msquic PRIVATE wtq::msquic
         Threads::Threads)

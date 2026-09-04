@@ -1214,11 +1214,48 @@ static int test_abi_listener_profile(void)
         offsetof(wtq_msquic_listener_cfg_t, webtransport_profile);
     const size_t plen =
         sizeof(((wtq_msquic_listener_cfg_t *)0)->webtransport_profile);
-    /* Little-endian encodings of the two valid profile values + an invalid. */
-    static const unsigned char COMPAT[] = { 0x01, 0x00, 0x00, 0x00 };
-    static const unsigned char CURRENT[] = { 0x00, 0x00, 0x00, 0x00 };
-    static const unsigned char BAD[] = { 0x63, 0x00, 0x00, 0x00 }; /* 99 */
+    /* NATIVE object representations: these are host C-ABI fields, not wire
+     * values, so the bytes must come from real objects rather than
+     * hand-written little-endian arrays. */
+    unsigned char COMPAT[sizeof(uint32_t)];
+    unsigned char CURRENT[sizeof(uint32_t)];
+    unsigned char D02[sizeof(uint32_t)];
+    unsigned char BAD[sizeof(uint32_t)];
+    {
+        uint32_t v;
+        v = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+        memcpy(COMPAT, &v, sizeof(v));
+        v = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+        memcpy(CURRENT, &v, sizeof(v));
+        v = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
+        memcpy(D02, &v, sizeof(v));
+        v = 99u;
+        memcpy(BAD, &v, sizeof(v));
+    }
     wtq_result_t rc;
+
+    /* --- D02/RFC9297 singular rows (0014f item 3) --------------------- */
+    /* exact current struct, D02 in the singular field, zero set. */
+    WTQ_TEST_CHECK_EQ_INT(
+        abi_listener_profile_start((uint32_t)full, D02, plen, &rc),
+        (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    /* D02 written but the field STRADDLES the declared size: the whole
+     * field is absent, so it must default to CURRENT and the poison must
+     * never be interpreted. */
+    for (size_t miss = 1; miss <= plen; miss++) {
+        WTQ_TEST_CHECK_EQ_INT(
+            abi_listener_profile_start((uint32_t)(poff + plen - miss), D02,
+                                       plen - miss, &rc),
+            (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT);
+        WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    }
+    /* oversized future object carrying D02 with a zero set: honoured, and
+     * the unknown tail is ignored. */
+    WTQ_TEST_CHECK_EQ_INT(
+        abi_listener_profile_start((uint32_t)(full + 32), D02, plen, &rc),
+        (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
 
     /* exact: the whole field present with the compat value → compat latched. */
     WTQ_TEST_CHECK_EQ_INT(

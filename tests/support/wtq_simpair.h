@@ -67,6 +67,10 @@ typedef struct wtq_simpair_side {
     int wt_fin_events;
     int wt_reset_events;
     int wt_stop_events;
+    /* Exact application codes the engine delivered, so a test can prove the
+     * inbound mapping is full-width rather than merely counting events. */
+    uint32_t last_wt_reset_code;
+    uint32_t last_wt_stop_code;
     int send_completions;
     int send_cancels;
     int dgram_events;
@@ -96,8 +100,9 @@ struct wtq_simpair {
 /* Create both engines and start them (control/QPACK streams open). */
 int wtq_simpair_create(wtq_simpair_t *sp, uint64_t seed);
 /* As wtq_simpair_create, but each side is CONFIGURED with an explicit
- * WebTransport wire profile (wtq_h3_wt_profile_t: 0 = current draft-16, 1 =
- * D13/14 compat). The caller must pass the client's profile again in
+ * WebTransport wire profile (wtq_h3_wt_profile_t, exhaustive: 0 = current
+ * draft-16, 1 = D13/14 compat, 2 = D02/RFC9297 browser compat). The caller
+ * must pass the client's profile again in
  * wtq_simpair_client_connect so the CONNECT token matches the SETTINGS the
  * client emitted at start. Configuration only — each side still selects and
  * latches from its peer's SETTINGS. */

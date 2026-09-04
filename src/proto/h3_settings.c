@@ -109,6 +109,12 @@ wtq_h3_settings_status_t wtq_h3_settings_decode(const uint8_t *payload,
             s.wt_max_sessions_d07 = value;
             break;
         case WTQ_H3_SET_ENABLE_WEBTRANSPORT_LEG:
+            /* draft-02 s3.1: "The SETTINGS_ENABLE_WEBTRANSPORT parameter
+             * value SHALL be either 0 or 1 ... an endpoint that receives a
+             * value other than 0 or 1 MUST close the connection with the
+             * H3_SETTINGS_ERROR error code." */
+            if (value > 1)
+                return WTQ_H3_SETTINGS_ERR_SETTING;
             s.has_enable_webtransport_leg = true;
             s.enable_webtransport_leg = value;
             break;
@@ -168,6 +174,14 @@ static size_t build_out_settings(const wtq_h3_settings_encode_cfg_t *cfg,
         profiles = WTQ_H3_WT_PROFILES_CURRENT;
     if (profiles & WTQ_H3_WT_PROFILES_D13_14_COMPAT) {
         out[n].id = WTQ_H3_SET_WT_MAX_SESSIONS_D13;
+        out[n++].value = 1;
+    }
+    if (profiles & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) {
+        /* draft-02 s3.1: a 0/1 boolean; 1 means supported. Ascending
+         * identifier order places it after 0x14e9cd29 and before
+         * 0x2c7cf000. RFC 9297 H3_DATAGRAM (0x33) is emitted
+         * unconditionally elsewhere; 0xffd277 is never emitted. */
+        out[n].id = WTQ_H3_SET_ENABLE_WEBTRANSPORT_LEG;
         out[n++].value = 1;
     }
     if (profiles & WTQ_H3_WT_PROFILES_CURRENT) {
@@ -247,6 +261,7 @@ wtq_h3_settings_status_t wtq_h3_settings_encode_frame(
 static const wtq_h3_wt_profile_t WT_PRECEDENCE[] = {
     WTQ_H3_WT_PROFILE_CURRENT,        /* drafts 15-16 */
     WTQ_H3_WT_PROFILE_D13_14_COMPAT,  /* drafts 13-14 */
+    WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT, /* drafts 00-03 over RFC 9297 */
 };
 
 _Static_assert(sizeof(WT_PRECEDENCE) / sizeof(WT_PRECEDENCE[0]) ==
@@ -265,6 +280,14 @@ static bool peer_advertises(const wtq_h3_settings_t *peer,
     case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
         return peer->has_wt_max_sessions_d13 &&
                peer->wt_max_sessions_d13 > 0;
+    case WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT:
+        /* draft-02 s3.1: the value SHALL be 0 or 1; 0 means "not
+         * supported" and must never select. The decoder rejects > 1 with
+         * H3_SETTINGS_ERROR. RFC 9297 datagrams are required because that
+         * is the only datagram framing this profile implements. */
+        return peer->has_enable_webtransport_leg &&
+               peer->enable_webtransport_leg == 1 &&
+               peer->has_h3_datagram && peer->h3_datagram == 1;
     }
     return false;
 }
@@ -277,14 +300,11 @@ bool wtq_h3_settings_select_profile(const wtq_h3_settings_t *peer,
     if (peer == NULL || out == NULL)
         return false;
 
-    /* Profile-independent requirements first: they gate every profile
-     * equally, so a peer failing them has no mutual profile at all. */
-    if (!(peer->has_h3_datagram && peer->h3_datagram == 1))
-        return false;
-    if (peer_is_server &&
-        !(peer->has_enable_connect_protocol &&
-          peer->enable_connect_protocol == 1))
-        return false;
+    /* Per-profile predicates. CURRENT and D13/14 keep the shared
+     * requirements; D02_RFC9297 does NOT require ENABLE_CONNECT_PROTOCOL,
+     * because draft-02 s3.2 says ENABLE_WEBTRANSPORT itself implies
+     * extended CONNECT. Its own datagram requirement lives in
+     * peer_advertises(). */
 
     /* The intersection, walked newest-first: the first hit is the highest
      * mutually supported profile. A signal for a profile outside `set` is
@@ -294,6 +314,14 @@ bool wtq_h3_settings_select_profile(const wtq_h3_settings_t *peer,
 
         if ((set & wtq_h3_wt_profile_bit(p)) == 0)
             continue;
+        if (p != WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT) {
+            if (!(peer->has_h3_datagram && peer->h3_datagram == 1))
+                continue;
+            if (peer_is_server &&
+                !(peer->has_enable_connect_protocol &&
+                  peer->enable_connect_protocol == 1))
+                continue;
+        }
         if (!peer_advertises(peer, p))
             continue;
         *out = p;

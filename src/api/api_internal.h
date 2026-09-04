@@ -64,7 +64,10 @@ typedef struct wtq_api_session_cfg {
     void *user;                      /* handed to every event */
     wtq_driver_t *drv;               /* backend connection context */
     const wtq_driver_ops_t *ops;     /* backend vtable */
-    /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
+    /* wtq_h3_wt_profile_t, exhaustive: 0 = current (draft-16),
+     * 1 = D13/14 compat, 2 = D02/RFC9297 browser compat. Keep this list
+     * exhaustive rather than open-ended so a new profile cannot silently
+     * stale it.
      * The legacy SINGLETON source: it supplies a one-member capability set
      * when webtransport_profiles below is zero, and is validated only then.
      * It is configuration, never a negotiated outcome — nothing is selected

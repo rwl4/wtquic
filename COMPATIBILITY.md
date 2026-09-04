@@ -14,7 +14,7 @@ CONTENT is otherwise exactly the preview.2 dependency point.)
 
 ## WebTransport profile selection
 
-wtquic speaks two WebTransport-over-HTTP/3 wire profiles
+wtquic speaks three WebTransport-over-HTTP/3 wire profiles
 (`wtq_webtransport_profile_t`):
 
 - `WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT` (0, the default): draft-16 —
@@ -23,9 +23,18 @@ wtquic speaks two WebTransport-over-HTTP/3 wire profiles
   drafts-13/14 dialect — `:protocol = webtransport`, WT_MAX_SESSIONS
   (0x14e9cd29) = 1, no WT flow control. It never emits the drafts-7–12
   codepoint (0xc671706a).
+- `WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT` (2): the
+  browser-compatibility profile — `:protocol = webtransport`,
+  ENABLE_WEBTRANSPORT (0x2b603742) = 1, carried over **RFC 9297**
+  datagrams (H3_DATAGRAM 0x33 = 1). Selected only when the peer sends
+  `0x2b603742 == 1` **and** `0x33 == 1`. It requires the draft-02 §6
+  CONNECT markers and an Origin, and caps OUTBOUND stream application
+  error codes at 0..255 while still decoding the full 32-bit range
+  inbound.
 
-**These two are the whole set. They do not provide stock-browser
-compatibility** — see the browser note below.
+**These three are the whole set.** `H3_CURRENT` and
+`H3_DRAFT_13_14_COMPAT` do not provide stock-browser compatibility;
+`H3_DRAFT_02_RFC9297_COMPAT` does — see the browser note below.
 
 ### Configured set vs selected profile
 
@@ -77,23 +86,44 @@ pico_wt) sends both 0x14e9cd29 and 0xc671706a and accepts either. No
 D13/14 compat interop target uses 0xc671706a instead of 0x14e9cd29, so
 one D13/14 compat profile suffices.
 
-### Browsers are NOT supported by these profiles
+### Browser support: `H3_DRAFT_02_RFC9297_COMPAT`
 
 What a peer ACCEPTS and what it EMITS are separate observations, and only
 the emitted dialect tells you which generation it speaks.
 
-Published evidence points at stable Chrome and Firefox emitting the older
-**draft-02** signal `ENABLE_WEBTRANSPORT` (0x2b603742). That is a
-different generation from the drafts-7–12 `WEBTRANSPORT_MAX_SESSIONS`
-(0xc671706a), and neither is enabled here: wtquic emits neither codepoint
-and implements no profile that would select on them. Do not read the two
-as one "browser" dialect.
+Stable Chrome and Firefox emit the older **draft-02** signal
+`ENABLE_WEBTRANSPORT` (0x2b603742). That is a different generation from
+the drafts-7–12 `WEBTRANSPORT_MAX_SESSIONS` (0xc671706a). wtquic emits
+`0x2b603742` for `H3_DRAFT_02_RFC9297_COMPAT` and selects on it; it
+**never** emits `0xc671706a` and has no profile that selects on it. Do
+not read the two as one "browser" dialect.
 
-No Safari support is claimed. Any such claim needs a packet/qlog capture
-of what Safari actually emits, which has not been taken.
+The legacy datagram codepoint `0xffd277` has an exact contract: it is
+**never emitted**; an incoming `0xffd277` may be decoded and observed as
+an unknown/ignored setting, and it **never counts as D02 support** — D02
+selection requires RFC 9297 `0x33 == 1`.
 
-Adding a browser-compatible profile is future work gated on that capture
-evidence; it is not part of the current profiles.
+The profile is draft-02 **signaling** over **RFC 9297 datagrams**, not a
+byte-faithful draft-02/-05 stack: no datagram context or registration
+machinery is implemented.
+
+Evidence status:
+
+- **Google Chrome 152.0.7977.66 — live interoperability proven** against
+  this profile.
+- **Firefox 155 — source coherence only.** There is no live
+  exact-binary row yet.
+- **Safari — no claim.** Any such claim needs a capture of what Safari
+  actually emits, which has not been taken.
+
+`H3_CURRENT` and `H3_DRAFT_13_14_COMPAT` behaviour is unchanged, and
+there is **no heuristic fallback**: profiles are selected from peer
+SETTINGS only, never from the CONNECT token or headers.
+
+Note that the three profiles do **not** share the entire data/error
+plane: `H3_DRAFT_02_RFC9297_COMPAT` has a distinct outbound `0..255`
+application error range plus marker and Origin policy. Stream preambles,
+datagram association, CLOSE and DRAIN remain shared.
 
 ### Known conformance gap
 

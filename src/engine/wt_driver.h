@@ -367,7 +367,8 @@ typedef struct wtq_conn_cfg {
     const wtq_alloc_t *alloc;        /* required; copied */
     wtq_perspective_t perspective;
     bool enable_connect_protocol;    /* outgoing SETTINGS knob */
-    /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
+    /* wtq_h3_wt_profile_t, exhaustive: 0 = current (draft-16),
+     * 1 = D13/14 compat, 2 = D02/RFC9297 browser compat.
      * The backward-compatible SINGLETON source: when webtransport_profiles
      * below is zero, this single value becomes the connection's configured
      * capability set. It is configuration, not a negotiated outcome — it
@@ -562,7 +563,8 @@ typedef struct wtq_client_connect_cfg {
     const char *const *protocols;
     size_t protocol_count;      /* <= WTQ_CONN_MAX_OFFERED */
     bool require_protocol;
-    /* wtq_h3_wt_profile_t: 0 = current (draft-16), 1 = D13/14 compat.
+    /* wtq_h3_wt_profile_t, exhaustive: 0 = current (draft-16),
+     * 1 = D13/14 compat, 2 = D02/RFC9297 browser compat.
      * The client's REQUESTED singleton, committed as configuration before
      * SETTINGS are emitted; the connection's selected profile is still
      * latched only from the peer's SETTINGS. Requesting a different

@@ -368,6 +368,9 @@ _Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT ==
 _Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT ==
                    (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT,
                "public/internal D13/14 profile value must agree");
+_Static_assert((int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT ==
+                   (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT,
+               "public/internal D02/RFC9297 profile value must agree");
 
 static wtq_webtransport_profile_t api_public_profile(wtq_h3_wt_profile_t p)
 {
@@ -376,6 +379,8 @@ static wtq_webtransport_profile_t api_public_profile(wtq_h3_wt_profile_t p)
         return WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
     case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
         return WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+    case WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT:
+        return WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
     }
     return WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
 }
@@ -754,7 +759,8 @@ wtq_result_t wtq_api_session_connect(wtq_session_t *s,
                     sizeof(c.webtransport_profile))) {
         profile = c.webtransport_profile;
         if (profile != WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT &&
-            profile != WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
+            profile != WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT &&
+            profile != WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT)
             return WTQ_ERR_INVALID_ARG;
     }
 

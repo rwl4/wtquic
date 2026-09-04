@@ -21,6 +21,78 @@
  */
 
 #define WTQ_CONN_MAX_PEER_UNI 16
+#include <stdarg.h>
+
+#ifdef WTQ_TESTING
+/*
+ * Test-only evidence ledger. Line-delimited, machine-parseable records on
+ * a file named by WTQ_LEDGER. NOT a public API and never compiled into a
+ * shipping build: it exists solely so an isolated evidence harness can
+ * assert on decoded server-side facts rather than on browser behaviour.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+static FILE *wtq_led_fp(void)
+{
+    static FILE *fp;
+    static int tried;
+    if (!tried) {
+        const char *p = getenv("WTQ_LEDGER");
+        tried = 1;
+        if (p != NULL)
+            fp = fopen(p, "a");
+    }
+    return fp;
+}
+#include <pthread.h>
+static pthread_mutex_t wtq_led_mu = PTHREAD_MUTEX_INITIALIZER;
+static const char *wtq_led_run(void)
+{
+    const char *r = getenv("WTQ_RUN_ID");
+    return r ? r : "norun";
+}
+/* Every record carries run and connection id, written under one lock, so a
+ * concurrent or prior connection can never be attributed to this scenario. */
+static void wtq_led_c(uint64_t cid, const char *fmt, ...)
+{
+    FILE *fp = wtq_led_fp();
+    if (fp == NULL)
+        return;
+    pthread_mutex_lock(&wtq_led_mu);
+    fprintf(fp, "run=%s conn=%llu ", wtq_led_run(),
+            (unsigned long long)cid);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fflush(fp);
+    pthread_mutex_unlock(&wtq_led_mu);
+}
+static void wtq_led_bytes_c(uint64_t cid, const char *key, const void *p,
+                            size_t n)
+{
+    FILE *fp = wtq_led_fp();
+    if (fp == NULL)
+        return;
+    pthread_mutex_lock(&wtq_led_mu);
+    fprintf(fp, "run=%s conn=%llu %s=", wtq_led_run(),
+            (unsigned long long)cid, key);
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++)
+        fprintf(fp, "%02x", b[i]);
+    fprintf(fp, " len=%zu\n", n);
+    fflush(fp);
+    pthread_mutex_unlock(&wtq_led_mu);
+}
+#define wtq_led(...) wtq_led_c(conn->led_conn_id, __VA_ARGS__)
+#define wtq_led_bytes(k, p, n) \
+    wtq_led_bytes_c(conn->led_conn_id, (k), (p), (n))
+#else
+#define wtq_led(...) ((void)0)
+#define wtq_led_bytes(k, p, n) ((void)0)
+#endif
+
 #define WTQ_CONN_SETTINGS_CAP 512
 
 /* Peer stream classification states. */
@@ -188,6 +260,17 @@ struct wtq_conn {
      * request per connection, so one buffer. */
     struct wtq_estream *parked_es;
     uint8_t parked_buf[WTQ_CONN_SETTINGS_CAP];
+#ifdef WTQ_TESTING
+    /* Evidence-only state. Compiled out entirely in a non-testing build so
+     * observability can never change ordinary connection layout. */
+    char req_origin[320];
+    size_t req_origin_len;
+    bool req_has_origin;
+    bool req_had_d02_marker;
+    uint64_t led_conn_id;
+    const char *expect_origin;   /* harness-supplied exact page origin */
+    size_t expect_origin_len;
+#endif
     uint16_t parked_fill;
     bool parked_fin; /* peer FIN arrived while parked */
 
@@ -230,18 +313,87 @@ static const wtq_connect_opts_t CONN_SERVER_COMPAT_OPTS = { false, true };
  * false and the request is answered generically), so it cannot accidentally
  * bypass the latch or inherit another generation's token rules.
  */
+/*
+ * Per-profile CONNECT policy. Axes 3, 4, 5 and 7 all read this ONE map so
+ * profile knowledge stays in a single place: the expected :protocol token,
+ * whether the draft-02 request marker is required inbound, whether the
+ * draft-02 response marker is emitted on success, and whether an Origin
+ * must be present. draft-02 s6 defines no receiver-side failure rule, so
+ * the marker requirement is deliberate wtquic policy.
+ */
+typedef struct conn_profile_policy {
+    const wtq_connect_opts_t *opts;
+    bool expect_legacy_token;
+    bool require_d02_request_marker;
+    bool emit_d02_response_marker;
+    bool require_origin;
+    uint32_t max_outbound_app_error; /* axis 6: D02 caps at 255 */
+} conn_profile_policy_t;
+
+/*
+ * EVIDENCE FIXTURE VALIDATOR — deliberately narrow, and NOT the production
+ * RFC 6454 / RFC 3986 parser planned for commit 4a. It accepts exactly the
+ * grammar this harness uses:
+ *     ("http://" | "https://") host ":" port
+ * with a nonempty host containing no userinfo/path/query/fragment/comma/
+ * whitespace/control bytes, and a decimal port in 1..65535 ending the
+ * string. Shared by the client preflight and the server guard so both
+ * sides judge an Origin by one rule.
+ */
+static bool conn_origin_fixture_valid(const char *o, size_t on)
+{
+    if (o == NULL || on == 0)
+        return false;
+    size_t i = 0;
+    if (on > 7 && memcmp(o, "http://", 7) == 0)
+        i = 7;
+    else if (on > 8 && memcmp(o, "https://", 8) == 0)
+        i = 8;
+    else
+        return false;
+    const size_t hs = i;
+    while (i < on) {
+        const unsigned char c = (unsigned char)o[i];
+        if (c == ':')
+            break;
+        if (c == '/' || c == '?' || c == '#' || c == '@' || c == ',' ||
+            c <= 0x20 || c == 0x7f)
+            return false;
+        i++;
+    }
+    if (i == hs || i >= on || o[i] != ':')
+        return false;
+    const size_t ps = ++i;
+    unsigned long port = 0;
+    while (i < on && o[i] >= '0' && o[i] <= '9') {
+        port = port * 10UL + (unsigned long)(o[i] - '0');
+        if (port > 65535UL)
+            return false;
+        i++;
+    }
+    if (i == ps || i != on || port < 1UL)
+        return false;
+    return true;
+}
+
 static bool conn_connect_policy(wtq_h3_wt_profile_t profile,
-                                const wtq_connect_opts_t **opts_out,
-                                bool *expect_legacy_token)
+                                conn_profile_policy_t *out)
 {
     switch (profile) {
     case WTQ_H3_WT_PROFILE_CURRENT:
-        *opts_out = &CONN_STRICT_OPTS;
-        *expect_legacy_token = false;
+        *out = (conn_profile_policy_t){ &CONN_STRICT_OPTS, false,
+                                        false, false, false, UINT32_MAX };
         return true;
     case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
-        *opts_out = &CONN_SERVER_COMPAT_OPTS;
-        *expect_legacy_token = true;
+        *out = (conn_profile_policy_t){ &CONN_SERVER_COMPAT_OPTS, true,
+                                        false, false, false, UINT32_MAX };
+        return true;
+    case WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT:
+        /* Bare token (shared with D13/14, so it validates and never
+         * selects); both markers; Origin required (draft-02 s3.3); and the
+         * conservative 0..255 outbound stream-error range. */
+        *out = (conn_profile_policy_t){ &CONN_SERVER_COMPAT_OPTS, true,
+                                        true, true, true, 255u };
         return true;
     }
     return false;
@@ -586,7 +738,9 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
     wtq_h3_wt_profile_set_t profiles = cfg->webtransport_profiles;
     if (profiles == 0) {
         if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
-            cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
+            cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT &&
+            cfg->webtransport_profile !=
+                WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT)
             return WTQ_ERR_INVALID_ARG;
         profiles = wtq_h3_wt_profile_bit(
             (wtq_h3_wt_profile_t)cfg->webtransport_profile);
@@ -613,15 +767,29 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
      * singleton in wtq_conn_client_connect, before start emits SETTINGS.
      */
     conn->wt_profiles = profiles;
+#ifdef WTQ_TESTING
+    {
+        static uint64_t led_next;
+        conn->led_conn_id = ++led_next;
+        /* Evidence-only: the harness names the exact page origin it will
+         * present. Absent -> semantic-only check. */
+        const char *eo = getenv("WTQ_EXPECT_ORIGIN");
+        conn->expect_origin = (eo != NULL && eo[0] != '\0') ? eo : NULL;
+        conn->expect_origin_len = conn->expect_origin ? strlen(eo) : 0;
+    }
+#endif
     /* Never carry an IGNORED singular into live state: when the set is
      * authoritative the incoming value may be out of range, so seed the
      * placeholder deterministically instead of casting it. Nothing reads
      * this before selection — profile_latched is the sole authority for
      * whether a selection exists. */
-    conn->wt_profile = (profiles == wtq_h3_wt_profile_bit(
-                                        WTQ_H3_WT_PROFILE_D13_14_COMPAT))
-                           ? WTQ_H3_WT_PROFILE_D13_14_COMPAT
-                           : WTQ_H3_WT_PROFILE_CURRENT;
+    if (profiles == wtq_h3_wt_profile_bit(WTQ_H3_WT_PROFILE_D13_14_COMPAT))
+        conn->wt_profile = WTQ_H3_WT_PROFILE_D13_14_COMPAT;
+    else if (profiles ==
+             wtq_h3_wt_profile_bit(WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT))
+        conn->wt_profile = WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT;
+    else
+        conn->wt_profile = WTQ_H3_WT_PROFILE_CURRENT;
     conn->profile_latched = false;
 
     *out = conn;
@@ -651,6 +819,8 @@ static wtq_result_t conn_open_locals(wtq_conn_t *conn)
      * the deterministic union BEFORE it can know the peer's choice — this is
      * capability advertisement, not selection. */
     wtq_h3_settings_encode_cfg_t scfg = { conn->ecp, conn->wt_profiles };
+    wtq_led("LOCAL_SETTINGS_CFG ecp=%d profiles=0x%llx", (int)conn->ecp,
+            (unsigned long long)conn->wt_profiles);
     size_t flen = 0;
 
     buf[0] = 0x00;
@@ -974,6 +1144,26 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                 } else {
                     conn->wt_supported = false;
                 }
+                wtq_led("PEER_SETTINGS ecp=%d/%llu dgram=%d/%llu "
+                        "leg_0x2b603742=%d/%llu d13_0x14e9cd29=%d/%llu "
+                        "d07_0xc671706a=%d/%llu cur_0x2c7cf000=%d/%llu "
+                        "unknown=%u",
+                        (int)s.has_enable_connect_protocol,
+                        (unsigned long long)s.enable_connect_protocol,
+                        (int)s.has_h3_datagram,
+                        (unsigned long long)s.h3_datagram,
+                        (int)s.has_enable_webtransport_leg,
+                        (unsigned long long)s.enable_webtransport_leg,
+                        (int)s.has_wt_max_sessions_d13,
+                        (unsigned long long)s.wt_max_sessions_d13,
+                        (int)s.has_wt_max_sessions_d07,
+                        (unsigned long long)s.wt_max_sessions_d07,
+                        (int)s.has_wt_enabled,
+                        (unsigned long long)s.wt_enabled,
+                        s.unknown_count);
+                wtq_led("LATCH supported=%d latched=%d profile=%d parked=%d",
+                        (int)conn->wt_supported, (int)conn->profile_latched,
+                        (int)conn->wt_profile, (int)(conn->parked_es != NULL));
                 if (conn->cb.on_peer_settings != NULL)
                     conn->cb.on_peer_settings(conn, conn->wt_supported,
                                               conn->cb.ctx);
@@ -1525,7 +1715,15 @@ static void server_send_response(wtq_conn_t *conn, wtq_dstream_t *ds,
     uint8_t section[WTQ_CONN_SETTINGS_CAP];
     size_t slen = 0;
 
-    if (wtq_connect_encode_response(status, selected, section,
+    bool emit_marker = false;
+    if (status >= 200 && status < 300 && conn->profile_latched) {
+        conn_profile_policy_t rp;
+        if (conn_connect_policy(conn->wt_profile, &rp))
+            emit_marker = rp.emit_d02_response_marker;
+    }
+    wtq_led("RESPONSE status=%u d02_response_marker=%d subproto=%d",
+            (unsigned)status, (int)emit_marker, (int)(selected != NULL));
+    if (wtq_connect_encode_response_ex(status, selected, emit_marker, section,
                                     sizeof(section), &slen) !=
         WTQ_CONNECT_OK) {
         conn_fatal(conn, WTQ_H3_INTERNAL_ERROR);
@@ -1581,6 +1779,31 @@ static void client_response_done(wtq_conn_t *conn, struct wtq_estream *es)
         if (conn->cb.on_session_rejected != NULL)
             conn->cb.on_session_rejected(conn, resp.status, conn->cb.ctx);
         return;
+    }
+
+    /*
+     * Axis 5, client half — the draft-02 s6 RESPONSE marker. Required on a
+     * SUCCESSFUL D02 response, checked BEFORE subprotocol validation and
+     * before establishment. Non-2xx keeps its own refusal path above and is
+     * never masked by marker validation. draft-02 defines no receiver rule,
+     * so this strictness is deliberate wtquic policy.
+     */
+    {
+        conn_profile_policy_t cpol;
+        memset(&cpol, 0, sizeof(cpol));
+        if (conn->profile_latched &&
+            conn_connect_policy(conn->wt_profile, &cpol) &&
+            cpol.emit_d02_response_marker) {
+            const bool ok = resp.has_d02_marker &&
+                            resp.d02_marker_len == 7 &&
+                            memcmp(resp.d02_marker, "draft02", 7) == 0;
+            wtq_led("CLIENT_RESP_MARKER present=%d len=%zu ok=%d",
+                    (int)resp.has_d02_marker, resp.d02_marker_len, (int)ok);
+            if (!ok) {
+                session_failed(conn, WTQ_SESSION_FAIL_BAD_RESPONSE);
+                return;
+            }
+        }
     }
 
     /* Subprotocol validation against our recorded offer. The selection is
@@ -1703,16 +1926,18 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
      * malformed/capacity, path and subprotocol distinctions are never
      * exposed while no profile exists. The connection stays live.
      */
-    const wtq_connect_opts_t *opts = NULL;
-    bool expect_legacy = false;
+    conn_profile_policy_t pol;
+    memset(&pol, 0, sizeof(pol));
     if (!conn->wt_supported || !conn->profile_latched ||
-        !conn_connect_policy(conn->wt_profile, &opts, &expect_legacy)) {
+        !conn_connect_policy(conn->wt_profile, &pol)) {
         server_send_response(conn, es->ds, 400, NULL);
         es->request_dead = true;
         return;
     }
 
     /* Latched: decode under THAT profile's policy from the central map. */
+    const wtq_connect_opts_t *opts = pol.opts;
+    const bool expect_legacy = pol.expect_legacy_token;
     wtq_connect_status_t st = wtq_connect_decode_request(
         es->set_buf, es->set_fill, opts, &req, offered,
         WTQ_CONN_MAX_OFFERED, &offered_count, scratch, sizeof(scratch));
@@ -1764,6 +1989,31 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
     }
 
     /* Path lookup (exact match). */
+    wtq_led("CONNECT token_legacy=%d expect_legacy=%d marker=%d marker_len=%zu "
+            "origin=%d origin_len=%zu offers=%zu",
+            (int)req.legacy_protocol, (int)expect_legacy,
+            (int)req.has_d02_marker, req.d02_marker_len,
+            (int)req.has_origin, req.origin_len, offered_count);
+    if (req.has_d02_marker)
+        wtq_led_bytes("MARKER_VALUE", req.d02_marker, req.d02_marker_len);
+    if (req.has_origin)
+        wtq_led_bytes("ORIGIN_VALUE", req.origin, req.origin_len);
+
+    /*
+     * Axis 4 — the draft-02 s6 request marker. draft-02 defines no
+     * receiver-side failure rule, so requiring exactly one field with the
+     * exact value "1" is deliberate wtquic policy. A wrong-but-valid value
+     * is a profile validation failure (generic 400); a DUPLICATE field is
+     * malformed syntax and already failed in the decoder.
+     */
+    if (pol.require_d02_request_marker &&
+        !(req.has_d02_marker && req.d02_marker_len == 1 &&
+          req.d02_marker[0] == '1')) {
+        server_send_response(conn, es->ds, 400, NULL);
+        es->request_dead = true;
+        return;
+    }
+
     size_t p = conn->path_count;
     for (size_t i = 0; i < conn->path_count; i++)
         if (conn->paths[i].path_len == req.path_len &&
@@ -1775,6 +2025,57 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         server_send_response(conn, es->ds, 404, NULL);
         es->request_dead = true;
         return;
+    }
+
+    /*
+     * Axis 7 — the draft-02 s3.3 Origin duty, enforced AFTER path lookup
+     * (the policy is per-path) and BEFORE subprotocol selection, any 2xx,
+     * and establishment. draft-02 s3.3 makes both halves unconditional
+     * MUSTs and defines no status; draft-16 s3.2 prescribes 403, which is
+     * what we use. One generic 403, no reason, revealing nothing.
+     */
+    if (pol.require_origin) {
+        bool ok = req.has_origin;
+#ifdef WTQ_TESTING
+        /*
+         * EVIDENCE FIXTURE VALIDATOR — deliberately NARROW. It validates
+         * only the fixture grammar this harness actually uses:
+         *   scheme "://" host ":" port      (no userinfo/path/query/
+         *                                    fragment/whitespace/controls)
+         * with a decimal port in 1..65535. It is NOT the production
+         * RFC 6454 / RFC 3986 parser planned for commit 4a, and must not
+         * be mistaken for one. Setup FAILS CLOSED when no expected origin
+         * is supplied.
+         */
+        const char *o = req.origin;
+        size_t on = req.origin_len;
+        bool sem = conn_origin_fixture_valid(o, on);
+        bool exact = sem && conn->expect_origin != NULL &&
+                     on == conn->expect_origin_len &&
+                     memcmp(o, conn->expect_origin, on) == 0;
+        /*
+         * When the harness names an expected origin, enforce byte-exact
+         * equality. When it does NOT, fall back to the PRODUCTION rule
+         * (presence) rather than refusing: WTQ_TESTING is defined for the
+         * whole library, so failing closed here would silently change
+         * behaviour for every other test binary. "Fail closed" belongs in
+         * the evidence server's own setup, which refuses to start without
+         * WTQ_EXPECT_ORIGIN.
+         */
+        ok = (conn->expect_origin != NULL) ? exact : req.has_origin;
+        wtq_led("ORIGIN_VERDICT present=%d semantic=%d exact=%d "
+                "expected_supplied=%d expected_len=%zu",
+                (int)req.has_origin, (int)sem, (int)exact,
+                (int)(conn->expect_origin != NULL), conn->expect_origin_len);
+        if (conn->expect_origin != NULL)
+            wtq_led_bytes("ORIGIN_EXPECTED", conn->expect_origin,
+                          conn->expect_origin_len);
+#endif
+        if (!ok) {
+            server_send_response(conn, es->ds, 403, NULL);
+            es->request_dead = true;
+            return;
+        }
     }
 
     /* Subprotocol selection: first client-offered supported one. */
@@ -1801,6 +2102,15 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         memcpy(conn->req_auth, req.authority, req.authority_len);
         conn->req_auth_len = req.authority_len;
     }
+#ifdef WTQ_TESTING
+    conn->req_origin_len = 0;
+    conn->req_has_origin = req.has_origin;
+    if (req.has_origin && req.origin_len <= sizeof(conn->req_origin)) {
+        memcpy(conn->req_origin, req.origin, req.origin_len);
+        conn->req_origin_len = req.origin_len;
+    }
+    conn->req_had_d02_marker = req.has_d02_marker;
+#endif
     server_send_response(conn, es->ds, 200, selected);
     if (!conn->closed)
         session_established(conn, es, selected ? selected->data : "",
@@ -1899,6 +2209,9 @@ static void session_capsule_bytes(wtq_conn_t *conn,
             }
             break;
         default:
+            wtq_led("CAPSULE_UNKNOWN type=0x%llx len=%llu skipped=1",
+                    (unsigned long long)cap.type,
+                    (unsigned long long)cap.length);
             break; /* unknown capsules: payload already skipped */
         }
     }
@@ -2139,7 +2452,8 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
     if (conn->closed || conn->sess_state != SS_IDLE)
         return WTQ_ERR_STATE;
     if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
-        cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
+        cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT &&
+        cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT)
         return WTQ_ERR_INVALID_ARG;
     /*
      * The requested profile stays LOCAL through preflight — it is
@@ -2191,7 +2505,22 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
 
     /* The REQUESTED profile (still local — not yet committed) selects
      * the extended-CONNECT :protocol token and the readback options. */
-    const bool compat = req_profile == WTQ_H3_WT_PROFILE_D13_14_COMPAT;
+    conn_profile_policy_t rpol;
+    memset(&rpol, 0, sizeof(rpol));
+    if (!conn_connect_policy(req_profile, &rpol))
+        return WTQ_ERR_INVALID_ARG;
+    /*
+     * PREFLIGHT, zero-effect: a D02 client MUST provide an Origin
+     * (draft-02 s3.3). Validated with the bounded evidence helper before
+     * any connection state changes or any I/O.
+     */
+    if (rpol.require_origin) {
+        if (cfg->origin == NULL || cfg->origin[0] == '\0')
+            return WTQ_ERR_INVALID_ARG;
+        if (!conn_origin_fixture_valid(cfg->origin, strlen(cfg->origin)))
+            return WTQ_ERR_INVALID_ARG;
+    }
+    const bool compat = rpol.expect_legacy_token;
     const char *proto_tok = compat ? WTQ_CONNECT_PROTOCOL_TOKEN_LEGACY
                                    : WTQ_CONNECT_PROTOCOL_TOKEN;
     const size_t proto_tok_len =
@@ -2200,12 +2529,12 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
 
     uint8_t section[sizeof(conn->connect_section)];
     size_t slen = 0;
-    wtq_connect_status_t st = wtq_connect_encode_request_ex(
+    wtq_connect_status_t st = wtq_connect_encode_request_d02(
         cfg->authority, strlen(cfg->authority), cfg->path,
         strlen(cfg->path), cfg->origin,
         cfg->origin != NULL ? strlen(cfg->origin) : 0, offer_spans,
-        cfg->protocol_count, proto_tok, proto_tok_len, section,
-        sizeof(section), &slen);
+        cfg->protocol_count, proto_tok, proto_tok_len,
+        rpol.require_d02_request_marker, section, sizeof(section), &slen);
     if (st == WTQ_CONNECT_BUFFER)
         return WTQ_ERR_TOO_LARGE;
     if (st != WTQ_CONNECT_OK)
@@ -2620,28 +2949,57 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
     return WTQ_OK;
 }
 
+/*
+ * Axis 6 — the ONE profile-aware outbound application-error conversion.
+ * D02/RFC9297 may send only 0..255 (the common subset both stable
+ * browsers decode); CURRENT and D13/14 keep the full 32-bit range. All
+ * three stream paths funnel through here, so the cap has a single home.
+ * Rejection is synchronous and mutation-free: the caller returns before
+ * any stream state changes.
+ */
+static bool conn_app_error_to_h3(const wtq_conn_t *conn, uint32_t app_code,
+                                 uint64_t *wire_out)
+{
+    if (conn->profile_latched) {
+        conn_profile_policy_t pol;
+        if (conn_connect_policy(conn->wt_profile, &pol) &&
+            app_code > pol.max_outbound_app_error)
+            return false;
+    }
+    *wire_out = wtq_app_error_to_h3(app_code);
+    return true;
+}
+
 wtq_result_t wtq_conn_wt_reset(wtq_conn_t *conn, wtq_estream_t *es,
                                uint32_t app_code)
 {
+    uint64_t wire = 0;
+    if (!conn_app_error_to_h3(conn, app_code, &wire))
+        return WTQ_ERR_INVALID_ARG;
     wtq_shutdown_t req = { .mode = WTQ_SHUTDOWN_EXACT_HALVES,
                            .abort_send = true,
-                           .send_err = wtq_app_error_to_h3(app_code) };
+                           .send_err = wire };
     return wtq_conn_wt_shutdown(conn, es, &req);
 }
 
 wtq_result_t wtq_conn_wt_stop(wtq_conn_t *conn, wtq_estream_t *es,
                               uint32_t app_code)
 {
+    uint64_t wire = 0;
+    if (!conn_app_error_to_h3(conn, app_code, &wire))
+        return WTQ_ERR_INVALID_ARG;
     wtq_shutdown_t req = { .mode = WTQ_SHUTDOWN_EXACT_HALVES,
                            .abort_recv = true,
-                           .recv_err = wtq_app_error_to_h3(app_code) };
+                           .recv_err = wire };
     return wtq_conn_wt_shutdown(conn, es, &req);
 }
 
 wtq_result_t wtq_conn_wt_abort(wtq_conn_t *conn, wtq_estream_t *es,
                                uint32_t app_code)
 {
-    uint64_t code = wtq_app_error_to_h3(app_code);
+    uint64_t code = 0;
+    if (!conn_app_error_to_h3(conn, app_code, &code))
+        return WTQ_ERR_INVALID_ARG;
     wtq_shutdown_t req = { .mode = WTQ_SHUTDOWN_WHOLE_STREAM,
                            .send_err = code,
                            .recv_err = code };

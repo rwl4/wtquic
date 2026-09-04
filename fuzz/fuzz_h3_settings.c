@@ -45,10 +45,46 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             set |= WTQ_H3_WT_PROFILES_D13_14_COMPAT;
         if (s.has_wt_enabled)
             set |= WTQ_H3_WT_PROFILES_CURRENT;
-        /* Load-bearing: a D07-only (or Chrome/D02-only) decode must leave
-         * the supported set empty, so it can never select or advertise a
-         * supported profile. */
-        if (!s.has_wt_max_sessions_d13 && !s.has_wt_enabled && set != 0)
+        /* D02/RFC9297 steering: the exact draft-02 signal at value 1 AND
+         * RFC 9297 H3_DATAGRAM at 1, matching the production predicate.
+         * Value 0, a missing 0x33, D07-only and 0xffd277-only never steer
+         * D02. */
+        if (s.has_enable_webtransport_leg && s.enable_webtransport_leg == 1 &&
+            s.has_h3_datagram && s.h3_datagram == 1)
+            set |= WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT;
+        /* Load-bearing: a decode carrying NO supported signal must leave the
+         * set empty, so it can never select or advertise a profile. D07
+         * (0xc671706a) is receive-only and is never a member. */
+        if (!s.has_wt_max_sessions_d13 && !s.has_wt_enabled &&
+            !(s.has_enable_webtransport_leg &&
+              s.enable_webtransport_leg == 1 && s.has_h3_datagram &&
+              s.h3_datagram == 1) &&
+            set != 0)
+            abort();
+        /*
+         * CROSS-CHECK the oracle's own membership against the PRODUCTION
+         * selector, so the oracle cannot drift from the implementation it
+         * is meant to police. If production would select D02 from this
+         * decode, the oracle's set must contain D02, and vice versa.
+         */
+        {
+            wtq_h3_wt_profile_t psel;
+            const bool prod_d02 = wtq_h3_settings_select_profile(
+                &s, false, WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, &psel);
+            const bool oracle_d02 =
+                (set & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) != 0;
+            if (prod_d02 != oracle_d02)
+                abort();
+            if (prod_d02 && psel != WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT)
+                abort();
+        }
+        /* D02 must never be steered by value 0 or without RFC 9297. */
+        if ((set & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) &&
+            !(s.has_enable_webtransport_leg &&
+              s.enable_webtransport_leg == 1))
+            abort();
+        if ((set & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) &&
+            !(s.has_h3_datagram && s.h3_datagram == 1))
             abort();
         if (s.has_wt_max_sessions_d07 &&
             (set & WTQ_H3_WT_PROFILES_D13_14_COMPAT) &&
@@ -80,6 +116,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         wtq_h3_wt_profile_set_t want = set ? set : WTQ_H3_WT_PROFILES_CURRENT;
         bool want_d13 = (want & WTQ_H3_WT_PROFILES_D13_14_COMPAT) != 0;
         bool want_cur = (want & WTQ_H3_WT_PROFILES_CURRENT) != 0;
+        bool want_d02 =
+            (want & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) != 0;
         if (s2.has_wt_max_sessions_d13 != want_d13)
             abort();
         if (want_d13 && s2.wt_max_sessions_d13 != 1)
@@ -88,7 +126,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             abort();
         if (want_cur && s2.wt_enabled != 1)
             abort();
+        if (s2.has_enable_webtransport_leg != want_d02)
+            abort();
+        if (want_d02 && s2.enable_webtransport_leg != 1)
+            abort();
+        /* D07 (0xc671706a) is NEVER emitted. */
         if (s2.has_wt_max_sessions_d07)
+            abort();
+        /* Local RFC 9297 0x33 is always emitted; legacy 0xffd277 never is
+         * (an unknown setting on decode is counted, not recognised). */
+        if (!s2.has_h3_datagram || s2.h3_datagram != 1)
             abort();
         if (s2.has_enable_connect_protocol != cfg.enable_connect_protocol)
             abort();
@@ -101,6 +148,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 abort();
             if (wtq_h3_wt_profile_bit(sel) == 0 ||
                 (wtq_h3_wt_profile_bit(sel) & want) == 0)
+                abort();
+            /* Precedence: CURRENT > D13/14 > D02. */
+            if (want_cur && sel != WTQ_H3_WT_PROFILE_CURRENT)
+                abort();
+            if (!want_cur && want_d13 &&
+                sel != WTQ_H3_WT_PROFILE_D13_14_COMPAT)
+                abort();
+            if (!want_cur && !want_d13 && want_d02 &&
+                sel != WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT)
                 abort();
             /* CURRENT outranks D13/14 whenever both were advertised. */
             if (want_cur && sel != WTQ_H3_WT_PROFILE_CURRENT)

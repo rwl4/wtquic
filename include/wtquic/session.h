@@ -223,7 +223,8 @@ WTQ_API void wtq_session_events_init(wtq_session_events_t *events);
  * profile, the session simply does not establish. Zero-initialised and
  * older callers get WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT, exactly as before.
  *
- * These two profiles are the only ones wtquic implements. They do NOT
+ * wtquic implements THREE profiles. H3_CURRENT and H3_DRAFT_13_14_COMPAT do
+ * NOT
  * provide stock-browser compatibility (see COMPATIBILITY.md).
  */
 typedef enum wtq_webtransport_profile {
@@ -246,7 +247,21 @@ typedef enum wtq_webtransport_profile {
      * capsule-based WebTransport; this profile is safe only because it is
      * EXPLICIT and paired with the historical H3 SETTINGS dialect above.
      */
-    WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT = 1
+    WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT = 1,
+    /*
+     * draft-02 WebTransport signaling and the 8-bit outbound stream-error
+     * contract, carried over RFC 9297 datagrams. Live interoperability is
+     * proven against exact Google Chrome 152.0.7977.66; Firefox 155 is
+     * source-coherent only, with no live exact-binary row yet, and no
+     * Safari claim is made. Deliberately NOT byte-faithful draft-02/-05:
+     * the legacy datagram codepoint 0xffd277 is never EMITTED, and an
+     * incoming 0xffd277 may be observed as an unknown/ignored setting but
+     * never counts as D02 support. No datagram context/registration is
+     * used, and D07 0xc671706a is never emitted. Selection comes from peer
+     * SETTINGS only, an Origin is required, and there is no heuristic
+     * fallback.
+     */
+    WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT = 2
 } wtq_webtransport_profile_t;
 
 /*
@@ -266,10 +281,13 @@ typedef uint64_t wtq_webtransport_profile_set_t;
     UINT64_C(0x1)
 #define WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT \
     UINT64_C(0x2)
+#define WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT \
+    UINT64_C(0x4)
 /* Every profile this build knows. */
 #define WTQ_WEBTRANSPORT_PROFILES_ALL                                     \
     (WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |                               \
-     WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT)
+     WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT |                    \
+     WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT)
 
 /*
  * The profile this session actually selected.

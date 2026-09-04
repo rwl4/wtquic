@@ -4,7 +4,7 @@
  * These strict parsers are TEST-ONLY and deliberately do NOT call
  * wtquic's production CONNECT or SETTINGS decoders. They walk the raw
  * wire bytes with a self-contained QUIC varint reader and classify a
- * payload into exactly one of the two supported profiles (or neither),
+ * payload into exactly one of the three supported profiles (or none),
  * proving that:
  *   - the current profile is webtransport-h3 + WT_ENABLED only;
  *   - the D13/14 compat profile is webtransport + WT_MAX_SESSIONS
@@ -25,6 +25,7 @@
 #include <wtquic/error.h>
 
 #include "proto/connect.h"
+#include "proto/qpack_static.h"
 #include "proto/h3_settings.h"
 #include "proto/preamble.h"
 #include "proto/varint.h"
@@ -154,7 +155,11 @@ static bool tp_settings_is_union(const uint8_t *p, size_t len)
         return false;
     if (!(s.wt_enabled && s.wt_enabled_n == 1 && s.wt_enabled_v == 1))
         return false;
-    return !s.max07 && !s.enable_wt;
+    /* The union now offers three generations; the D02 signal is present
+     * exactly once with value 1. D07 0xc671706a still never appears. */
+    if (!(s.enable_wt && s.enable_wt_n == 1 && s.enable_wt_v == 1))
+        return false;
+    return !s.max07;
 }
 
 /* Strict CURRENT SETTINGS: WT_ENABLED==1 present, and NO other-profile
@@ -366,6 +371,7 @@ static void test_settings_union_parser(int *fp)
     const uint8_t ok[] = {
         0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
         0x94, 0xe9, 0xcd, 0x29, 0x01,       /* 0x14e9cd29 = 1 */
+        0xab, 0x60, 0x37, 0x42, 0x01,       /* 0x2b603742 = 1 */
         0xac, 0x7c, 0xf0, 0x00, 0x01,       /* 0x2c7cf000 = 1 */
     };
     WTQ_TEST_CHECK(tp_settings_is_union(ok, sizeof(ok)));
@@ -425,16 +431,16 @@ static void test_settings_union_parser(int *fp)
     };
     WTQ_TEST_CHECK(!tp_settings_is_union(with_d07, sizeof(with_d07)));
 
-    /* FOREIGN generation present: Chrome/D02 ENABLE_WEBTRANSPORT
-     * (0x2b603742). Placed in ascending position so ORDER is not what
-     * rejects it — the foreign-signal rule is. */
-    const uint8_t with_d02[] = {
+    /* missing member: the D02/RFC9297 signal dropped. 0x2b603742 is now a
+     * UNION MEMBER, not a foreign generation — the foreign-signal rule is
+     * carried by D07 (0xc671706a), asserted separately. */
+    const uint8_t miss_d02[] = {
         0x01, 0x00, 0x07, 0x00, 0x08, 0x01, 0x33, 0x01,
         0x94, 0xe9, 0xcd, 0x29, 0x01,
-        0xab, 0x60, 0x37, 0x42, 0x01,       /* 0x2b603742 = 1 */
         0xac, 0x7c, 0xf0, 0x00, 0x01,
     };
-    WTQ_TEST_CHECK(!tp_settings_is_union(with_d02, sizeof(with_d02)));
+    WTQ_TEST_CHECK(!tp_settings_is_union(miss_d02, sizeof(miss_d02)));
+
 
     /* SHARED BASE broken: H3_DATAGRAM missing */
     const uint8_t no_dgram[] = {
@@ -554,8 +560,9 @@ static void test_connect_token_parsers(int *fp)
 }
 
 /*
- * The explicit PROFILE TABLE (checkpoint blocker #4). The two profiles
- * differ on exactly three axes and are identical on every other; this
+ * The explicit PROFILE TABLE. The three profiles
+ * differ on exactly seven profile-semantic axes and are identical on
+ * every other; this
  * test pins both directions. The engine reads the profile in exactly
  * three places (SETTINGS encode, CONNECT token, peer-SETTINGS
  * predicate); the WT data/error plane below takes no profile argument
@@ -564,7 +571,7 @@ static void test_connect_token_parsers(int *fp)
 /* AXIS_SPECIFIC: differs by profile (and this test pins the difference).
  * AXIS_WITNESSED: identical in both, with a runtime byte-witness below.
  * AXIS_STRUCTURAL: identical in both by CONSTRUCTION — the engine reads
- *   the profile in exactly the three SPECIFIC sites and these
+ *   the profile in exactly the seven SPECIFIC axes and these
  *   control-plane paths have no profile branch; not runtime-witnessed
  *   here (they need the full engine/transport), so the claim is
  *   structural, not tested-identical. */
@@ -578,6 +585,10 @@ static const struct axis PROFILE_TABLE[] = {
     { "extended-CONNECT :protocol token", AXIS_SPECIFIC },
     { "outgoing WT SETTINGS signal",      AXIS_SPECIFIC },
     { "peer-SETTINGS WT predicate",       AXIS_SPECIFIC },
+    { "D02 CONNECT request marker",       AXIS_SPECIFIC },
+    { "D02 CONNECT response marker",      AXIS_SPECIFIC },
+    { "outbound app error-code cap",      AXIS_SPECIFIC },
+    { "D02 Origin presence requirement",  AXIS_SPECIFIC },
     /* identical in both, runtime-witnessed below */
     { "uni/bidi association preambles",   AXIS_WITNESSED },
     { "quarter-stream-ID datagram prefix", AXIS_WITNESSED },
@@ -587,13 +598,210 @@ static const struct axis PROFILE_TABLE[] = {
     { "CLOSE / DRAIN / session teardown", AXIS_STRUCTURAL },
 };
 
+
+/* ---- independent oracle for the two D02 CONNECT markers ------------- */
+/*
+ * A test-only QPACK field-section reader. It decodes only the literal
+ * never-indexed / literal-with-literal-name forms this engine emits, so it
+ * is genuinely independent of the production decoder: the production
+ * encoder is checked against THIS, not against its own decoder.
+ */
+/*
+ * Byte-pattern oracle over an encoded field section. It locates the literal
+ * field NAME in the emitted bytes and reads the value-length prefix that
+ * immediately follows, without calling the production decoder at all — so
+ * the production encoder is validated against an independent reader rather
+ * than against its own parser.
+ */
+static bool tp_qpack_find(const uint8_t *p, size_t len, const char *name,
+                          size_t name_len, const uint8_t **val_out,
+                          size_t *val_len_out, unsigned *count_out)
+{
+    unsigned found = 0;
+    for (size_t i = 0; i + name_len + 1 <= len; i++) {
+        if (memcmp(p + i, name, name_len) != 0)
+            continue;
+        /* A longer name containing this one as a prefix is a different
+         * field: require the following byte to be a value-length prefix,
+         * not more name text. */
+        const size_t vi = i + name_len;
+        if (vi >= len)
+            break;
+        const uint8_t vb = p[vi];
+        if ((vb & 0x80) != 0)
+            continue;                    /* Huffman value: not emitted here */
+        const size_t vl = (size_t)(vb & 0x7f);
+        if (vl == 0x7f || vi + 1 + vl > len)
+            continue;
+        found++;
+        if (val_out) *val_out = p + vi + 1;
+        if (val_len_out) *val_len_out = vl;
+    }
+    if (count_out) *count_out = found;
+    return true;
+}
+
+/*
+ * The two markers, checked by the independent reader: the REQUEST name
+ * carries the version, the RESPONSE name does not and carries it in the
+ * value. Emitted exactly once for D02 and never for CURRENT or D13/14.
+ */
+static void test_d02_marker_oracle(int *fp)
+{
+    int failures = 0;
+    static const char REQ_NAME[] = "sec-webtransport-http3-draft02";
+    static const char RSP_NAME[] = "sec-webtransport-http3-draft";
+    uint8_t buf[512];
+    size_t n = 0;
+    const uint8_t *v = NULL;
+    size_t vl = 0;
+    unsigned cnt = 0;
+
+    /* the two names must be DISTINCT (a unified name is a bug) */
+    WTQ_TEST_CHECK(sizeof(REQ_NAME) != sizeof(RSP_NAME));
+    WTQ_TEST_CHECK(memcmp(REQ_NAME, RSP_NAME, sizeof(RSP_NAME) - 1) == 0);
+
+    /* D02 request: exactly one marker whose value is "1" */
+    WTQ_TEST_CHECK(wtq_connect_encode_request_d02(
+        "example.com", 11, "/moq", 4, "https://example.com:443", 23, NULL, 0,
+        "webtransport", 12, true, buf, sizeof(buf), &n) == WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK(tp_qpack_find(buf, n, REQ_NAME, sizeof(REQ_NAME) - 1, &v,
+                                 &vl, &cnt));
+    WTQ_TEST_CHECK_EQ_INT((int)cnt, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(vl, 1);
+    WTQ_TEST_CHECK(vl == 1 && v[0] == '1');
+
+    /* CURRENT / D13-14 request: the marker must be ABSENT */
+    WTQ_TEST_CHECK(wtq_connect_encode_request_d02(
+        "example.com", 11, "/moq", 4, NULL, 0, NULL, 0,
+        "webtransport-h3", 15, false, buf, sizeof(buf), &n) ==
+        WTQ_CONNECT_OK);
+    cnt = 99;
+    WTQ_TEST_CHECK(tp_qpack_find(buf, n, REQ_NAME, sizeof(REQ_NAME) - 1, NULL,
+                                 NULL, &cnt));
+    WTQ_TEST_CHECK_EQ_INT((int)cnt, 0);
+
+    /* D02 success response: exactly one marker whose value is "draft02" */
+    wtq_sf_str_t sel = { "moqt-18", 7 };
+    WTQ_TEST_CHECK(wtq_connect_encode_response_ex(200, &sel, true, buf,
+                                                  sizeof(buf), &n) ==
+                   WTQ_CONNECT_OK);
+    v = NULL; vl = 0; cnt = 0;
+    WTQ_TEST_CHECK(tp_qpack_find(buf, n, RSP_NAME, sizeof(RSP_NAME) - 1, &v,
+                                 &vl, &cnt));
+    WTQ_TEST_CHECK_EQ_INT((int)cnt, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(vl, 7);
+    WTQ_TEST_CHECK(vl == 7 && memcmp(v, "draft02", 7) == 0);
+    /* and the REQUEST name never appears in a response */
+    cnt = 99;
+    WTQ_TEST_CHECK(tp_qpack_find(buf, n, REQ_NAME, sizeof(REQ_NAME) - 1, NULL,
+                                 NULL, &cnt));
+    WTQ_TEST_CHECK_EQ_INT((int)cnt, 0);
+
+    /* non-D02 response: no marker at all */
+    WTQ_TEST_CHECK(wtq_connect_encode_response_ex(200, &sel, false, buf,
+                                                  sizeof(buf), &n) ==
+                   WTQ_CONNECT_OK);
+    cnt = 99;
+    WTQ_TEST_CHECK(tp_qpack_find(buf, n, RSP_NAME, sizeof(RSP_NAME) - 1, NULL,
+                                 NULL, &cnt));
+    WTQ_TEST_CHECK_EQ_INT((int)cnt, 0);
+
+    *fp += failures;
+}
+
+
+/*
+ * Response-marker classification through the PRODUCTION decoder: a
+ * singleton is surfaced with its exact value, a duplicate is malformed
+ * message syntax, and absence is reported as absence (the engine, not the
+ * decoder, decides whether absence is fatal for D02).
+ */
+static void test_d02_response_marker_faults(int *fp)
+{
+    int failures = 0;
+    static const char RSP_NAME[] = "sec-webtransport-http3-draft";
+    uint8_t buf[512];
+    size_t n = 0;
+    char scratch[512];
+    wtq_connect_resp_t resp;
+    static const wtq_connect_opts_t OPTS = { false, false };
+    wtq_sf_str_t sel = { "moqt-18", 7 };
+
+    /* present exactly once, value "draft02" */
+    WTQ_TEST_CHECK(wtq_connect_encode_response_ex(200, &sel, true, buf,
+                                                  sizeof(buf), &n) ==
+                   WTQ_CONNECT_OK);
+    memset(&resp, 0, sizeof(resp));
+    WTQ_TEST_CHECK(wtq_connect_decode_response(buf, n, &OPTS, &resp, scratch,
+                                               sizeof(scratch)) ==
+                   WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK(resp.has_d02_marker);
+    WTQ_TEST_CHECK_EQ_SIZE(resp.d02_marker_len, 7);
+    WTQ_TEST_CHECK(resp.d02_marker_len == 7 &&
+                   memcmp(resp.d02_marker, "draft02", 7) == 0);
+
+    /* absent: decoded fine, reported absent */
+    WTQ_TEST_CHECK(wtq_connect_encode_response_ex(200, &sel, false, buf,
+                                                  sizeof(buf), &n) ==
+                   WTQ_CONNECT_OK);
+    memset(&resp, 0, sizeof(resp));
+    WTQ_TEST_CHECK(wtq_connect_decode_response(buf, n, &OPTS, &resp, scratch,
+                                               sizeof(scratch)) ==
+                   WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK(!resp.has_d02_marker);
+    WTQ_TEST_CHECK_EQ_SIZE(resp.d02_marker_len, 0);
+
+    /* DUPLICATE singleton: malformed message syntax, not a policy verdict */
+    {
+        wtq_qpack_field_t f[3];
+        size_t fn = 0;
+        f[fn++] = (wtq_qpack_field_t){ ":status", 7, "200", 3, false };
+        f[fn++] = (wtq_qpack_field_t){ RSP_NAME, sizeof(RSP_NAME) - 1,
+                                       "draft02", 7, false };
+        f[fn++] = (wtq_qpack_field_t){ RSP_NAME, sizeof(RSP_NAME) - 1,
+                                       "draft02", 7, false };
+        WTQ_TEST_CHECK(wtq_qpack_encode_section(f, fn, buf, sizeof(buf),
+                                                &n) == WTQ_QPACK_OK);
+        memset(&resp, 0, sizeof(resp));
+        WTQ_TEST_CHECK(wtq_connect_decode_response(buf, n, &OPTS, &resp,
+                                                   scratch, sizeof(scratch)) ==
+                       WTQ_CONNECT_MALFORMED);
+    }
+
+    /* WRONG value: surfaced verbatim so the engine can reject it */
+    {
+        wtq_qpack_field_t f[2];
+        size_t fn = 0;
+        f[fn++] = (wtq_qpack_field_t){ ":status", 7, "200", 3, false };
+        f[fn++] = (wtq_qpack_field_t){ RSP_NAME, sizeof(RSP_NAME) - 1,
+                                       "draft07", 7, false };
+        WTQ_TEST_CHECK(wtq_qpack_encode_section(f, fn, buf, sizeof(buf),
+                                                &n) == WTQ_QPACK_OK);
+        memset(&resp, 0, sizeof(resp));
+        WTQ_TEST_CHECK(wtq_connect_decode_response(buf, n, &OPTS, &resp,
+                                                   scratch, sizeof(scratch)) ==
+                       WTQ_CONNECT_OK);
+        WTQ_TEST_CHECK(resp.has_d02_marker);
+        WTQ_TEST_CHECK(resp.d02_marker_len == 7 &&
+                       memcmp(resp.d02_marker, "draft07", 7) != 0 ? false
+                       : true);
+        WTQ_TEST_CHECK(!(resp.d02_marker_len == 7 &&
+                         memcmp(resp.d02_marker, "draft02", 7) == 0));
+    }
+
+    *fp += failures;
+}
+
 static void test_profile_table(int *fp)
 {
     int failures = 0;
     uint8_t a[128], b[128];
     size_t na = 0, nb = 0;
 
-    /* exactly three profile-specific axes; the rest shared. */
+    /* Exactly SEVEN profile-semantic axes; the rest shared. This table is
+     * a MANUALLY AUDITED semantic inventory, not a source-level proof of
+     * branch count — every concrete profile read must map onto these. */
     size_t n_axes = sizeof(PROFILE_TABLE) / sizeof(PROFILE_TABLE[0]);
     int n_specific = 0, n_witnessed = 0, n_structural = 0;
     for (size_t i = 0; i < n_axes; i++) {
@@ -604,7 +812,7 @@ static void test_profile_table(int *fp)
         case AXIS_STRUCTURAL: n_structural++; break;
         }
     }
-    WTQ_TEST_CHECK_EQ_INT(n_specific, 3);
+    WTQ_TEST_CHECK_EQ_INT(n_specific, 7);
     WTQ_TEST_CHECK_EQ_INT(n_witnessed, 3);
     WTQ_TEST_CHECK_EQ_INT(n_structural, 2);
 
@@ -700,6 +908,8 @@ int main(void)
     test_settings_union_parser(&failures);
     test_connect_token_parsers(&failures);
     test_profile_table(&failures);
+    test_d02_marker_oracle(&failures);
+    test_d02_response_marker_faults(&failures);
     WTQ_TEST_PASS("test_profile_parsers");
     return failures;
 }

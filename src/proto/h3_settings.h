@@ -118,7 +118,13 @@ typedef enum wtq_h3_wt_profile {
     WTQ_H3_WT_PROFILE_CURRENT = 0,
     /* drafts 13/14 compat: SETTINGS_WT_MAX_SESSIONS (0x14e9cd29) = 1.
      * NOT the D07 codepoint (0xc671706a), NOT WT_ENABLED, no flow control. */
-    WTQ_H3_WT_PROFILE_D13_14_COMPAT = 1
+    WTQ_H3_WT_PROFILE_D13_14_COMPAT = 1,
+    /* drafts 00-03 WebTransport signaling (ENABLE_WEBTRANSPORT 0x2b603742
+     * = exactly 1) carried over RFC 9297 datagrams (H3_DATAGRAM 0x33 = 1).
+     * NOT byte-faithful draft-02/-05: draft-02 references
+     * masque-h3-datagram-05 (0xffd277, optional Context ID), which this
+     * profile deliberately neither emits nor accepts. */
+    WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT = 2
 } wtq_h3_wt_profile_t;
 
 /*
@@ -135,15 +141,17 @@ typedef uint64_t wtq_h3_wt_profile_set_t;
 
 #define WTQ_H3_WT_PROFILES_CURRENT       UINT64_C(0x1)
 #define WTQ_H3_WT_PROFILES_D13_14_COMPAT UINT64_C(0x2)
+#define WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT UINT64_C(0x4)
 
 /* Every profile this build knows — the validity mask for a caller's set. */
 #define WTQ_H3_WT_PROFILES_ALL \
-    (WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT)
+    (WTQ_H3_WT_PROFILES_CURRENT | WTQ_H3_WT_PROFILES_D13_14_COMPAT | \
+     WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT)
 
 /* How many profiles this build knows: the upper bound on WT settings in
  * one advertisement. The precedence table's length is static-asserted
  * against it, so the two cannot drift. */
-#define WTQ_H3_WT_PROFILE_COUNT 2
+#define WTQ_H3_WT_PROFILE_COUNT 3
 
 /* The one-bit set for a single profile, or 0 for an unknown value. Total
  * by construction — no shift, so no undefined behaviour. */
@@ -155,6 +163,8 @@ wtq_h3_wt_profile_bit(wtq_h3_wt_profile_t profile)
         return WTQ_H3_WT_PROFILES_CURRENT;
     case WTQ_H3_WT_PROFILE_D13_14_COMPAT:
         return WTQ_H3_WT_PROFILES_D13_14_COMPAT;
+    case WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT:
+        return WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT;
     }
     return 0;
 }

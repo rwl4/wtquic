@@ -166,6 +166,7 @@ static void on_wt_reset(wtq_conn_t *conn, wtq_estream_t *es,
     (void)conn;
     (void)es;
     side->wt_reset_events++;
+    side->last_wt_reset_code = app_code;
     trace(side->sp, "e side=%c wtreset code=%u\n", side->label,
           (unsigned)app_code);
 }
@@ -178,6 +179,7 @@ static void on_wt_stop(wtq_conn_t *conn, wtq_estream_t *es,
     (void)conn;
     (void)es;
     side->wt_stop_events++;
+    side->last_wt_stop_code = app_code;
     trace(side->sp, "e side=%c wtstop code=%u\n", side->label,
           (unsigned)app_code);
 }

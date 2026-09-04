@@ -100,7 +100,16 @@ typedef struct setting_pair {
     uint64_t value;
 } setting_pair_t;
 
+static void rig_up_profiles(rig_t *r, wtq_perspective_t persp,
+                            wtq_h3_wt_profile_set_t set, int *fp);
+
 static void rig_up(rig_t *r, wtq_perspective_t persp, int *fp)
+{
+    rig_up_profiles(r, persp, 0, fp);
+}
+
+static void rig_up_profiles(rig_t *r, wtq_perspective_t persp,
+                            wtq_h3_wt_profile_set_t set, int *fp)
 {
     int failures = 0;
 
@@ -111,6 +120,7 @@ static void rig_up(rig_t *r, wtq_perspective_t persp, int *fp)
         .alloc = wtq_alloc_default(),
         .perspective = persp,
         .enable_connect_protocol = true,
+        .webtransport_profiles = set,
         .callbacks = { .on_peer_settings = cb_settings,
                        .on_conn_error = cb_error,
                        .on_session_established = cb_established,
@@ -3405,6 +3415,120 @@ static void test_subprotocol_malformed_content(int *fp)
     *fp += failures;
 }
 
+/* ---- D02 marker policy, causal at the ENGINE (0014e finding F) ------- */
+
+#define CD02 WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT
+static const char *const D02_ORG = "https://example.com:443";
+
+/*
+ * Build a D02 CONNECT request with a controlled marker. `marker_mode`:
+ *   0 = exactly one correct marker, 1 = absent, 2 = wrong value,
+ *   3 = duplicated. The production encoder is used for everything else;
+ *   only the marker fields are placed deliberately.
+ */
+static size_t build_d02_request(uint8_t *dst, size_t cap, int marker_mode,
+                                bool with_origin)
+{
+    static const char MK[] = "sec-webtransport-http3-draft02";
+    wtq_qpack_field_t f[9];
+    size_t n = 0;
+    f[n++] = (wtq_qpack_field_t){ ":method", 7, "CONNECT", 7, false };
+    f[n++] = (wtq_qpack_field_t){ ":scheme", 7, "https", 5, false };
+    f[n++] = (wtq_qpack_field_t){ ":authority", 10, "example.com", 11,
+                                  false };
+    f[n++] = (wtq_qpack_field_t){ ":path", 5, "/moq", 4, false };
+    f[n++] = (wtq_qpack_field_t){ ":protocol", 9, "webtransport", 12,
+                                  false };
+    if (with_origin)
+        f[n++] = (wtq_qpack_field_t){ "origin", 6, D02_ORG,
+                                      sizeof(D02_ORG) - 1, false };
+    if (marker_mode == 0 || marker_mode == 3)
+        f[n++] = (wtq_qpack_field_t){ MK, sizeof(MK) - 1, "1", 1, false };
+    if (marker_mode == 2)
+        f[n++] = (wtq_qpack_field_t){ MK, sizeof(MK) - 1, "0", 1, false };
+    if (marker_mode == 3)
+        f[n++] = (wtq_qpack_field_t){ MK, sizeof(MK) - 1, "1", 1, false };
+
+    uint8_t section[512];
+    size_t slen = 0;
+    if (wtq_qpack_encode_section(f, n, section, sizeof(section), &slen) !=
+        WTQ_QPACK_OK)
+        return 0;
+    size_t hl = 0;
+    if (wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, slen, dst, cap,
+                                   &hl) != 0)
+        return 0;
+    memcpy(dst + hl, section, slen);
+    return hl + slen;
+}
+
+/* Deliver peer SETTINGS that steer D02: 0x2b603742=1 plus RFC 9297 0x33=1. */
+static void deliver_d02_peer_settings(rig_t *r, int *fp)
+{
+    const setting_pair_t s[] = {
+        { WTQ_H3_SET_ENABLE_WEBTRANSPORT_LEG, 1 },
+        { WTQ_H3_SET_H3_DATAGRAM, 1 },
+    };
+    deliver_peer_settings_pairs(r, s, sizeof(s) / sizeof(s[0]), fp);
+}
+
+static void server_d02_up(rig_t *r, int *fp)
+{
+    int failures = 0;
+    rig_up_profiles(r, WTQ_PERSPECTIVE_SERVER,
+                    WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false };
+    WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
+    *fp += failures;
+}
+
+static void test_d02_request_marker_policy(int *fp)
+{
+    int failures = 0;
+    const struct {
+        const char *name; int mode; bool origin;
+        uint16_t status;      /* 0 = expect NO HTTP response at all */
+        bool stream_error;    /* stream-local malformed instead */
+    } cases[] = {
+        { "correct",   0, true,  200, false },
+        { "missing",   1, true,  400, false },
+        { "wrong",     2, true,  400, false },
+        { "duplicate", 3, true,  0,   true  },  /* malformed message */
+        { "no_origin", 0, false, 403, false },  /* Origin gate precedes 2xx */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rig_t r;
+        uint8_t req[512];
+        const size_t qlen = build_d02_request(req, sizeof(req),
+                                              cases[i].mode,
+                                              cases[i].origin);
+        WTQ_TEST_CHECK(qlen > 0);
+        server_d02_up(&r, fp);
+        struct wtq_dstream *ds = feed_request(&r, 0, req, qlen, 13, fp);
+        /* parked until SETTINGS: nothing decided */
+        WTQ_TEST_CHECK_EQ_U64(ds->len, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        deliver_d02_peer_settings(&r, fp);
+
+        if (cases[i].stream_error) {
+            /* malformed message: stream-local, no HTTP response body */
+            WTQ_TEST_CHECK_EQ_U64(ds->len, 0);
+            WTQ_TEST_CHECK(ds->reset || ds->stopped);
+        } else {
+            expect_response_status(ds, cases[i].status, fp);
+        }
+        /* first-causal outcome, exactly once, and NO acceptance effects */
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events,
+                              cases[i].status == 200 ? 1 : 0);
+        WTQ_TEST_CHECK(wtq_conn_session_established(r.conn) ==
+                       (cases[i].status == 200));
+        WTQ_TEST_CHECK(!wtq_conn_is_closed(r.conn));
+        WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 0);
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -3463,6 +3587,8 @@ int main(void)
     test_server_profile_symmetry(&failures);
     test_multi_server_connect_before_settings(&failures);
     test_no_mutual_never_decodes(&failures);
+
+    test_d02_request_marker_policy(&failures);
 
     WTQ_TEST_PASS("test_engine_connect");
     return failures;
