@@ -178,6 +178,27 @@ static uint64_t nw_doorbell_deadline_us(uint64_t now_us, uint64_t eff_us)
 /* --- engine bracket ---------------------------------------------------- */
 
 static void conn_poll_shutdown(struct wtq_driver *drv);
+static void batch_on_retire(void *ctx);
+#ifdef WTQ_NW_TESTING
+/* Read from the test thread while the driver queue may still be writing
+ * them, so they are ATOMIC: a plain int here is a genuine data race
+ * (observed under TSan at batch_on_complete). */
+_Atomic int wtq_nw_test_cancel_with_owed;
+int wtq_nw_test_hold_pump;
+_Atomic int wtq_nw_test_conn_closes;
+/* ONE-SHOT: force the next wtq_nw_conn_rundown_internal() to take its
+ * leak-safe false return WITHOUT freeing, so a test can exercise the
+ * unfinished-rundown path deterministically. */
+int wtq_nw_test_force_rundown_false;
+/* Two-phase order actually observed on the real path, per batch:
+ * completion-first and retirement-first are counted separately so a test
+ * can state WHICH orders it exercised instead of assuming both. */
+_Atomic int wtq_nw_test_phase_completion_first;
+_Atomic int wtq_nw_test_phase_retire_first;
+
+#endif
+static bool drv_sends_owed(const struct wtq_driver *drv);
+static void conn_poll_deferred_shutdown(struct wtq_driver *drv);
 
 static void nw_leave_and_poll(struct wtq_driver *drv)
 {
@@ -491,6 +512,31 @@ static void batch_on_complete(void *ctx, bool canceled)
     drv->callback_depth++; /* NW's completion frame */
     NWDBG("batch complete id=%llu nrecs=%d canceled=%d\n",
           (unsigned long long)ds->id, b->nrecs, (int)canceled);
+#ifdef WTQ_NW_TESTING
+    /*
+     * CONSUME THE WATCH FIRST, while `b` is unquestionably live.
+     *
+     * The identity match must not be evaluated after any path may have
+     * freed `b`: a pointer to an ended lifetime is indeterminate, and
+     * sanitizer silence on an address-only comparison does not make it
+     * valid. Capturing here also means a reentrant application completion
+     * callback cannot install a new watch that this completion then
+     * satisfies -- the tuple is already cleared, and the captured callback
+     * is invoked only at the end of the frame, never referring to `b`.
+     */
+    void (*watch_cb_local)(void *) = NULL;
+    void *watch_ctx_local = NULL;
+    drv->completions_total++;   /* per-driver epoch, advanced here */
+    if (drv->watch_batch == (void *)b) {
+        drv->watch_hits++;
+        drv->watch_canceled = canceled;
+        watch_cb_local = drv->watch_cb;
+        watch_ctx_local = drv->watch_ctx;
+        drv->watch_batch = NULL;
+        drv->watch_cb = NULL;
+        drv->watch_ctx = NULL;
+    }
+#endif
     ds->send_inflight = false;
     for (int i = 0; i < b->nrecs; i++) {
         rec_app_complete(b->recs[i], canceled);
@@ -498,14 +544,227 @@ static void batch_on_complete(void *ctx, bool canceled)
             b->recs[i]->in_use = false;
     }
     bool last = ++b->phases_done == 2;
+#ifdef WTQ_NW_TESTING
+    if (b->phases_done == 1)
+        wtq_nw_test_phase_completion_first++;
+#endif
     if (last) {
+#ifdef WTQ_NW_TESTING
+        /* clear ONLY if it still names THIS batch: completion of batch 1
+         * may already have pumped batch 2 into the slot */
+        if (ds->live_batch_for_test == (void *)b)
+            ds->live_batch_for_test = NULL;
+#endif
         drv->alloc.free(b, sizeof(*b), drv->alloc.ctx);
         ds->batches_live--;
     }
     ds_pump_sends(ds);
+    /* the accepted close bytes may have just drained: perform the
+     * shutdown the orderly terminal deferred */
+    conn_poll_deferred_shutdown(drv);
+#ifdef WTQ_NW_TESTING
+    /* the captured callback runs LAST, and never refers to `b` again */
+    if (watch_cb_local != NULL)
+        watch_cb_local(watch_ctx_local);
+#endif
     ds_maybe_free(ds, WTQ_NW_REAP_SRC_COMPLETE); /* schedules only */
     drv->callback_depth--;
 }
+
+#ifdef WTQ_NW_TESTING
+/*
+ * Drive the post-terminal poll from a test exactly as a stray Network
+ * callback does after the local session terminal has fired.
+ *
+ * BALANCE MATTERS: nw_leave_and_poll() is not a standalone poll. It closes
+ * a bracket its real callers opened with wtq_api_session_enter(), so this
+ * seam MUST open that bracket too. Calling only the leave half would drive
+ * cb_depth negative and permanently prevent session_unref() from
+ * destroying the session, silently invalidating any lifetime or leak claim
+ * made by a test that used it.
+ */
+/*
+ * THE production predicate itself, exposed for tests. A test must never
+ * re-implement an approximation of drv_sends_owed(): a duplicated walker
+ * can silently diverge from production and then "pin" behaviour that does
+ * not exist.
+ */
+/*
+ * BATCH-KEYED completion watch. Every entry point runs on the driver
+ * queue, so arm / match / disarm linearize against batch_on_complete().
+ */
+void wtq_nw_test_watch_arm(struct wtq_driver *drv, void *batch,
+                           void (*cb)(void *), void *ctx)
+{
+    drv->watch_batch = batch;
+    drv->watch_cb = cb;
+    drv->watch_ctx = ctx;
+    drv->watch_hits = 0;
+    drv->watch_canceled = false;
+}
+
+int wtq_nw_test_watch_disarm(struct wtq_driver *drv)
+{
+    const int hits = drv->watch_hits;
+
+    /* unconditional: safe whether or not the target already completed */
+    drv->watch_batch = NULL;
+    drv->watch_cb = NULL;
+    drv->watch_ctx = NULL;
+    return hits;
+}
+
+bool wtq_nw_test_watch_armed(const struct wtq_driver *drv)
+{
+    return drv->watch_batch != NULL;
+}
+
+int wtq_nw_test_watch_hits(const struct wtq_driver *drv)
+{
+    return drv->watch_hits;
+}
+
+bool wtq_nw_test_watch_was_canceled(const struct wtq_driver *drv)
+{
+    return drv->watch_canceled;
+}
+
+int wtq_nw_test_driver_completions(const struct wtq_driver *drv)
+{
+    return drv->completions_total;
+}
+
+void wtq_nw_test_detach_next(struct wtq_dstream *ds)
+{
+    ds->detach_next_batch = true;
+}
+
+bool wtq_nw_test_sends_owed(const struct wtq_driver *drv)
+{
+    return drv_sends_owed(drv);
+}
+
+/* Per-stream half of the same predicate, for rows that must discriminate
+ * WHICH stream production considers drainable. Kept in lockstep with
+ * drv_sends_owed()'s body above. */
+bool wtq_nw_test_stream_drainable(const struct wtq_dstream *ds)
+{
+    if (ds->conn == NULL || ds->terminal || ds->cancel_issued)
+        return false;
+    if (ds->send_inflight)
+        return true;
+    return ds->pending_sends != NULL && ds->ready_processed;
+}
+
+/*
+ * The LEAVE half only, for a test that has ALREADY opened the bracket with
+ * wtq_api_session_enter() and fed the engine inside it. This reproduces
+ * production's shape exactly: enter -> feed engine -> leave-and-poll, ONE
+ * bracket. The caller MUST hold an enter; calling this without one drives
+ * cb_depth negative and prevents session destruction.
+ */
+/*
+ * Phase-order test seam. Drives the production phase
+ * callbacks -- batch_on_complete() and batch_on_retire() -- on a REAL
+ * driver/dstream/batch, in a caller-chosen order, so the inverse of the
+ * order Network.framework naturally produces can be executed. It does not
+ * reimplement the state machine: it calls the same two functions the
+ * transport calls, on a batch built by the same issue path.
+ */
+void wtq_nw_test_batch_phase_one(void *batch, bool complete_first,
+                                 bool canceled)
+{
+    if (complete_first)
+        batch_on_complete(batch, canceled);
+    else
+        batch_on_retire(batch);
+}
+
+void wtq_nw_test_batch_phase_two(void *batch, bool complete_first,
+                                 bool canceled)
+{
+    if (complete_first)
+        batch_on_retire(batch);
+    else
+        batch_on_complete(batch, canceled);
+}
+
+/* The live batch currently issued on this stream, for tests. */
+void *wtq_nw_test_stream_live_batch(struct wtq_dstream *ds)
+{
+    return ds->live_batch_for_test;
+}
+
+/* Exact batch/record state for phase-order tests. */
+/*
+ * STREAM-OWNED record state. These stay valid after a batch is freed,
+ * so a test can assert final ownership without dereferencing a batch
+ * past its last phase.
+ */
+int wtq_nw_test_stream_recs_in_use(const struct wtq_dstream *ds)
+{
+    int n = 0;
+    for (int i = 0; i < WTQ_NW_SEND_RECORDS; i++)
+        if (ds->recs[i].in_use)
+            n++;
+    return n;
+}
+
+int wtq_nw_test_stream_recs_app_pending(const struct wtq_dstream *ds)
+{
+    return ds->recs_app_pending;
+}
+
+int wtq_nw_test_stream_recs_unretired(const struct wtq_dstream *ds)
+{
+    return ds->recs_unretired;
+}
+
+int wtq_nw_test_batch_phases_done(void *batch)
+{
+    return ((struct wtq_nw_send_batch *)batch)->phases_done;
+}
+
+int wtq_nw_test_batch_nrecs(void *batch)
+{
+    return ((struct wtq_nw_send_batch *)batch)->nrecs;
+}
+
+bool wtq_nw_test_batch_rec_app_done(void *batch, int i)
+{
+    return ((struct wtq_nw_send_batch *)batch)->recs[i]->app_done;
+}
+
+bool wtq_nw_test_batch_rec_transport_done(void *batch, int i)
+{
+    return ((struct wtq_nw_send_batch *)batch)->recs[i]->transport_done;
+}
+
+bool wtq_nw_test_batch_rec_in_use(void *batch, int i)
+{
+    return ((struct wtq_nw_send_batch *)batch)->recs[i]->in_use;
+}
+
+void nw_leave_and_poll_with_enter_held(struct wtq_driver *drv)
+{
+    nw_leave_and_poll(drv);
+}
+
+void nw_poll_after_balanced_test_callback(struct wtq_driver *drv)
+{
+    if (drv->session == NULL)
+        return;
+    wtq_api_session_enter(drv->session);
+    nw_leave_and_poll(drv);
+}
+
+/* Release a held queue from a test, through the ordinary pump path. */
+void ds_pump_sends_for_test(struct wtq_dstream *ds)
+{
+    ds_pump_sends(ds);
+    conn_poll_deferred_shutdown(ds->drv);
+}
+#endif
 
 static void batch_on_retire(void *ctx)
 {
@@ -524,7 +783,15 @@ static void batch_on_retire(void *ctx)
         }
     }
     bool last = ++b->phases_done == 2;
+#ifdef WTQ_NW_TESTING
+    if (b->phases_done == 1)
+        wtq_nw_test_phase_retire_first++;
+#endif
     if (last) {
+#ifdef WTQ_NW_TESTING
+        if (ds->live_batch_for_test == (void *)b)
+            ds->live_batch_for_test = NULL;
+#endif
         drv->alloc.free(b, sizeof(*b), drv->alloc.ctx);
         ds->batches_live--;
     }
@@ -647,6 +914,12 @@ static void ds_pump_sends(struct wtq_dstream *ds)
     if (ds->send_inflight || !ds->ready_processed || ds->terminal ||
         ds->cancel_issued || ds->conn == NULL)
         return;
+#ifdef WTQ_NW_TESTING
+    /* deterministic hold: keep accepted bytes QUEUED (still owed) so a
+     * test can drive the post-terminal path at that exact boundary */
+    if (wtq_nw_test_hold_pump)
+        return;
+#endif
     if (ds->pending_sends == NULL)
         return;
 
@@ -737,7 +1010,25 @@ static void ds_pump_sends(struct wtq_dstream *ds)
           (unsigned long long)ds->id, dispatch_data_get_size(all),
           b->nrecs, (int)fin);
     ds->send_inflight = true;
+#ifdef WTQ_NW_TESTING
+    ds->live_batch_for_test = b;
+#endif
     ds->batches_live++; /* pins the stream until BOTH phases ran */
+#ifdef WTQ_NW_TESTING
+    if (ds->detach_next_batch) {
+        ds->detach_next_batch = false; /* ONE-SHOT, consumed here */
+        /*
+         * PHASE-ORDER HARNESS ONLY: the batch is PRODUCTION-CONSTRUCTED
+         * and fully accounted, but deliberately NOT transport-submitted.
+         * Nothing will ever complete it, so a test can drive its two phase
+         * callbacks in either order without racing a real completion that
+         * would double-process (and free) the same batch. It is NOT an
+         * issued batch and must not be described as one.
+         */
+        dispatch_release(all);
+        return;
+    }
+#endif
     wtqi_nw_send_with_holder(ds->conn, drv->queue, all, fin,
                             batch_on_complete, batch_on_retire, b);
     dispatch_release(all);
@@ -1505,6 +1796,18 @@ static wtq_result_t op_conn_close(wtq_driver_t *drv, uint64_t h3_err)
     (void)h3_err;
     if (drv->shutdown_started)
         return WTQ_OK;
+#ifdef WTQ_NW_TESTING
+    /* ORDERING ORACLE: cancelling the transport while accepted engine
+     * bytes are still owed is exactly the truncation defect. Counted for
+     * every close so a test can assert it stays zero across an orderly
+     * terminal; an engine-FATAL close legitimately cancels and is
+     * accounted separately by the caller. */
+    if (drv_sends_owed(drv))
+        wtq_nw_test_cancel_with_owed++;
+#endif
+#ifdef WTQ_NW_TESTING
+    wtq_nw_test_conn_closes++; /* transport cancellations actually issued */
+#endif
     drv->shutdown_started = true;
     for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
         if (ds->conn != NULL && !ds->terminal && !ds->cancel_issued) {
@@ -1680,6 +1983,54 @@ static const wtq_driver_ops_t nw_driver_ops = {
 
 /* --- connection lifetime policy ------------------------------------------ */
 
+/*
+ * DRAINABLE accepted sends: bytes this backend accepted that a completion
+ * is guaranteed to follow -- the one submission that may be in flight, or
+ * a queue on a stream that is ready and can therefore actually be pumped.
+ *
+ * The name and the predicate are deliberately NARROWER than "everything
+ * accepted". A queue on a NOT-yet-ready stream is intentionally excluded
+ * and will be cancelled by an orderly terminal, because no completion can
+ * be guaranteed for it and deferring on it could strand the connection.
+ * That exclusion cannot affect the CLOSE wire unit: closing requires an
+ * established session, whose CONNECT stream has necessarily completed its
+ * ready processing (the engine cannot have sent the CONNECT request, nor
+ * received its response, through a stream that never became ready), so
+ * close bytes are always on a ready stream and are always counted here.
+ *
+ * Says nothing about peer receipt, and makes no ACK claim.
+ */
+static bool drv_sends_owed(const struct wtq_driver *drv)
+{
+    for (const struct wtq_dstream *ds = drv->streams; ds != NULL;
+         ds = ds->next) {
+        if (ds->conn == NULL || ds->terminal || ds->cancel_issued)
+            continue;
+        /* see the contract above: drainable, not merely accepted */
+        if (ds->send_inflight)
+            return true;
+        if (ds->pending_sends != NULL && ds->ready_processed)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Completion-side half of the orderly-terminal gate: once the last
+ * accepted byte has drained, perform the shutdown that conn_poll_shutdown
+ * deferred. Called from the send-completion path, so it is driven by an
+ * actual completion rather than by any timer or poll.
+ */
+static void conn_poll_deferred_shutdown(struct wtq_driver *drv)
+{
+    if (!drv->shutdown_when_flushed || drv->shutdown_started)
+        return;
+    if (drv_sends_owed(drv))
+        return;
+    drv->shutdown_when_flushed = false;
+    (void)op_conn_close(drv, 0);
+}
+
 static void conn_poll_shutdown(struct wtq_driver *drv)
 {
     if (drv->shutdown_started || drv->session == NULL)
@@ -1695,8 +2046,20 @@ static void conn_poll_shutdown(struct wtq_driver *drv)
     case WTQ_SESSION_CLOSED:
     case WTQ_SESSION_REJECTED:
     case WTQ_SESSION_FAILED:
-        /* post-terminal retirement: the record was sealed at the
-         * session terminal; this cleanup stages nothing */
+        /*
+         * post-terminal retirement: the record was sealed at the session
+         * terminal; this cleanup stages nothing.
+         *
+         * ORDERLY terminal, so it must not cancel the transport out from
+         * under accepted bytes. If any are still owed, arm the deferred
+         * shutdown; the send-completion path re-polls and closes once the
+         * last one drains. Nothing here waits, sleeps or retries, and a
+         * terminal with nothing owed still closes immediately.
+         */
+        if (drv_sends_owed(drv)) {
+            drv->shutdown_when_flushed = true;
+            break;
+        }
         (void)op_conn_close(drv, 0);
         break;
     default:
@@ -2969,6 +3332,12 @@ bool wtq_nw_conn_rundown_internal(struct wtq_driver *drv, int timeout_ms)
             break;
     bool done = c->stopped_done;
     pthread_mutex_unlock(&c->mu);
+#ifdef WTQ_NW_TESTING
+    if (wtq_nw_test_force_rundown_false) {
+        wtq_nw_test_force_rundown_false = 0;  /* one-shot */
+        done = false;
+    }
+#endif
     if (!done)
         return false; /* leak-safe: nothing freed under callbacks */
 

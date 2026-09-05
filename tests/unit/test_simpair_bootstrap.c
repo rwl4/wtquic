@@ -122,7 +122,7 @@ static int scenario_connect(uint64_t seed, uint64_t *hash_out)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, seed) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,
@@ -181,7 +181,7 @@ static void test_pair_dgram_malformed(int *fp)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, 0xBAD) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,
@@ -215,7 +215,7 @@ static int scenario_full_session(uint64_t seed, uint64_t *hash_out)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, seed) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,
@@ -334,7 +334,7 @@ static void test_pair_reset_stop_propagation(int *fp)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, 0xC10500) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,
@@ -391,7 +391,7 @@ static void test_pair_detach_mid_pass(int *fp)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, 0xDE7AC4) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,
@@ -449,7 +449,7 @@ static void test_pair_peer_pool_rejection(int *fp)
     static wtq_simpair_t sp;
 
     WTQ_TEST_CHECK(wtq_simpair_create(&sp, 0xC0FFEE) == 0);
-    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", SIM_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, SIM_OFFER, 2, true, 0,

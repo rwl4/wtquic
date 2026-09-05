@@ -864,6 +864,7 @@ static wtq_result_t listener_up_profiles(wtq_msquic_env_t *env,
                                          wtq_msquic_listener_t **l_out)
 {
     static const char *const protos[] = { "wtq-test" };
+    static const char *const origins[] = { "https://localhost:443" };
     wtq_session_events_t ev;
     wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
     wtq_msquic_listener_cfg_t cfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
@@ -872,6 +873,12 @@ static wtq_result_t listener_up_profiles(wtq_msquic_env_t *env,
     serve.path = path;
     serve.subprotocols = protos;
     serve.subprotocol_count = 1;
+    if ((profiles &
+         WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT) != 0) {
+        serve.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+        serve.allowed_origins = origins;
+        serve.allowed_origin_count = 1;
+    }
 
     cfg.bind_address = "127.0.0.1";
     cfg.port = 0;
@@ -901,10 +908,9 @@ static wtq_result_t client_up_profile(wtq_msquic_env_t *env, struct side *sd,
     connect.subprotocols = protos;
     connect.subprotocol_count = 1;
     connect.webtransport_profile = profile;
-    /* D02/RFC9297 requires an Origin (draft-02 s3.3). */
-    if (profile ==
-        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT)
-        connect.origin = "https://localhost:443";
+    /* A listener that advertises D02 applies its explicit Origin policy to
+     * every selected profile, including CURRENT and D13/14. */
+    connect.origin = "https://localhost:443";
 
     cfg.server_name = "127.0.0.1";
     cfg.port = port;
@@ -1214,7 +1220,7 @@ out:
 /*
  * A D02-only listener configured through the ABI-compatible SINGULAR field
  * (webtransport_profiles left 0), proving the singular path is not hidden
- * by an authoritative set. 0014e finding C.4.
+ * by an authoritative set.
  */
 static int t_profile_d02_singular_listener(void)
 {
@@ -1241,6 +1247,14 @@ static int t_profile_d02_singular_listener(void)
         serve.path = "/echo";
         serve.subprotocols = protos;
         serve.subprotocol_count = 1;
+        {
+            static const char *const origins[] = {
+                "https://localhost:443",
+            };
+            serve.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+            serve.allowed_origins = origins;
+            serve.allowed_origin_count = 1;
+        }
         cfg.bind_address = "127.0.0.1";
         cfg.port = 0;
         cfg.cert_file = cert_path;

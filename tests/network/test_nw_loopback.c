@@ -56,6 +56,11 @@
 static int g_wait_ms = 20000;
 #define WAIT_MS g_wait_ms
 
+/* Short, explicit watchdog for the wait-wake probe: a broken mutant is
+ * rescued in a bounded time instead of consuming WAIT_MS four times. It is
+ * never the oracle -- the recorded wait return status is. */
+#define WP_BACKSTOP_MS 1000
+
 /*
  * Environmental establishment retries are OPT-IN (WTQ_NW_ESTABLISH_
  * RETRIES, default 0): normal correctness gates take ONE attempt so an
@@ -415,6 +420,11 @@ struct side {
     int established;
     char subproto[128];
     size_t subproto_len;
+    /* the negotiated profile sampled INSIDE on_established, which is what
+     * proves the value is published BEFORE the callback rather than merely
+     * by the time the test gets around to asking. */
+    int cb_prof_rc;
+    int cb_prof;
     int refused;
     uint16_t refused_status;
     int failed;
@@ -510,6 +520,25 @@ struct side {
     int ctx_canceled[MAX_CTX];
     int nctx;
     int completions_total;
+    /* One specific accepted send, tracked by cookie
+     * identity, so a row can prove it received exactly one CANCELED
+     * completion and never a successful one. */
+    const void *nr_cookie;
+    int nr_completions;
+    int nr_canceled;
+    int nr_success;
+    /* a second independently tracked cookie */
+    const void *k2_cookie;
+    int k2_completions;
+    int k2_canceled;
+    /* a third slot for the second replacement batch */
+    const void *k3_cookie;
+    int k3_completions;
+    int k3_canceled;
+    /* the phase-order harness's own target send */
+    const void *ph_slot_cookie;
+    int ph_slot_completions;
+    int ph_slot_canceled;
 
     /* --- deferral-barrier proof (server + client roles) --- */
     bool payload_barrier;         /* server: answer a "go" request with the
@@ -565,6 +594,113 @@ static bool side_wait(struct side *sd, const int *flag)
     bool ok = *flag != 0;
     pthread_mutex_unlock(&sd->mu);
     return ok;
+}
+
+/*
+ * Wait for ANY session outcome -- established, REFUSED, failed or closed
+ * -- on the callback condition variable, against ONE wall-clock deadline.
+ * No polling and no sleeping: every one of those callbacks broadcasts, so
+ * this wakes on the event itself.
+ *
+ * A refusal is a real terminal outcome. Omitting it would let an ordinary
+ * HTTP refusal wake the wait, fail the predicate, block until the full
+ * deadline, and then be misreported as "no outcome".
+ *
+ * Returns with `sd->mu` released.
+ */
+/*
+ * TEST-ONLY probe for the wait helper. It records the causal facts the
+ * ordinary path has no reason to keep:
+ *
+ *   entered   - set immediately BEFORE pthread_cond_timedwait, so a
+ *               signaler can prove the waiter is at the wait point;
+ *   wait_rc   - the return status of the wait that released us. 0 means a
+ *               real condition-variable wake; ETIMEDOUT means the backstop
+ *               expired. This is the oracle: never elapsed time.
+ *
+ * Lock ordering is explicit and never nested in both directions. The
+ * waiter takes sd->mu, then briefly takes probe->mu to publish `entered`,
+ * then RELEASES probe->mu before waiting. The signaler holds only
+ * probe->mu while waiting for `entered`, releases it, and only then takes
+ * sd->mu -- which it cannot acquire until pthread_cond_timedwait has
+ * atomically released it, so the broadcast can never be missed.
+ */
+struct wp_probe {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered;
+    int wait_rc;
+    bool waited;
+};
+
+static void wp_probe_init(struct wp_probe *p)
+{
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    p->entered = false;
+    p->wait_rc = -1;
+    p->waited = false;
+}
+
+static void wp_probe_destroy(struct wp_probe *p)
+{
+    pthread_mutex_destroy(&p->mu);
+    pthread_cond_destroy(&p->cv);
+}
+
+static bool side_wait_outcome_ex(struct side *sd, int backstop_ms,
+                                 struct wp_probe *probe)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += backstop_ms / 1000;
+    ts.tv_nsec += (long)(backstop_ms % 1000) * 1000 * 1000L;
+    if (ts.tv_nsec >= 1000 * 1000 * 1000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000 * 1000 * 1000L;
+    }
+    pthread_mutex_lock(&sd->mu);
+    while (sd->established == 0 && sd->refused == 0 && sd->failed == 0 &&
+           sd->closed == 0) {
+        if (probe != NULL && !probe->entered) {
+            /* published while sd->mu is still HELD: the signaler cannot
+             * take sd->mu, and so cannot broadcast, until the wait below
+             * has released it */
+            pthread_mutex_lock(&probe->mu);
+            probe->entered = true;
+            pthread_cond_broadcast(&probe->cv);
+            pthread_mutex_unlock(&probe->mu);
+        }
+        const int rc = pthread_cond_timedwait(&sd->cv, &sd->mu, &ts);
+        if (probe != NULL) {
+            probe->waited = true;
+            probe->wait_rc = rc;
+        }
+        if (rc != 0)
+            break;
+    }
+    const bool got = sd->established != 0 || sd->refused != 0 ||
+                     sd->failed != 0 || sd->closed != 0;
+    pthread_mutex_unlock(&sd->mu);
+    return got;
+}
+
+/*
+ * Wait for ANY session outcome -- established, REFUSED, failed or closed
+ * -- on the callback condition variable, against ONE wall-clock deadline.
+ * No polling and no sleeping: every one of those callbacks broadcasts, so
+ * this wakes on the event itself.
+ *
+ * A refusal is a real terminal outcome. Omitting it would let an ordinary
+ * HTTP refusal wake the wait, fail the predicate, block until the full
+ * deadline, and then be misreported as "no outcome".
+ *
+ * Returns with `sd->mu` released.
+ */
+static bool side_wait_outcome(struct side *sd)
+{
+    return side_wait_outcome_ex(sd, WAIT_MS, NULL);
 }
 
 static bool side_wait_ge(struct side *sd, const int *ctr, int want)
@@ -684,8 +820,13 @@ static void cb_established(wtq_session_t *s, wtq_str_t sub, void *user)
 {
     struct side *sd = user;
 
-    (void)s;
+    /* query while the callback's session handle is known valid */
+    wtq_webtransport_profile_t cbp = (wtq_webtransport_profile_t)0x7f;
+    const wtq_result_t cbrc = wtq_session_webtransport_profile(s, &cbp);
+
     pthread_mutex_lock(&sd->mu);
+    sd->cb_prof_rc = (int)cbrc;
+    sd->cb_prof = (int)cbp;
     sd->established++;
     sd->subproto_len =
         sub.len < sizeof(sd->subproto) ? sub.len : sizeof(sd->subproto) - 1;
@@ -1022,6 +1163,28 @@ static void cb_send_complete(wtq_session_t *s, void *send_ctx, bool canceled,
 
     pthread_mutex_lock(&sd->mu);
     sd->completions_total++;
+    if (sd->nr_cookie != NULL && send_ctx == sd->nr_cookie) {
+        sd->nr_completions++;
+        if (canceled)
+            sd->nr_canceled++;
+        else
+            sd->nr_success++;
+    }
+    if (sd->k2_cookie != NULL && send_ctx == sd->k2_cookie) {
+        sd->k2_completions++;
+        if (canceled)
+            sd->k2_canceled++;
+    }
+    if (sd->k3_cookie != NULL && send_ctx == sd->k3_cookie) {
+        sd->k3_completions++;
+        if (canceled)
+            sd->k3_canceled++;
+    }
+    if (sd->ph_slot_cookie != NULL && send_ctx == sd->ph_slot_cookie) {
+        sd->ph_slot_completions++;
+        if (canceled)
+            sd->ph_slot_canceled++;
+    }
     for (int i = 0; i < ECHO_RECS; i++)
         if (send_ctx == (void *)&sd->echo[i]) { /* identity, not range */
             rec = &sd->echo[i];
@@ -1231,11 +1394,53 @@ static wtq_result_t listener_up(wtq_msquic_env_t *env, struct side *sd,
     return wtq_msquic_listener_start(env, &cfg, l_out);
 }
 
+/* Per-scenario connect overrides. Both default to "unset", so every
+ * scenario that does not touch them builds exactly the config it built
+ * before: profile 0 is H3_CURRENT and a NULL origin is omitted. */
+static uint32_t g_nw_profile;
+static const char *g_nw_origin;
+static const char NW_TEST_ORIGIN[] = "https://localhost:443";
+
+/* Same listener as listener_up, but advertising a caller-chosen profile
+ * capability SET rather than the default singular current profile. */
+static wtq_result_t listener_up_profiles(wtq_msquic_env_t *env,
+                                         struct side *sd,
+                                         wtq_webtransport_profile_set_t set,
+                                         wtq_msquic_listener_t **l_out)
+{
+    static const char *protos_storage[2];
+    wtq_session_events_t ev;
+    wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
+    wtq_msquic_listener_cfg_t cfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
+
+    protos_storage[0] = ESCAPED_PROTO;
+    protos_storage[1] = "wtq-nw-test";
+    events_for(&ev);
+    serve.path = "/nw";
+    serve.subprotocols = protos_storage;
+    serve.subprotocol_count = 2;
+    if ((set & WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT) !=
+        0)
+        serve.origin_policy = WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+
+    cfg.bind_address = "127.0.0.1";
+    cfg.port = 0;
+    cfg.cert_file = cert_path;
+    cfg.key_file = key_path;
+    cfg.paths = &serve;
+    cfg.path_count = 1;
+    cfg.events = &ev;
+    cfg.user = sd;
+    cfg.webtransport_profiles = set;
+    return wtq_msquic_listener_start(env, &cfg, l_out);
+}
+
 static wtq_result_t nw_client_up_alloc(struct side *sd, uint16_t port,
                                        const char *path,
                                        const char *const *protos,
                                        size_t nprotos,
                                        const wtq_alloc_t *alloc,
+                                       const char *origin,
                                        struct wtq_driver **drv_out,
                                        wtq_session_t **s_out)
 {
@@ -1248,6 +1453,8 @@ static wtq_result_t nw_client_up_alloc(struct side *sd, uint16_t port,
     connect.path = path;
     connect.subprotocols = protos;
     connect.subprotocol_count = nprotos;
+    connect.webtransport_profile = g_nw_profile;
+    connect.origin = origin;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.alloc = alloc != NULL ? alloc : wtq_alloc_default();
@@ -1267,6 +1474,18 @@ static wtq_result_t nw_client_up(struct side *sd, uint16_t port,
                                  wtq_session_t **s_out)
 {
     return nw_client_up_alloc(sd, port, path, protos, nprotos, NULL,
+                              g_nw_origin,
+                              drv_out, s_out);
+}
+
+static wtq_result_t nw_client_up_origin(struct side *sd, uint16_t port,
+                                        const char *path,
+                                        const char *const *protos,
+                                        size_t nprotos, const char *origin,
+                                        struct wtq_driver **drv_out,
+                                        wtq_session_t **s_out)
+{
+    return nw_client_up_alloc(sd, port, path, protos, nprotos, NULL, origin,
                               drv_out, s_out);
 }
 
@@ -1291,39 +1510,90 @@ static bool side_err_is_environmental(const struct side *sd)
  * the bound) fails the test here — and every retry is counted and
  * printed.
  */
+/*
+ * Outcome of one setup attempt, snapshotted by the helper BEFORE it resets
+ * its latches, so a caller taking the FALSE branch can still see exactly
+ * what happened and whether the helper's own cleanup ran and succeeded.
+ */
 static bool nw_client_up_ready(struct side *cl, uint16_t port,
                                const char *path,
                                const char *const *protos, size_t nprotos,
                                const wtq_alloc_t *alloc,
                                struct wtq_driver **drv_out,
-                               wtq_session_t **cs_out)
+                               wtq_session_t **cs_out);
+
+struct nw_setup_outcome {
+    bool observed;        /* an outcome was delivered inside the budget */
+    int established;
+    int failed;
+    int failed_why;
+    int refused;
+    int closed;
+    bool cleanup_ran;     /* helper-owned rundown executed */
+    bool rundown_ok;      /* and the bounded rundown SUCCEEDED */
+    /*
+     * FAIL-SAFE RETENTION. wtq_nw_conn_rundown_internal() returns false
+     * when it could not quiesce: by contract it frees nothing, because
+     * callbacks may still be live. In that case the helper must NOT
+     * release the session and the caller must NOT destroy its `side` --
+     * doing either would expose caller-owned callback state to a late
+     * callback. `retained` says the objects were deliberately kept alive
+     * (leaked) instead, mirroring the production contract.
+     */
+    bool retained;
+};
+
+static bool nw_client_up_ready_ex(struct side *cl, uint16_t port,
+                                  const char *path,
+                                  const char *const *protos, size_t nprotos,
+                                  const wtq_alloc_t *alloc,
+                                  const char *origin,
+                                  struct wtq_driver **drv_out,
+                                  wtq_session_t **cs_out,
+                                  struct nw_setup_outcome *out)
 {
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
     for (int attempt = 0; attempt < 1 + g_est_retries; attempt++) {
         struct wtq_driver *drv = NULL;
         wtq_session_t *cs = NULL;
 
-        if (nw_client_up_alloc(cl, port, path, protos, nprotos, alloc,
+        if (nw_client_up_alloc(cl, port, path, protos, nprotos, alloc, origin,
                                &drv, &cs) != WTQ_OK ||
             cs == NULL)
             return false;
-        /* wait for ANY session outcome */
-        bool est = false, done = false;
-        for (int i = 0; i < WAIT_MS / 10 && !done; i++) {
-            pthread_mutex_lock(&cl->mu);
-            est = cl->established > 0;
-            done = est || cl->failed > 0 || cl->closed > 0;
-            pthread_mutex_unlock(&cl->mu);
-            if (!done) {
-                struct timespec ts = { 0, 10 * 1000 * 1000 };
-                nanosleep(&ts, NULL);
-            }
-        }
+        /* Wait for ANY session outcome on the condition variable. This
+         * blocks on the callback broadcast against one deadline -- it does
+         * not poll and does not sleep. */
+        const bool done = side_wait_outcome(cl);
+        pthread_mutex_lock(&cl->mu);
+        const bool est = cl->established > 0;
+        pthread_mutex_unlock(&cl->mu);
         if (est) {
             *drv_out = drv;
             *cs_out = cs;
+            if (out != NULL) {
+                pthread_mutex_lock(&cl->mu);
+                out->observed = true;
+                out->established = cl->established;
+                out->failed = cl->failed;
+                out->failed_why = cl->failed_why;
+                out->refused = cl->refused;
+                out->closed = cl->closed;
+                pthread_mutex_unlock(&cl->mu);
+            }
             return true;
         }
         pthread_mutex_lock(&cl->mu);
+        /* SNAPSHOT the outcome before the latches below are cleared */
+        if (out != NULL) {
+            out->observed = done;
+            out->established = cl->established;
+            out->failed = cl->failed;
+            out->failed_why = cl->failed_why;
+            out->refused = cl->refused;
+            out->closed = cl->closed;
+        }
         bool env = done && side_err_is_environmental(cl);
         /* a retry exists only when it will actually RUN */
         bool more = env && attempt + 1 < 1 + g_est_retries;
@@ -1340,14 +1610,58 @@ static bool nw_client_up_ready(struct side *cl, uint16_t port,
         cl->closed = 0;
         memset(&cl->closed_err, 0, sizeof(cl->closed_err));
         pthread_mutex_unlock(&cl->mu);
-        (void)wtq_nw_conn_rundown_internal(drv, WAIT_MS);
-        wtq_session_release(cs);
+        {
+            const bool rok = wtq_nw_conn_rundown_internal(drv, WAIT_MS);
+            if (out != NULL) {
+                out->cleanup_ran = true;
+                out->rundown_ok = rok;   /* CHECKED, not discarded */
+                out->retained = !rok;
+            }
+            if (rok) {
+                wtq_session_release(cs);
+            }
+            /* else: the domain has NOT quiesced. Release nothing and let
+             * the caller see `retained` so it keeps its callback state
+             * alive. No timeout is widened and no late callback is
+             * reclassified; the objects are deliberately leaked, exactly
+             * as the rundown contract itself does. */
+        }
+        /* the caller's handles must be unusable after helper cleanup */
+        if (drv_out != NULL)
+            *drv_out = NULL;
+        if (cs_out != NULL)
+            *cs_out = NULL;
         if (!more)
             return false; /* not environmental, retries disabled, or
                              the bound is spent: the test sees it */
         g_est_retry_count++; /* counted at the START of a real retry */
     }
     return false;
+}
+
+/* The ordinary form: the SAME single implementation, no outcome wanted. */
+static bool nw_client_up_ready(struct side *cl, uint16_t port,
+                               const char *path,
+                               const char *const *protos, size_t nprotos,
+                               const wtq_alloc_t *alloc,
+                               struct wtq_driver **drv_out,
+                               wtq_session_t **cs_out)
+{
+    return nw_client_up_ready_ex(cl, port, path, protos, nprotos, alloc,
+                                 g_nw_origin, drv_out, cs_out, NULL);
+}
+
+static bool nw_client_up_ready_origin(struct side *cl, uint16_t port,
+                                      const char *path,
+                                      const char *const *protos,
+                                      size_t nprotos,
+                                      const wtq_alloc_t *alloc,
+                                      const char *origin,
+                                      struct wtq_driver **drv_out,
+                                      wtq_session_t **cs_out)
+{
+    return nw_client_up_ready_ex(cl, port, path, protos, nprotos, alloc,
+                                 origin, drv_out, cs_out, NULL);
 }
 
 /* --- subtests --------------------------------------------------------------- */
@@ -1940,6 +2254,2213 @@ static int t_refusal(uint16_t port)
  * no canary connection can exist). The owning layer's connect timeout
  * governs that case (§2.6); slice 6's managed lifecycle owns it.
  */
+
+/*
+ * A REAL Network.framework client speaking the D02/RFC9297 profile to a
+ * REAL managed MsQuic listener over localhost. This is the only place the
+ * profile is exercised end to end across two independent transports, so it
+ * pins what neither the in-memory pair nor the MsQuic loopback can: that
+ * the profile survives an actual QUIC handshake, an actual SETTINGS
+ * exchange, and an actual extended CONNECT with its draft-02 markers.
+ *
+ * The negative row is the Origin duty. draft-02 3.3 makes Origin an
+ * unconditional MUST, so a D02 client with no Origin must fail in
+ * preflight -- before any socket work -- and must leave the process able
+ * to run the positive row again.
+ */
+/* Runs ON the driver queue. Split out so the check macros write this
+ * function's own failure counter rather than capturing the caller's. */
+static int nw_d02_on_queue(wtq_session_t *cs)
+{
+    int failures = 0;
+
+              /* the negotiated profile is D02 over a real wire */
+              wtq_webtransport_profile_t p =
+                  (wtq_webtransport_profile_t)0x7f;
+              WTQ_TEST_CHECK_EQ_INT(
+                  (int)wtq_session_webtransport_profile(cs, &p),
+                  (int)WTQ_OK);
+              WTQ_TEST_CHECK_EQ_INT(
+                  (int)p,
+                  (int)
+                      WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT);
+
+              /* The D02 outbound error cap holds over the real transport,
+               * not only in the in-memory pair, and it is a PRE-transport
+               * validation: 256 is refused as an invalid argument even on
+               * a backend that could not perform the operation at all.
+               * A one-sided reset/stop on a fully-open bidi is separately
+               * UNSUPPORTED on Network.framework -- a pre-existing
+               * transport limit that D02 neither introduces nor changes --
+               * so the in-cap value surfaces THAT, and abort (which NW
+               * does implement) carries the accepted 255. */
+              wtq_stream_t *st = NULL;
+              if (wtq_session_open_bidi(cs, &st) == WTQ_OK && st != NULL) {
+                  WTQ_TEST_CHECK_EQ_INT((int)wtq_stream_reset(st, 256u),
+                                        (int)WTQ_ERR_INVALID_ARG);
+                  WTQ_TEST_CHECK_EQ_INT((int)wtq_stream_stop_sending(st, 256u),
+                                        (int)WTQ_ERR_INVALID_ARG);
+                  WTQ_TEST_CHECK_EQ_INT((int)wtq_stream_abort(st, 256u),
+                                        (int)WTQ_ERR_INVALID_ARG);
+                  WTQ_TEST_CHECK_EQ_INT((int)wtq_stream_reset(st, 255u),
+                                        (int)WTQ_ERR_UNSUPPORTED);
+                  /* the over-cap attempts left the stream fully usable */
+                  WTQ_TEST_CHECK_EQ_INT((int)wtq_stream_abort(st, 255u),
+                                        (int)WTQ_OK);
+              } else {
+                  failures++;
+              }
+    /* the session close belongs to the caller's step (6), so that the
+     * terminal cardinality assertions own exactly one close. */
+    return failures;
+}
+
+/*
+ * A REAL Network.framework client speaking the D02/RFC9297 profile to a
+ * REAL managed MsQuic listener over localhost. This is the only place the
+ * profile is exercised end to end across two independent transports, so it
+ * pins what neither the in-memory pair nor the MsQuic loopback can: that
+ * the profile survives an actual QUIC handshake, an actual SETTINGS
+ * exchange, and an actual extended CONNECT with its draft-02 markers, and
+ * that real application bytes then cross that session.
+ *
+ * There are no retries and no timing sleeps: every wait is causal, on the
+ * existing condition variables.
+ */
+/*
+ * The wait helper's WAKE is proven causally, with no elapsed-time oracle.
+ *
+ * The sequence is:
+ *   1. a waiter thread enters side_wait_outcome_ex;
+ *   2. it publishes `entered` while still holding sd->mu, immediately
+ *      before pthread_cond_timedwait -- so the signaler cannot proceed
+ *      past the handshake and then acquire sd->mu until the wait has
+ *      atomically released it;
+ *   3. the signaler sets exactly ONE outcome latch under sd->mu and
+ *      broadcasts;
+ *   4. the waiter records the RETURN STATUS of the wait that released it.
+ *
+ * The oracle is that status: 0 means a genuine condition-variable wake,
+ * ETIMEDOUT means the backstop expired. A latch that is merely set is NOT
+ * sufficient, because after a backstop expiry the final predicate is true
+ * either way -- which is exactly how a missing broadcast previously passed.
+ *
+ * The backstop here is short and explicit so that a broken mutant is
+ * rescued quickly instead of consuming the normal WAIT_MS four times over.
+ * It is a watchdog, never the oracle.
+ */
+struct wp_arg {
+    struct side *sd;
+    struct wp_probe *probe;
+    int which;
+    bool got;
+};
+
+/* the waiter */
+static void *wp_waiter(void *p)
+{
+    struct wp_arg *a = p;
+
+    a->got = side_wait_outcome_ex(a->sd, WP_BACKSTOP_MS, a->probe);
+    return NULL;
+}
+
+static int t_wait_predicate(void)
+{
+    int failures = 0;
+    static const char *const NAMES[] = { "established", "refused",
+                                         "failed", "closed" };
+
+    for (int which = 0; which < 4; which++) {
+        struct side sd;
+        struct wp_probe probe;
+        struct wp_arg a;
+        pthread_t th;
+
+        side_init(&sd);
+        wp_probe_init(&probe);
+        a.sd = &sd;
+        a.probe = &probe;
+        a.which = which;
+        a.got = false;
+
+        if (pthread_create(&th, NULL, wp_waiter, &a) != 0) {
+            fprintf(stderr, "FAIL: could not start waiter for '%s'\n",
+                    NAMES[which]);
+            failures++;
+            wp_probe_destroy(&probe);
+            side_destroy(&sd);
+            continue; /* never join an uninitialised thread */
+        }
+
+        /* HANDSHAKE: block until the waiter is provably at the wait point.
+         * Bounded so a broken build cannot hang the suite. */
+        struct timespec hts;
+        clock_gettime(CLOCK_REALTIME, &hts);
+        hts.tv_sec += (WP_BACKSTOP_MS / 1000) + 2;
+        pthread_mutex_lock(&probe.mu);
+        while (!probe.entered) {
+            if (pthread_cond_timedwait(&probe.cv, &probe.mu, &hts) != 0)
+                break;
+        }
+        const bool entered = probe.entered;
+        pthread_mutex_unlock(&probe.mu);
+        if (!entered) {
+            fprintf(stderr, "FAIL: waiter never reached the wait point "
+                            "for '%s'\n", NAMES[which]);
+            failures++;
+        }
+
+        /* set exactly ONE latch and broadcast */
+        pthread_mutex_lock(&sd.mu);
+        switch (which) {
+        case 0: sd.established++; break;
+        case 1: sd.refused++;     break;
+        case 2: sd.failed++;      break;
+        default: sd.closed++;     break;
+        }
+        side_signal(&sd);
+        pthread_mutex_unlock(&sd.mu);
+
+        pthread_join(th, NULL);
+
+        /* THE ORACLE: the wait returned because it was SIGNALED. */
+        pthread_mutex_lock(&probe.mu);
+        const bool waited = probe.waited;
+        const int wrc = probe.wait_rc;
+        pthread_mutex_unlock(&probe.mu);
+        if (!waited || wrc != 0) {
+            fprintf(stderr,
+                    "FAIL: outcome '%s' did not wake the wait by signal "
+                    "(waited=%d wait_rc=%d%s)\n",
+                    NAMES[which], (int)waited, wrc,
+                    wrc == ETIMEDOUT ? " ETIMEDOUT/backstop" : "");
+            failures++;
+        }
+        /* and the outcome itself is reported */
+        if (!a.got) {
+            fprintf(stderr, "FAIL: wait predicate missed outcome '%s'\n",
+                    NAMES[which]);
+            failures++;
+        }
+        pthread_mutex_lock(&sd.mu);
+        const int seen = which == 0   ? sd.established
+                         : which == 1 ? sd.refused
+                         : which == 2 ? sd.failed
+                                      : sd.closed;
+        pthread_mutex_unlock(&sd.mu);
+        WTQ_TEST_CHECK_EQ_INT(seen, 1);
+        wp_probe_destroy(&probe);
+        side_destroy(&sd);
+    }
+    return failures;
+}
+
+/*
+ * Counting allocator for the close-flush lifetime oracle: it tracks the
+ * live allocation balance so a test can prove that, after rundown and the
+ * application's final release, everything the session and engine allocated
+ * has actually been freed -- i.e. the session was really DESTROYED, not
+ * merely dereferenced. This is what catches a corrupted callback bracket:
+ * a session whose cb_depth never returns to 0 can never be destroyed by
+ * session_unref, so its allocations stay live here.
+ */
+static struct {
+    pthread_mutex_t mu;
+    int live;
+    size_t live_bytes;
+    int errors;
+} g_cnt = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0 };
+
+static void cnt_reset(void)
+{
+    pthread_mutex_lock(&g_cnt.mu);
+    g_cnt.live = 0;
+    g_cnt.live_bytes = 0;
+    g_cnt.errors = 0;
+    pthread_mutex_unlock(&g_cnt.mu);
+}
+
+static void *cnt_alloc(size_t size, void *ctx)
+{
+    (void)ctx;
+    void *p = malloc(size);
+    if (p != NULL) {
+        pthread_mutex_lock(&g_cnt.mu);
+        g_cnt.live++;
+        g_cnt.live_bytes += size;
+        pthread_mutex_unlock(&g_cnt.mu);
+    }
+    return p;
+}
+
+/*
+ * The allocator contract is SIZED: free/realloc receive the ORIGINAL
+ * allocation size. This oracle must therefore account exactly, and must
+ * never let a mis-accounted byte total wrap into a huge value that looks
+ * like a leak (or, worse, back to zero and looks clean).
+ *
+ * TEST SEMANTICS, chosen deliberately and not inferred from libc:
+ *   - realloc(NULL, n) behaves as alloc(n);
+ *   - a FAILED realloc leaves the old block live and still charged, and is
+ *     not accounted;
+ *   - realloc(p, 0) is handled WITHOUT calling libc realloc at all, because
+ *     libc may free the block and return NULL, which is indistinguishable
+ *     from a failure. The public allocator contract defines no zero-size
+ *     rule, so this oracle keeps the ORIGINAL block live and re-charges it
+ *     to zero bytes. That transition is asserted directly by
+ *     test_cnt_allocator_semantics().
+ */
+static void *cnt_realloc(void *ptr, size_t old_size, size_t new_size,
+                         void *ctx)
+{
+    (void)ctx;
+    if (ptr == NULL)
+        return cnt_alloc(new_size, ctx);
+    if (new_size == 0) {
+        /* deterministic: never ask libc, keep the block, re-charge to 0 */
+        pthread_mutex_lock(&g_cnt.mu);
+        if (old_size > g_cnt.live_bytes) {
+            g_cnt.errors++;
+            g_cnt.live_bytes = 0;
+        } else {
+            g_cnt.live_bytes -= old_size;
+        }
+        pthread_mutex_unlock(&g_cnt.mu);
+        return ptr;
+    }
+    void *p = realloc(ptr, new_size);
+    if (p == NULL)
+        return NULL; /* old block still live and still charged */
+    pthread_mutex_lock(&g_cnt.mu);
+    if (old_size > g_cnt.live_bytes) {
+        g_cnt.errors++; /* accounting underflow: report, never wrap */
+        g_cnt.live_bytes = 0;
+    } else {
+        g_cnt.live_bytes -= old_size;
+    }
+    g_cnt.live_bytes += new_size;
+    pthread_mutex_unlock(&g_cnt.mu);
+    return p;
+}
+
+static void cnt_free(void *ptr, size_t size, void *ctx)
+{
+    (void)ctx;
+    if (ptr == NULL)
+        return;
+    pthread_mutex_lock(&g_cnt.mu);
+    g_cnt.live--;
+    if (g_cnt.live < 0)
+        g_cnt.errors++;
+    if (size > g_cnt.live_bytes) {
+        g_cnt.errors++;
+        g_cnt.live_bytes = 0;
+    } else {
+        g_cnt.live_bytes -= size;
+    }
+    pthread_mutex_unlock(&g_cnt.mu);
+    free(ptr);
+}
+
+/*
+ * STATIC allocator descriptor. It must outlive every path that can install
+ * it: a stack-local descriptor installed into the process-global
+ * wtq_nw_test_backend_alloc would dangle the moment a setup failure
+ * returned early, and a later test would dereference dead stack.
+ */
+static const wtq_alloc_t g_cnt_vtable = { NULL, cnt_alloc, cnt_realloc,
+                                          cnt_free };
+
+/*
+ * Scoped install/restore for EVERY process-global test seam this file's
+ * close-flush rows touch. Installing through this and restoring on a single
+ * exit path is what makes an early return safe.
+ */
+struct seam_scope {
+    const wtq_alloc_t *prev_backend_alloc;
+    int prev_hold_pump;
+    int prev_cancel_with_owed;
+    int prev_conn_closes;
+    int prev_completion_first;
+    int prev_retire_first;
+    uint32_t prev_nw_profile;
+    const char *prev_nw_origin;
+};
+
+/* Saves the PRIOR value of every mutable global these rows touch -- never
+ * an assumed zero/NULL -- and restores exactly that. */
+static void seam_install(struct seam_scope *s, bool count_allocs)
+{
+    s->prev_backend_alloc = wtq_nw_test_backend_alloc;
+    s->prev_hold_pump = wtq_nw_test_hold_pump;
+    s->prev_cancel_with_owed = wtq_nw_test_cancel_with_owed;
+    s->prev_conn_closes = wtq_nw_test_conn_closes;
+    s->prev_completion_first = wtq_nw_test_phase_completion_first;
+    s->prev_retire_first = wtq_nw_test_phase_retire_first;
+    s->prev_nw_profile = g_nw_profile;
+    s->prev_nw_origin = g_nw_origin;
+    if (count_allocs) {
+        cnt_reset();
+        wtq_nw_test_backend_alloc = &g_cnt_vtable;
+    }
+}
+
+static void seam_restore(struct seam_scope *s)
+{
+    wtq_nw_test_backend_alloc = s->prev_backend_alloc;
+    wtq_nw_test_hold_pump = s->prev_hold_pump;
+    wtq_nw_test_cancel_with_owed = s->prev_cancel_with_owed;
+    wtq_nw_test_conn_closes = s->prev_conn_closes;
+    wtq_nw_test_phase_completion_first = s->prev_completion_first;
+    wtq_nw_test_phase_retire_first = s->prev_retire_first;
+    g_nw_profile = s->prev_nw_profile;
+    g_nw_origin = s->prev_nw_origin;
+}
+
+/* Assert the counting oracle is fully balanced: BOTH the object count and
+ * the byte total, plus zero accounting errors. */
+static int cnt_assert_balanced(const char *what)
+{
+    pthread_mutex_lock(&g_cnt.mu);
+    const int live = g_cnt.live;
+    const size_t bytes = g_cnt.live_bytes;
+    const int errs = g_cnt.errors;
+    pthread_mutex_unlock(&g_cnt.mu);
+    if (live != 0 || bytes != 0 || errs != 0) {
+        fprintf(stderr,
+                "FAIL: %s: allocation not balanced: live=%d bytes=%zu "
+                "errors=%d\n", what, live, bytes, errs);
+        return 1;
+    }
+    return 0;
+}
+
+/* Fired from the REAL batch_on_complete(); releases the waiter. */
+static void wp_sem_signal(void *ctx)
+{
+    dispatch_semaphore_signal((dispatch_semaphore_t)ctx);
+}
+
+/*
+ * The counting oracle's own semantics, asserted directly
+ * rather than described in prose. Each transition is checked against the
+ * documented test semantics above.
+ */
+static int t_cnt_allocator_semantics(void)
+{
+    int failures = 0;
+    int live; size_t bytes; int errs;
+
+    cnt_reset();
+    /* alloc charges once */
+    void *a = cnt_alloc(100, NULL);
+    WTQ_TEST_CHECK(a != NULL);
+    pthread_mutex_lock(&g_cnt.mu);
+    live = g_cnt.live; bytes = g_cnt.live_bytes;
+    pthread_mutex_unlock(&g_cnt.mu);
+    WTQ_TEST_CHECK_EQ_INT(live, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, 100u);
+
+    /* realloc(NULL, n) == alloc(n) */
+    void *b = cnt_realloc(NULL, 0, 50, NULL);
+    WTQ_TEST_CHECK(b != NULL);
+    pthread_mutex_lock(&g_cnt.mu);
+    live = g_cnt.live; bytes = g_cnt.live_bytes;
+    pthread_mutex_unlock(&g_cnt.mu);
+    WTQ_TEST_CHECK_EQ_INT(live, 2);
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, 150u);
+
+    /* grow: old size released, new size charged, count unchanged */
+    a = cnt_realloc(a, 100, 200, NULL);
+    WTQ_TEST_CHECK(a != NULL);
+    pthread_mutex_lock(&g_cnt.mu);
+    live = g_cnt.live; bytes = g_cnt.live_bytes;
+    pthread_mutex_unlock(&g_cnt.mu);
+    WTQ_TEST_CHECK_EQ_INT(live, 2);
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, 250u);
+
+    /* realloc(p, 0): the block STAYS LIVE, re-charged to zero bytes, and
+     * libc realloc is never consulted -- so a NULL return can never be
+     * confused with a failure. */
+    void *b0 = cnt_realloc(b, 50, 0, NULL);
+    WTQ_TEST_CHECK(b0 == b); /* same block, deterministically */
+    pthread_mutex_lock(&g_cnt.mu);
+    live = g_cnt.live; bytes = g_cnt.live_bytes; errs = g_cnt.errors;
+    pthread_mutex_unlock(&g_cnt.mu);
+    WTQ_TEST_CHECK_EQ_INT(live, 2);       /* still live */
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, 200u);  /* only `a` is charged now */
+    WTQ_TEST_CHECK_EQ_INT(errs, 0);
+
+    /* underflow is REPORTED, never wrapped */
+    cnt_free(a, 999999, NULL);
+    pthread_mutex_lock(&g_cnt.mu);
+    bytes = g_cnt.live_bytes; errs = g_cnt.errors;
+    pthread_mutex_unlock(&g_cnt.mu);
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, 0u);
+    WTQ_TEST_CHECK_EQ_INT(errs, 1);
+
+    cnt_free(b0, 0, NULL);
+    cnt_reset();
+    return failures;
+}
+
+/*
+ * Deterministic oracle for orderly-terminal truncation.
+ *
+ * The defect: wtq_session_close enqueues the close wire unit (H3 DATA
+ * header, then CLOSE_WEBTRANSPORT_SESSION capsule + FIN) and publishes the
+ * local clean terminal synchronously. Any Network callback that then runs
+ * nw_leave_and_poll sees session state CLOSED and, before the fix, called
+ * op_conn_close immediately -- cancelling the CONNECT stream while those
+ * accepted bytes were still owed. The peer had already received the DATA
+ * frame header, so it saw a TRUNCATED frame and raised H3_FRAME_ERROR.
+ *
+ * The oracle is ORDERING AND STATE, never elapsed time:
+ *   wtq_nw_test_cancel_with_owed counts every transport cancel issued
+ *   while accepted engine bytes were still queued or in flight. An
+ *   orderly terminal must never contribute to it.
+ *
+ * The hold gate pins the failing boundary deterministically: accepted
+ * bytes stay QUEUED (owed, unissued) while the post-terminal poll runs.
+ */
+static int t_close_flush_ordering(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv, cl;
+    wtq_msquic_listener_t *l = NULL;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+
+    side_init(&sv);
+    sv.echo_streams = true;
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    const uint16_t port = wtq_msquic_listener_port(l);
+
+    side_init(&cl);
+    cl.echo_streams = false;
+    wtq_nw_test_cancel_with_owed = 0;
+    /* every session/engine allocation for this row goes through the
+     * counting allocator, installed through the SCOPED seam so that even
+     * an environmental setup failure restores it before its storage dies */
+    struct seam_scope scope;
+    seam_install(&scope, true);
+    if (!nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0,
+                                   &g_cnt_vtable, NW_TEST_ORIGIN, &drv,
+                                   &cs) ||
+        cs == NULL || drv == NULL) {
+        seam_restore(&scope);            /* single-exit discipline */
+        side_destroy(&cl);
+        wtq_msquic_listener_stop(l);
+        side_destroy(&sv);
+        return failures + 1;
+    }
+
+    /* HOLD accepted sends in the queue, then close. The close wire unit
+     * is accepted by the driver and stays owed. */
+    __block int owed_at_close = 0;
+    __block int started_at_close = 0;
+    __block int cancels_owed = 0;
+    dispatch_sync(drv->queue, ^{
+      wtq_nw_test_hold_pump = 1;
+      (void)wtq_session_close(cs, 0, NULL, 0);
+      /* accepted close bytes are owed to the transport right now */
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+           ds = ds->next)
+          if (ds->conn != NULL && !ds->terminal && !ds->cancel_issued &&
+              (ds->pending_sends != NULL || ds->send_inflight))
+              owed_at_close++;
+      /* drive an otherwise legitimate post-terminal poll: exactly what a
+       * stray Network callback does after the local terminal fired */
+      nw_poll_after_balanced_test_callback(drv);
+      started_at_close = (int)drv->shutdown_started;
+      cancels_owed = wtq_nw_test_cancel_with_owed;
+      wtq_nw_test_hold_pump = 0;
+    });
+
+    /* the local clean terminal is synchronous and exactly once */
+    pthread_mutex_lock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
+    WTQ_TEST_CHECK(cl.closed_clean);
+    pthread_mutex_unlock(&cl.mu);
+
+    /* the boundary really was the failing one: bytes WERE owed */
+    WTQ_TEST_CHECK(owed_at_close > 0);
+    /* THE ORACLE: the post-terminal poll must not have cancelled the
+     * transport while those bytes were owed */
+    WTQ_TEST_CHECK_EQ_INT(started_at_close, 0);
+    WTQ_TEST_CHECK_EQ_INT(cancels_owed, 0);
+
+    /* NO STRAND: the deferred shutdown must also complete when the last
+     * owed stream goes TERMINAL rather than draining -- a cancelled
+     * stream may never produce another send completion, so the
+     * completion-side re-poll alone would leave the connection waiting.
+     * The bounded rundown below is the joiner, and it must succeed.
+     *
+     * Release the gate: the held bytes are issued through the ordinary
+     * pump and the deferred shutdown is re-polled from the completion
+     * path. The counter is NOT re-asserted after the rundown below:
+     * an OWNER-REQUESTED rundown is explicitly allowed to cancel
+     * outstanding sends and synthesize their completions, so it may
+     * legitimately cancel with bytes owed. The load-bearing assertion is
+     * the one above, at the orderly-terminal boundary. */
+    dispatch_sync(drv->queue, ^{
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+           ds = ds->next)
+          ds_pump_sends_for_test(ds);
+    });
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+
+    /*
+     * CAUSAL LIFETIME ORACLE: after rundown and the application's final
+     * release, the session must actually have been DESTROYED, so every
+     * allocation made through the counting allocator must be freed. A
+     * corrupted callback bracket (an unmatched session leave) drives
+     * cb_depth negative, session_unref can then never destroy the
+     * session, and its allocations stay live -- which fails here.
+     */
+    wtq_session_release(cs);
+    cs = NULL;
+    seam_restore(&scope);
+    failures += cnt_assert_balanced("close-flush lifetime");
+
+    side_destroy(&cl);
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
+/*
+ * The fix is NOT D02-specific, so the strict clean-close oracle is also
+ * run for the CURRENT profile over the same real transports: a real
+ * Network.framework client to a real managed MsQuic listener, one
+ * attempt, no retries. The peer must observe exactly one clean terminal
+ * with the exact code and no H3/QUIC error.
+ */
+/*
+ * An engine-fatal condition while ordinary sends are
+ * known owed must still shut the connection down IMMEDIATELY, with the
+ * first-causal H3 code preserved. The orderly flush gate must NOT apply to
+ * it -- a protocol error must never wait behind ordinary traffic.
+ *
+ * Driven causally, not asserted from branch order: a real malformed H3
+ * frame is fed into the CONNECT stream's engine context through the
+ * production receive SPI, inside a correctly balanced session bracket.
+ */
+static int t_fatal_shutdown_with_owed_sends(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv, cl;
+    wtq_msquic_listener_t *l = NULL;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+
+    side_init(&sv);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    side_init(&cl);
+    cl.echo_streams = false;
+    if (!nw_client_up_ready_origin(&cl, wtq_msquic_listener_port(l), "/nw",
+                                   NULL, 0, NULL, NW_TEST_ORIGIN, &drv,
+                                   &cs) ||
+        cs == NULL || drv == NULL) {
+        side_destroy(&cl);
+        wtq_msquic_listener_stop(l);
+        side_destroy(&sv);
+        return failures + 1;
+    }
+
+    __block int owed = 0;
+    __block int started = 0;
+    __block uint64_t code = 0;
+    __block int closed_flag = 0;
+    __block wtq_stream_t *data_st = NULL;
+    __block struct wtq_dstream *sess = NULL;
+
+    /* (a) open an ordinary data stream and send once, so the stream
+     *     reaches ready_processed on a real transport. Also capture the
+     *     CONNECT stream now, before any other stream exists. */
+    dispatch_sync(drv->queue, ^{
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->ectx != NULL && ds->is_local && ds->is_bidi)
+              sess = ds; /* oldest local bidi == the CONNECT stream */
+      if (wtq_session_open_bidi(cs, &data_st) == WTQ_OK &&
+          data_st != NULL) {
+          static const uint8_t pay[] = "ordinary-traffic";
+          wtq_span_t sp = { pay, sizeof(pay) - 1 };
+          (void)wtq_stream_send(data_st, &sp, 1, 0, NULL);
+      }
+    });
+    /* causal: the peer seeing the stream proves it is ready and flowing */
+    WTQ_TEST_CHECK(side_wait_ge(&sv, &sv.streams_opened, 1));
+
+    dispatch_sync(drv->queue, ^{
+      /* (b) HOLD the pump and enqueue more ordinary traffic: it is now
+       *     owed on a stream that IS ready_processed, so the orderly
+       *     flush gate would genuinely apply -- which is what makes the
+       *     fatal-branch mutant below load-bearing. */
+      wtq_nw_test_hold_pump = 1;
+      if (data_st != NULL) {
+          static const uint8_t more[] = "more-ordinary-traffic";
+          wtq_span_t sp2 = { more, sizeof(more) - 1 };
+          (void)wtq_stream_send(data_st, &sp2, 1, 0, NULL);
+      }
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->conn != NULL && !ds->terminal && !ds->cancel_issued &&
+              ds->ready_processed &&
+              (ds->pending_sends != NULL || ds->send_inflight))
+              owed++;
+
+      /* (c) drive a REAL engine-fatal input on the CONNECT stream through
+       *     the production receive SPI, inside a balanced bracket: a DATA
+       *     frame header announcing 16 bytes, one byte of body, then FIN
+       *     -- a truncated frame, the engine's fatal H3_FRAME_ERROR. */
+      if (sess != NULL && drv->session != NULL) {
+          static const uint8_t bad[] = { 0x00, 0x10, 0xAA };
+          wtq_api_session_enter(drv->session);
+          wtq_conn_t *ec = wtq_api_session_conn(drv->session);
+          (void)wtq_conn_on_stream_bytes(ec, sess->ectx, bad, sizeof(bad),
+                                         true, 3000);
+          closed_flag = (int)wtq_conn_is_closed(ec);
+          code = wtq_conn_close_code(ec);
+          /* (d) production's shape exactly: ONE bracket --
+           *     enter -> feed engine -> leave-and-poll. The immediate
+           *     shutdown is delivered by conn_fatal() calling
+           *     ops.conn_close() during the feed above; this poll does NOT
+           *     cause it, and is here only because production always runs
+           *     it after a receive delivery. */
+          nw_leave_and_poll_with_enter_held(drv);
+      }
+      /* (e) shutdown must have started IMMEDIATELY, despite owed bytes */
+      started = (int)drv->shutdown_started;
+      wtq_nw_test_hold_pump = 0;
+    });
+
+    WTQ_TEST_CHECK(owed > 0);          /* the boundary really was owed */
+    WTQ_TEST_CHECK_EQ_INT(closed_flag, 1);
+    /* the EXACT first-causal code is preserved, not merely "nonzero" */
+    WTQ_TEST_CHECK_EQ_U64(code, UINT64_C(0x0106)); /* H3_FRAME_ERROR */
+    WTQ_TEST_CHECK_EQ_INT(started, 1); /* the flush gate did NOT apply */
+    fprintf(stderr, "[fatal] owed=%d code=0x%llx started=%d\n", owed,
+            (unsigned long long)code, started);
+
+    /* exactly one terminal, and rundown stays bounded */
+    WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
+    pthread_mutex_lock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
+    pthread_mutex_unlock(&cl.mu);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    wtq_session_release(cs);
+    side_destroy(&cl);
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
+/*
+ * Explicit stop at the held-close boundary.
+ *
+ * The close wire unit is left demonstrably queued and owed, and
+ * wtq_nw_conn_stop_begin() is invoked at exactly that point -- once ON the
+ * driver domain and once off it -- proving that an owner-requested stop
+ * OVERRIDES graceful flushing, returns without blocking, and still
+ * converges: the bounded join completes, completions/disposals stay
+ * exactly-once, and the allocation balance returns to baseline.
+ *
+ * The oracle is ordering and state. The bounded join is a watchdog against
+ * a broken build, never the semantic oracle.
+ */
+static int t_stop_begin_with_held_close(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv, cl;
+    wtq_msquic_listener_t *l = NULL;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+
+    side_init(&sv);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    side_init(&cl);
+    cl.echo_streams = false;
+    struct seam_scope scope;
+    seam_install(&scope, true);
+    if (!nw_client_up_ready_origin(&cl, wtq_msquic_listener_port(l), "/nw",
+                                   NULL, 0, &g_cnt_vtable, NW_TEST_ORIGIN,
+                                   &drv, &cs) ||
+        cs == NULL || drv == NULL) {
+        seam_restore(&scope);
+        side_destroy(&cl);
+        wtq_msquic_listener_stop(l);
+        side_destroy(&sv);
+        return failures + 1;
+    }
+
+    __block int owed = 0;
+    __block int on_domain_stop = 0;
+    dispatch_sync(drv->queue, ^{
+      wtq_nw_test_hold_pump = 1;
+      (void)wtq_session_close(cs, 0, NULL, 0);
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->conn != NULL && !ds->terminal && !ds->cancel_issued &&
+              (ds->pending_sends != NULL || ds->send_inflight))
+              owed++;
+      /* ON-DOMAIN invocation at the held boundary */
+      on_domain_stop = (int)wtq_nw_conn_stop_begin(drv->pub);
+    });
+    /* the close wire unit really was owed when stop was requested */
+    WTQ_TEST_CHECK(owed > 0);
+    WTQ_TEST_CHECK_EQ_INT(on_domain_stop, 1);
+    /* the local clean terminal was still delivered synchronously */
+    pthread_mutex_lock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
+    WTQ_TEST_CHECK(cl.closed_clean);
+    pthread_mutex_unlock(&cl.mu);
+    /* OFF-DOMAIN, and idempotent: a second stop reports "already" */
+    WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_conn_stop_begin(drv->pub), 0);
+
+    /* explicit stop overrides graceful flushing: it converges even though
+     * the close send is still owed and the hold is never released */
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    wtq_nw_test_hold_pump = 0;
+
+    wtq_session_release(cs);
+    cs = NULL;
+    seam_restore(&scope);
+    failures += cnt_assert_balanced("stop_begin lifetime");
+    side_destroy(&cl);
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
+/*
+ * Causal rows for the convergence properties of deferred shutdown. Each row
+ * is deterministic and
+ * asserts ordering/state, never elapsed time.
+ */
+static int t_deferred_shutdown_convergence(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv;
+    wtq_msquic_listener_t *l = NULL;
+
+    side_init(&sv);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    const uint16_t port = wtq_msquic_listener_port(l);
+
+    /* ROW 1: terminal with NO drainable send -> ONE immediate shutdown,
+     * no deferred flag left behind. */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        side_init(&cl);
+        if (nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0, NULL,
+                                      NW_TEST_ORIGIN, &drv, &cs) &&
+            cs != NULL && drv != NULL) {
+            __block int started = 0, deferred = 0, owed = 0;
+            dispatch_sync(drv->queue, ^{
+              (void)wtq_session_close(cs, 0, NULL, 0);
+            });
+            /* let the close atom drain on its own (no hold) */
+            WTQ_TEST_CHECK(side_wait(&sv, &sv.closed));
+            dispatch_sync(drv->queue, ^{
+              /* a SECOND poll with nothing owed must close immediately */
+              nw_poll_after_balanced_test_callback(drv);
+              started = (int)drv->shutdown_started;
+              deferred = (int)drv->shutdown_when_flushed;
+              for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+                   ds = ds->next)
+                  if (ds->conn != NULL && !ds->terminal &&
+                      !ds->cancel_issued && ds->ready_processed &&
+                      (ds->pending_sends != NULL || ds->send_inflight))
+                      owed++;
+            });
+            WTQ_TEST_CHECK_EQ_INT(owed, 0);
+            WTQ_TEST_CHECK_EQ_INT(started, 1);   /* immediate */
+            WTQ_TEST_CHECK_EQ_INT(deferred, 0);  /* no flag stranded */
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+            wtq_session_release(cs);
+        } else {
+            failures++;
+        }
+        side_destroy(&cl);
+        pthread_mutex_lock(&sv.mu);
+        sv.closed = 0;
+        pthread_mutex_unlock(&sv.mu);
+    }
+
+    /* ROW 2: REJECTED before establishment (unknown path, no CLOSE
+     * capsule) -> converges, no deferred flag, no hang. */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        side_init(&cl);
+        (void)nw_client_up_origin(&cl, port, "/wrong", NULL, 0,
+                                  NW_TEST_ORIGIN, &drv, &cs);
+        if (cs != NULL && drv != NULL) {
+            wtq_nw_test_conn_closes = 0;
+            WTQ_TEST_CHECK(side_wait(&cl, &cl.refused));
+            /* DOMAIN BARRIER ONLY -- no injected poll */
+            __block int deferred = 0, started = 0, owed = 0, closes_pre = 0;
+            dispatch_sync(drv->queue, ^{
+              deferred = (int)drv->shutdown_when_flushed;
+              started = (int)drv->shutdown_started;
+              owed = (int)wtq_nw_test_sends_owed(drv);
+              closes_pre = wtq_nw_test_conn_closes;
+            });
+            pthread_mutex_lock(&cl.mu);
+            /* exact refusal cardinality and status, and no other outcome */
+            WTQ_TEST_CHECK_EQ_INT(cl.refused, 1);
+            WTQ_TEST_CHECK_EQ_U64((uint64_t)cl.refused_status, 404u);
+            WTQ_TEST_CHECK_EQ_INT(cl.established, 0);
+            WTQ_TEST_CHECK_EQ_INT(cl.failed, 0);
+            WTQ_TEST_CHECK_EQ_INT(cl.closed, 0);
+            pthread_mutex_unlock(&cl.mu);
+            /* no close capsule to flush: nothing owed, nothing deferred,
+             * shutdown started immediately */
+            WTQ_TEST_CHECK_EQ_INT(owed, 0);
+            WTQ_TEST_CHECK_EQ_INT(deferred, 0);
+            /* production converged BEFORE owner rundown: exactly one close
+             * body already, and rundown must not add another */
+            WTQ_TEST_CHECK_EQ_INT(started, 1);
+            WTQ_TEST_CHECK_EQ_INT(closes_pre, 1);
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+            WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_conn_closes, 1);
+            wtq_session_release(cs);
+        } else {
+            failures++;
+        }
+        side_destroy(&cl);
+    }
+
+    /* The not-ready exception, with exact stream
+     * identity and an exact disposition proof.
+     *
+     * Both streams are captured by IDENTITY (the fresh application dstream
+     * and the CONNECT dstream), not "any ready drainable stream". The
+     * not-ready send carries a unique cookie, and the row proves it
+     * receives EXACTLY ONE CANCELED completion during teardown and never a
+     * successful one.
+     */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        static const uint8_t NRPAY[] = "not-ready-queue";
+        static int nr_cookie_obj; /* unique cookie identity */
+
+        side_init(&cl);
+        if (nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0, NULL,
+                                      NW_TEST_ORIGIN, &drv, &cs) &&
+            cs != NULL && drv != NULL) {
+            struct seam_scope sc3;
+            seam_install(&sc3, false);
+            pthread_mutex_lock(&cl.mu);
+            cl.nr_cookie = &nr_cookie_obj;
+            pthread_mutex_unlock(&cl.mu);
+
+            __block struct wtq_dstream *connect_ds = NULL;
+            __block struct wtq_dstream *fresh_ds = NULL;
+            __block wtq_stream_t *fresh_st = NULL;
+            __block int fresh_drainable = 0, owed_before_close = 0;
+            __block int connect_drainable = 0, deferred = 0, started = 0;
+            __block int send_rc = -1;
+
+            dispatch_sync(drv->queue, ^{
+              wtq_nw_test_hold_pump = 1;
+              /* EXACT CONNECT stream identity, captured before any other
+               * stream exists */
+              for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+                   ds = ds->next)
+                  if (ds->ectx != NULL && ds->is_local && ds->is_bidi)
+                      connect_ds = ds;
+              /* a FRESH application stream, opened and written in the same
+               * domain turn, so it cannot be ready_processed */
+              if (wtq_session_open_bidi(cs, &fresh_st) == WTQ_OK &&
+                  fresh_st != NULL) {
+                  wtq_span_t sp = { NRPAY, sizeof(NRPAY) - 1 };
+                  send_rc = (int)wtq_stream_send(fresh_st, &sp, 1, 0,
+                                                 &nr_cookie_obj);
+                  for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+                       ds = ds->next)
+                      if (ds != connect_ds && ds->pending_sends != NULL &&
+                          !ds->ready_processed)
+                          fresh_ds = ds; /* EXACT fresh stream identity */
+              }
+              /* (i) production says the FRESH stream is not drainable */
+              if (fresh_ds != NULL)
+                  fresh_drainable =
+                      (int)wtq_nw_test_stream_drainable(fresh_ds);
+              owed_before_close = (int)wtq_nw_test_sends_owed(drv);
+
+              /* (ii) the CONNECT stream carrying the close atom IS */
+              (void)wtq_session_close(cs, 0, NULL, 0);
+              if (connect_ds != NULL)
+                  connect_drainable =
+                      (int)wtq_nw_test_stream_drainable(connect_ds);
+              nw_poll_after_balanced_test_callback(drv);
+              deferred = (int)drv->shutdown_when_flushed;
+              started = (int)drv->shutdown_started;
+              wtq_nw_test_hold_pump = 0;
+            });
+
+            WTQ_TEST_CHECK(connect_ds != NULL);
+            WTQ_TEST_CHECK(fresh_ds != NULL);
+            WTQ_TEST_CHECK(connect_ds != fresh_ds);
+            WTQ_TEST_CHECK_EQ_INT(send_rc, (int)WTQ_OK);
+            /* (i) the fresh not-ready queue is NOT drainable, and with only
+             * it outstanding production sees nothing owed */
+            WTQ_TEST_CHECK_EQ_INT(fresh_drainable, 0);
+            WTQ_TEST_CHECK_EQ_INT(owed_before_close, 0);
+            /* (ii) the ready CONNECT stream IS drainable, and the
+             * connection defers rather than cancelling over it */
+            WTQ_TEST_CHECK_EQ_INT(connect_drainable, 1);
+            WTQ_TEST_CHECK_EQ_INT(deferred, 1);
+            WTQ_TEST_CHECK_EQ_INT(started, 0);
+
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+            /* the not-ready accepted send is INTENTIONALLY cancelled:
+             * exactly one completion, canceled, never successful */
+            pthread_mutex_lock(&cl.mu);
+            const int nrc = cl.nr_completions, nrx = cl.nr_canceled;
+            const int nrs = cl.nr_success;
+            cl.nr_cookie = NULL;
+            pthread_mutex_unlock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT(nrc, 1);
+            WTQ_TEST_CHECK_EQ_INT(nrx, 1);
+            WTQ_TEST_CHECK_EQ_INT(nrs, 0);
+            /* every public stream handle is released explicitly */
+            if (fresh_st != NULL)
+                wtq_stream_release(fresh_st);
+            seam_restore(&sc3);
+            wtq_session_release(cs);
+        } else {
+            failures++;
+        }
+        side_destroy(&cl);
+    }
+
+    /* Two real transport submissions on the exact
+     * CONNECT stream, each watched BY BATCH IDENTITY, with the graceful
+     * close proven BEFORE any owner rundown.
+     *
+     * The watch is keyed to the exact batch and lives on the driver, so an
+     * unrelated completion cannot satisfy it, and it is disarmed
+     * unconditionally on the domain on every path -- including the
+     * watchdog path -- before its semaphore is released.
+     */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        side_init(&cl);
+        if (nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0, NULL,
+                                      NW_TEST_ORIGIN, &drv, &cs) &&
+            cs != NULL && drv != NULL) {
+            struct seam_scope sc4;
+            seam_install(&sc4, false);
+            wtq_nw_test_conn_closes = 0;
+
+            dispatch_semaphore_t done = dispatch_semaphore_create(0);
+            __block struct wtq_dstream *sess4 = NULL;
+            __block void *b1 = NULL, *b2 = NULL;
+            __block int pre_pending = 0, pre_inflight = 0, pre_batches = 0;
+            __block int n_connect = 0;
+            __block int drain_rc = -1, close_rc = -1;
+            __block int b1_inflight = 0, b1_batches = 0, close_pending = 0;
+
+            /* (1) the CONNECT stream is UNIQUE and completely idle */
+            dispatch_sync(drv->queue, ^{
+              for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+                   ds = ds->next)
+                  if (ds->ectx != NULL && ds->is_local && ds->is_bidi) {
+                      sess4 = ds;
+                      n_connect++;
+                  }
+              if (sess4 != NULL) {
+                  pre_pending = sess4->pending_sends != NULL;
+                  pre_inflight = (int)sess4->send_inflight;
+                  pre_batches = sess4->batches_live;
+              }
+            });
+            WTQ_TEST_CHECK_EQ_INT(n_connect, 1);
+            WTQ_TEST_CHECK(sess4 != NULL);
+            WTQ_TEST_CHECK_EQ_INT(pre_pending, 0);
+            WTQ_TEST_CHECK_EQ_INT(pre_inflight, 0);
+            WTQ_TEST_CHECK_EQ_INT(pre_batches, 0);
+
+            /* (2-3) DRAIN alone becomes batch 1; the hold then keeps the
+             *       CLOSE atom pending as a DISTINCT batch behind it */
+            dispatch_sync(drv->queue, ^{
+              drain_rc = (int)wtq_session_drain(cs);
+              b1 = wtq_nw_test_stream_live_batch(sess4);
+              b1_inflight = (int)sess4->send_inflight;
+              b1_batches = sess4->batches_live;
+              /* (4) watch BATCH 1 BY IDENTITY before anything can complete */
+              wtq_nw_test_watch_arm(drv, b1, wp_sem_signal, (void *)done);
+              wtq_nw_test_hold_pump = 1;
+              close_rc = (int)wtq_session_close(cs, 0, NULL, 0);
+              close_pending = sess4->pending_sends != NULL;
+              nw_poll_after_balanced_test_callback(drv);
+            });
+            WTQ_TEST_CHECK_EQ_INT(drain_rc, (int)WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(close_rc, (int)WTQ_OK);
+            WTQ_TEST_CHECK(b1 != NULL);
+            /*
+             * The DRAIN/CLOSE discriminator is TEMPORAL IDENTITY plus
+             * queue state, NOT record count: both are engine sends with no
+             * application record, so nrecs cannot tell them apart.
+             * Batch 1 exists and is in flight with the live count at 1
+             * BEFORE the close is enqueued; the close then appears as a
+             * pending record behind it, and batch 2 is a distinct identity.
+             */
+            WTQ_TEST_CHECK_EQ_INT(b1_inflight, 1);   /* in flight */
+            WTQ_TEST_CHECK_EQ_INT(b1_batches, 1);    /* exactly one live */
+            WTQ_TEST_CHECK_EQ_INT(close_pending, 1); /* queued behind it */
+
+            /* wait for BATCH 1's real completion; disarm unconditionally */
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_sec += WAIT_MS / 1000;
+            const bool got1 =
+                dispatch_semaphore_wait(done,
+                                        dispatch_walltime(&dl, 0)) == 0;
+            __block int hits1 = 0, canceled1 = 0;
+            dispatch_sync(drv->queue, ^{
+              hits1 = wtq_nw_test_watch_disarm(drv); /* ALWAYS */
+              canceled1 = (int)wtq_nw_test_watch_was_canceled(drv);
+            });
+            WTQ_TEST_CHECK(got1);
+            WTQ_TEST_CHECK_EQ_INT(hits1, 1);      /* the TARGET completed */
+            WTQ_TEST_CHECK_EQ_INT(canceled1, 0);  /* non-canceled */
+
+            /* post-batch-1 boundary, before ANY owner rundown */
+            __block int owed_now = 0, deferred_now = 0;
+            __block int started_now = 0, closes_now = 0, still_pending = 0;
+            dispatch_sync(drv->queue, ^{
+              owed_now = (int)wtq_nw_test_sends_owed(drv);
+              deferred_now = (int)drv->shutdown_when_flushed;
+              started_now = (int)drv->shutdown_started;
+              closes_now = wtq_nw_test_conn_closes;
+              still_pending = sess4->pending_sends != NULL;
+            });
+            WTQ_TEST_CHECK_EQ_INT(still_pending, 1);
+            WTQ_TEST_CHECK_EQ_INT(owed_now, 1);
+            WTQ_TEST_CHECK_EQ_INT(deferred_now, 1);
+            WTQ_TEST_CHECK_EQ_INT(started_now, 0);
+            WTQ_TEST_CHECK_EQ_INT(closes_now, 0);
+
+            /* (5) release: CLOSE issues as batch 2; watch IT by identity */
+            dispatch_sync(drv->queue, ^{
+              wtq_nw_test_hold_pump = 0;
+              ds_pump_sends_for_test(sess4);
+              b2 = wtq_nw_test_stream_live_batch(sess4);
+              if (b2 != NULL)
+                  wtq_nw_test_watch_arm(drv, b2, wp_sem_signal,
+                                        (void *)done);
+            });
+            WTQ_TEST_CHECK(b2 != NULL);
+            WTQ_TEST_CHECK(b2 != b1); /* a genuinely DISTINCT submission */
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_sec += WAIT_MS / 1000;
+            const bool got2 =
+                dispatch_semaphore_wait(done,
+                                        dispatch_walltime(&dl, 0)) == 0;
+            __block int hits2 = 0, canceled2 = 0;
+            __block int started_end = 0, deferred_end = 0, closes_end = 0;
+            dispatch_sync(drv->queue, ^{
+              hits2 = wtq_nw_test_watch_disarm(drv); /* ALWAYS */
+              canceled2 = (int)wtq_nw_test_watch_was_canceled(drv);
+              started_end = (int)drv->shutdown_started;
+              deferred_end = (int)drv->shutdown_when_flushed;
+              closes_end = wtq_nw_test_conn_closes;
+            });
+            WTQ_TEST_CHECK(got2);
+            WTQ_TEST_CHECK_EQ_INT(hits2, 1);
+            WTQ_TEST_CHECK_EQ_INT(canceled2, 0); /* completed naturally */
+            /* THE graceful close, proven BEFORE owner rundown */
+            WTQ_TEST_CHECK_EQ_INT(started_end, 1);
+            WTQ_TEST_CHECK_EQ_INT(deferred_end, 0);
+            WTQ_TEST_CHECK_EQ_INT(closes_end, 1);
+
+            /* (6) owner rundown must not add another close body */
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+            WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_conn_closes, 1);
+            dispatch_release(done);
+            seam_restore(&sc4);
+            wtq_session_release(cs);
+        } else {
+            failures++;
+        }
+        side_destroy(&cl);
+    }
+
+    /* ROW 5: a stream goes TERMINAL while graceful shutdown is deferred
+     * -> the connection still converges (no strand). */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        side_init(&cl);
+        if (nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0, NULL,
+                                      NW_TEST_ORIGIN, &drv, &cs) &&
+            cs != NULL && drv != NULL) {
+            __block int deferred = 0;
+            dispatch_sync(drv->queue, ^{
+              wtq_nw_test_hold_pump = 1;
+              (void)wtq_session_close(cs, 0, NULL, 0);
+              nw_poll_after_balanced_test_callback(drv);
+              deferred = (int)drv->shutdown_when_flushed;
+            });
+            WTQ_TEST_CHECK_EQ_INT(deferred, 1); /* really deferred */
+            /* never release the hold: the owner-requested rundown must
+             * still converge, driving the owed stream terminal */
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+            wtq_nw_test_hold_pump = 0;
+            wtq_session_release(cs);
+        } else {
+            failures++;
+        }
+        side_destroy(&cl);
+    }
+
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
+/*
+ * A real establishment failure, with the seams installed,
+ * must be observed as a failure, must clean up exactly once, and must leave
+ * no process-global state or allocation behind.
+ *
+ * The failure is deterministic and supported: the listener offers ONLY the
+ * D02 profile while the client requests CURRENT, so peer SETTINGS carry no
+ * mutually supported profile and the session fails NO_WT_SUPPORT. No port
+ * races, no fault seam, and an exact expected outcome.
+ *
+ * Non-default SENTINELS are seeded into every scoped global before entry so
+ * restoration is proved against real prior values, not assumed zeros.
+ */
+static int t_setup_failure_restores_seams(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv;
+    wtq_msquic_listener_t *l = NULL;
+
+    /* SAVE the real outer state first, so the sentinels below are restored
+     * to what actually existed on entry -- never to a presumed default. */
+    struct seam_scope outer;
+    seam_install(&outer, false);
+
+    side_init(&sv);
+    /* D02-ONLY listener: a CURRENT client cannot establish against it */
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(
+            env, &sv, WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT,
+            &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        seam_restore(&outer);
+        return failures + 1;
+    }
+    const uint16_t port = wtq_msquic_listener_port(l);
+
+    /* seed non-default sentinels INSIDE the outer scope */
+    static const wtq_alloc_t sentinel_vtable = { NULL, cnt_alloc,
+                                                 cnt_realloc, cnt_free };
+    wtq_nw_test_backend_alloc = &sentinel_vtable;
+    wtq_nw_test_hold_pump = 7;
+    wtq_nw_test_cancel_with_owed = 11;
+    wtq_nw_test_conn_closes = 13;
+    wtq_nw_test_phase_completion_first = 17;
+    wtq_nw_test_phase_retire_first = 19;
+    g_nw_profile = 23u;
+    g_nw_origin = "sentinel-origin";
+
+    /* ---- the REAL false-return branch of the shared setup helper ---- */
+    {
+        struct side bad;
+        struct wtq_driver *bdrv = (struct wtq_driver *)1; /* poisoned */
+        wtq_session_t *bcs = (wtq_session_t *)1;          /* poisoned */
+        struct nw_setup_outcome oc;
+        struct seam_scope scope;
+
+        side_init(&bad);
+        seam_install(&scope, true);   /* installs the counting allocator */
+        wtq_nw_test_hold_pump = 0;
+        g_nw_profile = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+        g_nw_origin = NULL;
+
+        /* THE SAME helper the successful rows use, on its FALSE branch */
+        const bool up = nw_client_up_ready_ex(&bad, port, "/nw", NULL, 0,
+                                              &g_cnt_vtable, g_nw_origin,
+                                              &bdrv, &bcs, &oc);
+        WTQ_TEST_CHECK(!up);                      /* false return */
+        /* it returned false only AFTER observing the exact failure */
+        WTQ_TEST_CHECK(oc.observed);
+        WTQ_TEST_CHECK_EQ_INT(oc.failed, 1);
+        WTQ_TEST_CHECK_EQ_INT(oc.failed_why,
+                              (int)WTQ_CONNECT_FAILURE_NO_WT_SUPPORT);
+        WTQ_TEST_CHECK_EQ_INT(oc.established, 0);
+        /* helper-owned cleanup ran exactly once and its bounded result
+         * was CHECKED, not discarded */
+        WTQ_TEST_CHECK(oc.cleanup_ran);
+        WTQ_TEST_CHECK(oc.rundown_ok);
+        /* the returned handles are unusable after helper cleanup */
+        WTQ_TEST_CHECK(bdrv == NULL);
+        WTQ_TEST_CHECK(bcs == NULL);
+        /* balance asserted BEFORE any later reset can erase evidence */
+        failures += cnt_assert_balanced("setup-failure lifetime");
+        seam_restore(&scope);
+        side_destroy(&bad);
+    }
+
+    /* ---- the UNFINISHED-RUNDOWN path, exercised deterministically ---- */
+    {
+        struct side bad2;
+        struct wtq_driver *b2drv = (struct wtq_driver *)1;
+        wtq_session_t *b2cs = (wtq_session_t *)1;
+        struct nw_setup_outcome oc2;
+        struct seam_scope sc2;
+
+        side_init(&bad2);
+        seam_install(&sc2, false);
+        g_nw_profile = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+        g_nw_origin = NULL;
+        /* force the leak-safe false return exactly once */
+        wtq_nw_test_force_rundown_false = 1;
+        const bool up2 = nw_client_up_ready_ex(&bad2, port, "/nw", NULL, 0,
+                                               NULL, g_nw_origin, &b2drv,
+                                               &b2cs, &oc2);
+        WTQ_TEST_CHECK(!up2);
+        WTQ_TEST_CHECK(oc2.cleanup_ran);
+        /*
+         * THE SAFETY PROPERTY: rundown did not complete, so the helper
+         * must report retention and must NOT have released the session.
+         * The caller therefore keeps `bad2` alive -- it is deliberately
+         * NOT destroyed below -- so no late callback can reach freed
+         * caller-owned state. The seam is consumed one-shot, so the
+         * ordinary rows are unaffected.
+         */
+        WTQ_TEST_CHECK(!oc2.rundown_ok);
+        WTQ_TEST_CHECK(oc2.retained);
+        WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_test_force_rundown_false, 0);
+        seam_restore(&sc2);
+        /* deliberately NOT side_destroy(&bad2): retained by contract */
+    }
+
+    /* every scoped seam is restored to the SENTINELS by that branch */
+    WTQ_TEST_CHECK(wtq_nw_test_backend_alloc == &sentinel_vtable);
+    WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_hold_pump, 7);
+    WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_cancel_with_owed, 11);
+    WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_conn_closes, 13);
+    WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_phase_completion_first, 17);
+    WTQ_TEST_CHECK_EQ_INT(wtq_nw_test_phase_retire_first, 19);
+    WTQ_TEST_CHECK_EQ_U64((uint64_t)g_nw_profile, 23u);
+    WTQ_TEST_CHECK(g_nw_origin != NULL &&
+                   strcmp(g_nw_origin, "sentinel-origin") == 0);
+
+    /* ---- the SUCCESS path uses the same framework ---- */
+    wtq_nw_test_backend_alloc = NULL;
+    wtq_nw_test_hold_pump = 0;
+    g_nw_profile = 0;
+    g_nw_origin = NULL;
+    {
+        struct side sv2, ok;
+        wtq_msquic_listener_t *l2 = NULL;
+        struct wtq_driver *odrv = NULL;
+        wtq_session_t *ocs = NULL;
+        struct nw_setup_outcome oc2;
+        struct seam_scope sc2;
+
+        side_init(&sv2);
+        if (listener_up_profiles(env, &sv2, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                 &l2) == WTQ_OK && l2 != NULL) {
+            side_init(&ok);
+            ok.echo_streams = false;
+            seam_install(&sc2, true);
+            if (nw_client_up_ready_ex(&ok, wtq_msquic_listener_port(l2),
+                                      "/nw", NULL, 0, &g_cnt_vtable,
+                                      NW_TEST_ORIGIN, &odrv, &ocs, &oc2) &&
+                ocs != NULL && odrv != NULL) {
+                WTQ_TEST_CHECK(oc2.observed);
+                WTQ_TEST_CHECK_EQ_INT(oc2.established, 1);
+                WTQ_TEST_CHECK_EQ_INT(oc2.failed, 0);
+                WTQ_TEST_CHECK(!oc2.cleanup_ran); /* success: no cleanup */
+                WTQ_TEST_CHECK_EQ_INT((int)dom_close(odrv, ocs, 0),
+                                      (int)WTQ_OK);
+                WTQ_TEST_CHECK(side_wait(&ok, &ok.closed));
+                WTQ_TEST_CHECK(
+                    wtq_nw_conn_rundown_internal(odrv, WAIT_MS));
+                wtq_session_release(ocs);
+            } else {
+                failures++;
+            }
+            seam_restore(&sc2);
+            failures += cnt_assert_balanced("setup-success lifetime");
+            side_destroy(&ok);
+            wtq_msquic_listener_stop(l2);
+        } else {
+            failures++;
+        }
+        side_destroy(&sv2);
+    }
+
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    /* restore the ORIGINAL pre-sentinel outer state exactly */
+    seam_restore(&outer);
+    return failures;
+}
+
+static int t_watch_keying_and_lifetime(wtq_msquic_env_t *env, uint16_t port,
+                                       struct side *sv)
+{
+    int failures = 0;
+    struct side cl;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    static int foreign_key;
+    static int cookie_a, cookie_b, cookie_b2;
+
+    (void)env;
+    side_init(&cl);
+    struct seam_scope sc;
+    seam_install(&sc, true);       /* counting allocator, pre-construction */
+    if (!nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0,
+                                   &g_cnt_vtable, NW_TEST_ORIGIN, &drv,
+                                   &cs) ||
+        cs == NULL || drv == NULL) {
+        seam_restore(&sc);
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    pthread_mutex_lock(&cl.mu);
+    cl.nr_cookie = &cookie_a;
+    cl.k2_cookie = &cookie_b;
+    cl.k3_cookie = &cookie_b2;   /* the SECOND replacement batch */
+    pthread_mutex_unlock(&cl.mu);
+    pthread_mutex_lock(&sv->mu);
+    const int opened0 = sv->streams_opened;
+    pthread_mutex_unlock(&sv->mu);
+
+    /* a ready application stream */
+    __block wtq_stream_t *ast = NULL;
+    dispatch_sync(drv->queue, ^{
+      if (wtq_session_open_bidi(cs, &ast) == WTQ_OK && ast != NULL) {
+          static const uint8_t p0[] = "make-ready";
+          wtq_span_t s0 = { p0, sizeof(p0) - 1 };
+          (void)wtq_stream_send(ast, &s0, 1, 0, NULL);
+      }
+    });
+    WTQ_TEST_CHECK(ast != NULL);
+    WTQ_TEST_CHECK(side_wait_ge(sv, &sv->streams_opened, opened0 + 1));
+
+    /* ---- (2a) unrelated completion AFTER arming, with a baseline ---- */
+    dispatch_semaphore_t foreign_sem = dispatch_semaphore_create(0);
+    __block int epoch0 = 0, send_a_rc = -1;
+    dispatch_sync(drv->queue, ^{
+      epoch0 = wtq_nw_test_driver_completions(drv);   /* BASELINE */
+      /* a REAL context, so an unkeyed mutant genuinely signals it */
+      wtq_nw_test_watch_arm(drv, &foreign_key, wp_sem_signal,
+                            (void *)foreign_sem);
+      static const uint8_t pa[] = "unrelated-after-arm";
+      wtq_span_t sa = { pa, sizeof(pa) - 1 };
+      send_a_rc = (int)wtq_stream_send(ast, &sa, 1, 0, &cookie_a);
+    });
+    /* CAUSAL: wait on the exact application completion, not a sleep */
+    WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.nr_completions, 1));
+    __block int epoch1 = 0, armed1 = 0, hits1 = 0;
+    dispatch_sync(drv->queue, ^{                       /* domain barrier */
+      epoch1 = wtq_nw_test_driver_completions(drv);
+      armed1 = (int)wtq_nw_test_watch_armed(drv);
+      hits1 = wtq_nw_test_watch_hits(drv);
+    });
+    pthread_mutex_lock(&cl.mu);
+    const int cookie_a_done = cl.nr_completions;
+    pthread_mutex_unlock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(send_a_rc, (int)WTQ_OK);  /* accepted */
+    WTQ_TEST_CHECK_EQ_INT(cookie_a_done, 1);   /* that exact send finished */
+    WTQ_TEST_CHECK(epoch1 > epoch0);           /* AFTER the baseline */
+    WTQ_TEST_CHECK_EQ_INT(armed1, 1);          /* watch still armed */
+    WTQ_TEST_CHECK_EQ_INT(hits1, 0);           /* and never satisfied */
+    /* and its context was never signalled */
+    WTQ_TEST_CHECK(dispatch_semaphore_wait(foreign_sem, DISPATCH_TIME_NOW)
+                   != 0);
+
+    /* ---- (2b) + (3): an EXACT held target, then replacement ordering ---- */
+    dispatch_semaphore_t ctxsem = dispatch_semaphore_create(0);
+    __block void *b1 = NULL, *b2 = NULL;
+    __block struct wtq_dstream *ads = NULL;
+    __block int b1_batches = 0, send_b1_rc = -1, send_b2_rc = -1;
+    dispatch_sync(drv->queue, ^{
+      (void)wtq_nw_test_watch_disarm(drv);   /* retire the foreign watch */
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->ectx != NULL && ds->is_local && ds->is_bidi &&
+              ads == NULL)
+              ads = ds;                       /* newest-first: app stream */
+      if (ads != NULL && ads->ready_processed && !ads->send_inflight) {
+          /* send A becomes b1, DETACHED: it cannot complete on its own */
+          wtq_nw_test_detach_next(ads);
+          static const uint8_t pb[] = "held-target";
+          wtq_span_t sb = { pb, sizeof(pb) - 1 };
+          send_b1_rc = (int)wtq_stream_send(ast, &sb, 1, 0, &cookie_b);
+          b1 = wtq_nw_test_stream_live_batch(ads);
+          b1_batches = ads->batches_live;
+          /* the SECOND replacement batch queues BEHIND b1 and carries its
+           * OWN distinct cookie, so its completion is observed
+           * independently of b1's; arm detach for the next pump so the
+           * replacement is also non-submitted */
+          static const uint8_t pc[] = "replacement";
+          wtq_span_t scv = { pc, sizeof(pc) - 1 };
+          send_b2_rc = (int)wtq_stream_send(ast, &scv, 1, 0, &cookie_b2);
+          wtq_nw_test_detach_next(ads);
+          /* arm the watch on the EXACT held target */
+          wtq_nw_test_watch_arm(drv, b1, wp_sem_signal, (void *)ctxsem);
+      }
+    });
+    /* every prerequisite is CHECKED before any raw batch seam is used */
+    WTQ_TEST_CHECK_EQ_INT(send_b1_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(send_b2_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK(b1 != NULL);
+    WTQ_TEST_CHECK_EQ_INT(b1_batches, 1);
+    if (b1 == NULL || send_b1_rc != (int)WTQ_OK ||
+        send_b2_rc != (int)WTQ_OK) {
+        /* a failed prerequisite must NEVER fall through to a raw phase
+         * seam: tear down through the supported path and return */
+        dispatch_sync(drv->queue, ^{ (void)wtq_nw_test_watch_disarm(drv); });
+        dispatch_release(ctxsem);
+        dispatch_release(foreign_sem);
+        if (ast != NULL)
+            wtq_stream_release(ast);
+        WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+        wtq_session_release(cs);
+        seam_restore(&sc);
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    /* the target CANNOT complete on its own, so the real wait must take its
+     * watchdog path; use a short explicit backstop as that trigger only */
+    struct timespec wdl;
+    clock_gettime(CLOCK_REALTIME, &wdl);
+    wdl.tv_nsec += 200 * 1000 * 1000L;
+    if (wdl.tv_nsec >= 1000000000L) { wdl.tv_sec++; wdl.tv_nsec -= 1000000000L; }
+    const bool signalled =
+        dispatch_semaphore_wait(ctxsem, dispatch_walltime(&wdl, 0)) == 0;
+    WTQ_TEST_CHECK(!signalled);   /* structurally impossible to complete */
+
+    /* the SAME unconditional on-domain disarm the real wait uses */
+    __block int hits_at_disarm = 0, epoch2 = 0;
+    dispatch_sync(drv->queue, ^{
+      hits_at_disarm = wtq_nw_test_watch_disarm(drv);
+      epoch2 = wtq_nw_test_driver_completions(drv);
+    });
+    WTQ_TEST_CHECK_EQ_INT(hits_at_disarm, 0);
+    /* only NOW is the context released -- after the disarm returned */
+    dispatch_release(ctxsem);
+
+    /* (3) drive b1's completion: it must install b2 */
+    __block int live_is_b2 = 0, b1_phases = 0, batches_mid = 0;
+    dispatch_sync(drv->queue, ^{
+      wtq_nw_test_batch_phase_one(b1, true, true);   /* completion first */
+      b1_phases = wtq_nw_test_batch_phases_done(b1);
+      b2 = wtq_nw_test_stream_live_batch(ads);
+      live_is_b2 = (int)(b2 != NULL && b2 != b1);
+      batches_mid = ads->batches_live;
+    });
+    WTQ_TEST_CHECK_EQ_INT(b1_phases, 1);
+    WTQ_TEST_CHECK_EQ_INT(live_is_b2, 1);   /* b2 installed, distinct */
+    WTQ_TEST_CHECK_EQ_INT(batches_mid, 2);  /* both batches live */
+
+    /* b1 RETIRES: the live pointer must still be b2 */
+    __block int live_still_b2 = 0, epoch3 = 0, hits_after = 0;
+    dispatch_sync(drv->queue, ^{
+      wtq_nw_test_batch_phase_two(b1, true, true);   /* retire b1 */
+      live_still_b2 = (int)(wtq_nw_test_stream_live_batch(ads) == b2);
+      epoch3 = wtq_nw_test_driver_completions(drv);
+      hits_after = wtq_nw_test_watch_hits(drv);
+    });
+    WTQ_TEST_CHECK_EQ_INT(live_still_b2, 1); /* retirement did NOT erase */
+    /* (2b) the epoch advanced past the disarm while target hits stayed 0,
+     * and nothing touched the released context */
+    WTQ_TEST_CHECK(epoch3 > epoch2);
+    WTQ_TEST_CHECK_EQ_INT(hits_after, 0);
+
+    /* b2's final phase clears the slot */
+    __block void *live_end = (void *)1;
+    __block int batches_end = 0;
+    dispatch_sync(drv->queue, ^{
+      wtq_nw_test_batch_phase_one(b2, true, true);
+      wtq_nw_test_batch_phase_two(b2, true, true);
+      live_end = wtq_nw_test_stream_live_batch(ads);
+      batches_end = ads->batches_live;
+    });
+    WTQ_TEST_CHECK(live_end == NULL);
+    WTQ_TEST_CHECK_EQ_INT(batches_end, 0);
+
+    /* ALL THREE application cookies observed exactly once, each with its
+     * expected disposition; B1 and B2 are driven canceled by the harness */
+    pthread_mutex_lock(&cl.mu);
+    const int a_done = cl.nr_completions, a_cx = cl.nr_canceled;
+    const int b_done = cl.k2_completions, b_cx = cl.k2_canceled;
+    const int b2_done = cl.k3_completions, b2_cx = cl.k3_canceled;
+    cl.nr_cookie = NULL;
+    cl.k2_cookie = NULL;
+    cl.k3_cookie = NULL;
+    pthread_mutex_unlock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(a_done, 1);
+    WTQ_TEST_CHECK_EQ_INT(a_cx, 0);    /* a real, successful send */
+    WTQ_TEST_CHECK_EQ_INT(b_done, 1);
+    WTQ_TEST_CHECK_EQ_INT(b_cx, 1);    /* driven canceled */
+    WTQ_TEST_CHECK_EQ_INT(b2_done, 1); /* the SECOND replacement batch */
+    WTQ_TEST_CHECK_EQ_INT(b2_cx, 1);
+    /* STREAM-OWNED final state: no record left in use or owed, read from
+     * the dstream rather than a freed batch */
+    __block int rec_in_use = -1, rec_app_pending = -1, rec_unretired = -1;
+    dispatch_sync(drv->queue, ^{
+      rec_in_use = wtq_nw_test_stream_recs_in_use(ads);
+      rec_app_pending = wtq_nw_test_stream_recs_app_pending(ads);
+      rec_unretired = wtq_nw_test_stream_recs_unretired(ads);
+    });
+    WTQ_TEST_CHECK_EQ_INT(rec_in_use, 0);
+    WTQ_TEST_CHECK_EQ_INT(rec_app_pending, 0);
+    WTQ_TEST_CHECK_EQ_INT(rec_unretired, 0);
+
+    dispatch_release(foreign_sem);
+    if (ast != NULL)
+        wtq_stream_release(ast);
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    wtq_session_release(cs);
+    cs = NULL;
+    seam_restore(&sc);
+    failures += cnt_assert_balanced("watch/replacement lifetime");
+    side_destroy(&cl);
+    return failures;
+}
+
+static int t_phase_order_both(wtq_msquic_env_t *env, uint16_t port,
+                              struct side *sv, bool complete_first)
+{
+    int failures = 0;
+    struct side cl;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    struct seam_scope sc;
+
+    (void)env;
+    side_init(&cl);
+    /* the counting allocator is installed BEFORE construction, so the
+     * final balance measures the objects it names */
+    seam_install(&sc, true);
+    if (!nw_client_up_ready_origin(&cl, port, "/nw", NULL, 0,
+                                   &g_cnt_vtable, NW_TEST_ORIGIN, &drv,
+                                   &cs) ||
+        cs == NULL || drv == NULL) {
+        seam_restore(&sc);
+        side_destroy(&cl);
+        return failures + 1;
+    }
+    wtq_nw_test_conn_closes = 0;
+
+    __block void *hb = NULL;
+    __block struct wtq_dstream *sess = NULL;
+    __block int armed = 0, batches_before = 0, nrecs = 0;
+    __block int target_rc = -1, close_rc = -1;
+
+    /*
+     * The detached batch must carry a real send RECORD, so it is an
+     * APPLICATION send with a cookie -- the CLOSE capsule is an engine
+     * send with no app cookie and therefore no record, which is why it
+     * cannot be the harness batch.
+     *
+     * Sequence: get an app stream ready with a first real send, then mark
+     * its NEXT batch detached (one-shot, consumed in the same domain turn)
+     * and issue a second cookie'd send. That batch is
+     * PRODUCTION-CONSTRUCTED and fully accounted but deliberately NOT
+     * transport-submitted, so no real completion can race the phases
+     * driven below. It is NOT an issued batch.
+     */
+    pthread_mutex_lock(&sv->mu);
+    const int opened0 = sv->streams_opened;
+    pthread_mutex_unlock(&sv->mu);
+    __block wtq_stream_t *app_st = NULL;
+    __block struct wtq_dstream *app_ds = NULL;
+    static int ph_cookie;
+    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
+    __block void *first_b = NULL;
+    dispatch_sync(drv->queue, ^{
+      if (wtq_session_open_bidi(cs, &app_st) == WTQ_OK && app_st != NULL) {
+          static const uint8_t p1[] = "phase-first";
+          wtq_span_t s1 = { p1, sizeof(p1) - 1 };
+          (void)wtq_stream_send(app_st, &s1, 1, 0, NULL);
+      }
+    });
+    /* CAUSAL, in two steps and with no sleeping or polling:
+     *   (a) the PEER observing the stream proves it became ready and the
+     *       first batch actually went out;
+     *   (b) that first batch is then watched BY IDENTITY and its real
+     *       completion awaited, so the pump is free to issue a SECOND
+     *       batch -- ds_pump_sends() will not issue while one is in
+     *       flight, which is why (a) alone is not enough. */
+    WTQ_TEST_CHECK(side_wait_ge(sv, &sv->streams_opened, opened0 + 1));
+    /*
+     * ONE explicit selection, made once and reused for the precondition,
+     * the target send, the phase callbacks and the final assertions. The
+     * stream list is NEWEST-FIRST, so the newest local bidi is the
+     * application stream just opened and the OLDEST is the CONNECT stream;
+     * both are captured and required to differ, rather than relying on
+     * traversal order at each use site.
+     */
+    dispatch_sync(drv->queue, ^{
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->ectx != NULL && ds->is_local && ds->is_bidi) {
+              if (app_ds == NULL)
+                  app_ds = ds;   /* newest == the application stream */
+              sess = ds;         /* oldest == the CONNECT stream */
+          }
+      if (app_ds != NULL && app_ds != sess) {
+          first_b = wtq_nw_test_stream_live_batch(app_ds);
+          if (first_b != NULL)
+              wtq_nw_test_watch_arm(drv, first_b, wp_sem_signal,
+                                    (void *)ready);
+      }
+    });
+    WTQ_TEST_CHECK(app_ds != NULL);
+    WTQ_TEST_CHECK(sess != NULL);
+    WTQ_TEST_CHECK(app_ds != sess);
+    if (app_ds == NULL || sess == NULL || app_ds == sess) {
+        dispatch_sync(drv->queue, ^{ (void)wtq_nw_test_watch_disarm(drv); });
+        WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+        if (app_st != NULL)
+            wtq_stream_release(app_st);
+        wtq_session_release(cs);
+        dispatch_release(ready);
+        seam_restore(&sc);
+        failures += cnt_assert_balanced("phase-order selection abort");
+        side_destroy(&cl);
+        return failures + 1;
+    }
+    /* The first batch's completion is a PRECONDITION for the target send,
+     * so its outcome is required and recorded -- never discarded. On the
+     * watchdog path the test disarms on-domain and fails rather than
+     * driving a batch whose prerequisite never happened. */
+    /* first_b is non-NULL only if that batch is STILL in flight; if it has
+     * already completed the precondition is met without any wait. */
+    bool first_ok = (first_b == NULL);
+    if (first_b != NULL) {
+        struct timespec rdl;
+        clock_gettime(CLOCK_REALTIME, &rdl);
+        rdl.tv_sec += WAIT_MS / 1000;
+        first_ok =
+            dispatch_semaphore_wait(ready, dispatch_walltime(&rdl, 0)) == 0;
+    }
+    __block int first_hits = 0, first_canceled = 0, first_idle = 0;
+    dispatch_sync(drv->queue, ^{
+      first_hits = wtq_nw_test_watch_hits(drv);
+      first_canceled = (int)wtq_nw_test_watch_was_canceled(drv);
+      (void)wtq_nw_test_watch_disarm(drv);   /* ALWAYS, on the domain */
+      for (struct wtq_dstream *ds = drv->streams; ds != NULL; ds = ds->next)
+          if (ds->ectx != NULL && ds->is_local && ds->is_bidi) {
+              first_idle = (int)(ds->ready_processed && !ds->send_inflight);
+              break;
+          }
+    });
+    WTQ_TEST_CHECK(first_ok);      /* if a wait was needed, it SUCCEEDED */
+    if (first_b != NULL) {
+        WTQ_TEST_CHECK_EQ_INT(first_hits, 1);     /* the exact target */
+        WTQ_TEST_CHECK_EQ_INT(first_canceled, 0); /* non-canceled */
+    }
+    /*
+     * THE precondition is ready-and-idle. Under load the stream can still
+     * have a batch in flight here (the pump may have issued another), so
+     * this is WAITED FOR causally on the keyed watch rather than asserted
+     * once -- asserting a single snapshot made this row load-dependent.
+     */
+    for (int guard = 0; guard < 4 && first_idle != 1; guard++) {
+        __block void *pend_b = NULL;
+        dispatch_sync(drv->queue, ^{
+          for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+               ds = ds->next)
+              if (ds->ectx != NULL && ds->is_local && ds->is_bidi) {
+                  if (ds->send_inflight)
+                      pend_b = wtq_nw_test_stream_live_batch(ds);
+                  break;
+              }
+          if (pend_b != NULL)
+              wtq_nw_test_watch_arm(drv, pend_b, wp_sem_signal,
+                                    (void *)ready);
+        });
+        if (pend_b == NULL)
+            break;                       /* nothing in flight to wait on */
+        struct timespec gdl;
+        clock_gettime(CLOCK_REALTIME, &gdl);
+        gdl.tv_sec += WAIT_MS / 1000;
+        (void)dispatch_semaphore_wait(ready, dispatch_walltime(&gdl, 0));
+        dispatch_sync(drv->queue, ^{
+          (void)wtq_nw_test_watch_disarm(drv);   /* ALWAYS, on the domain */
+          for (struct wtq_dstream *ds = drv->streams; ds != NULL;
+               ds = ds->next)
+              if (ds->ectx != NULL && ds->is_local && ds->is_bidi) {
+                  first_idle =
+                      (int)(ds->ready_processed && !ds->send_inflight);
+                  break;
+              }
+        });
+    }
+    WTQ_TEST_CHECK_EQ_INT(first_idle, 1);
+    if (!first_ok || first_idle != 1) {
+        /* precondition absent: take one safe cleanup path, drive nothing */
+        WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+        if (app_st != NULL)
+            wtq_stream_release(app_st);
+        wtq_session_release(cs);
+        dispatch_release(ready);
+        seam_restore(&sc);
+        failures += cnt_assert_balanced("phase-order precondition abort");
+        side_destroy(&cl);
+        return failures + 1;
+    }
+    /* register the target send's OWN completion slot before delivery */
+    pthread_mutex_lock(&cl.mu);
+    cl.ph_slot_cookie = &ph_cookie;
+    cl.ph_slot_completions = 0;
+    cl.ph_slot_canceled = 0;
+    pthread_mutex_unlock(&cl.mu);
+
+    dispatch_sync(drv->queue, ^{
+      if (app_ds->ready_processed) {
+          wtq_nw_test_detach_next(app_ds);  /* ONE-SHOT, this turn only */
+          static const uint8_t p2[] = "phase-second";
+          wtq_span_t s2 = { p2, sizeof(p2) - 1 };
+          target_rc = (int)wtq_stream_send(app_st, &s2, 1, 0, &ph_cookie);
+          hb = wtq_nw_test_stream_live_batch(app_ds);
+          if (hb != NULL)
+              nrecs = wtq_nw_test_batch_nrecs(hb);
+          batches_before = app_ds->batches_live;
+      }
+      /* the close atom arms the graceful deferral */
+      close_rc = (int)wtq_session_close(cs, 0, NULL, 0);
+      nw_poll_after_balanced_test_callback(drv);
+      armed = (int)drv->shutdown_when_flushed;
+    });
+    WTQ_TEST_CHECK_EQ_INT(target_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(close_rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(armed, 1);
+    WTQ_TEST_CHECK(hb != NULL);
+    WTQ_TEST_CHECK_EQ_INT(batches_before, 1);
+    WTQ_TEST_CHECK(nrecs >= 1);
+    if (hb == NULL || target_rc != (int)WTQ_OK || nrecs < 1) {
+        /* a failed prerequisite must NEVER reach a raw phase seam */
+        dispatch_sync(drv->queue, ^{ (void)wtq_nw_test_watch_disarm(drv); });
+        WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+        if (app_st != NULL)
+            wtq_stream_release(app_st);
+        wtq_session_release(cs);
+        dispatch_release(ready);
+        pthread_mutex_lock(&cl.mu);
+        cl.ph_slot_cookie = NULL;
+        pthread_mutex_unlock(&cl.mu);
+        seam_restore(&sc);
+        failures += cnt_assert_balanced("phase-order prerequisite abort");
+        side_destroy(&cl);
+        return failures + 1;
+    }
+
+    __block int mid_phases = 0, mid_batches = 0, mid_closes = 0;
+    __block int mid_app = 0, mid_transport = 0, mid_live = 0;
+    __block int end_batches = 0, end_closes = 0;
+    __block void *end_live = (void *)1;
+    dispatch_sync(drv->queue, ^{
+      /* PHASE 1 in the chosen order */
+      wtq_nw_test_batch_phase_one(hb, complete_first, true);
+      mid_phases = wtq_nw_test_batch_phases_done(hb);
+      mid_batches = app_ds->batches_live;
+      mid_closes = wtq_nw_test_conn_closes;
+      mid_app = (int)wtq_nw_test_batch_rec_app_done(hb, 0);
+      mid_transport = (int)wtq_nw_test_batch_rec_transport_done(hb, 0);
+      mid_live = (int)(wtq_nw_test_stream_live_batch(app_ds) == hb);
+      /* PHASE 2 completes the pair */
+      wtq_nw_test_batch_phase_two(hb, complete_first, true);
+      end_batches = app_ds->batches_live;
+      end_closes = wtq_nw_test_conn_closes;
+      end_live = wtq_nw_test_stream_live_batch(app_ds);
+    });
+
+    /* PHASE 1: exactly one phase done, batch still live and still owned */
+    WTQ_TEST_CHECK_EQ_INT(mid_phases, 1);
+    WTQ_TEST_CHECK_EQ_INT(mid_batches, 1);
+    WTQ_TEST_CHECK_EQ_INT(mid_live, 1);
+    if (complete_first) {
+        /* app completion delivered, transport not yet retired */
+        WTQ_TEST_CHECK_EQ_INT(mid_app, 1);
+        WTQ_TEST_CHECK_EQ_INT(mid_transport, 0);
+    } else {
+        /* transport retired, app completion NOT yet delivered */
+        WTQ_TEST_CHECK_EQ_INT(mid_app, 0);
+        WTQ_TEST_CHECK_EQ_INT(mid_transport, 1);
+    }
+    /* PHASE 2: batch released exactly once, no live pointer left behind */
+    WTQ_TEST_CHECK_EQ_INT(end_batches, 0);
+    WTQ_TEST_CHECK(end_live == NULL);
+    /*
+     * NOT asserted here: "exactly one deferred transport close at the
+     * expected phase". A DETACHED batch is never transport-completed, so
+     * it keeps this connection permanently owed and the graceful close
+     * cannot fire in this construction. That property is proven exactly,
+     * and before owner rundown, on the REAL path in row 4. This harness
+     * proves the two-phase OWNERSHIP semantics for both callback orders,
+     * which is what the real path cannot drive.
+     */
+    WTQ_TEST_CHECK_EQ_INT(end_closes, mid_closes);
+    if (complete_first) {
+        WTQ_TEST_CHECK(wtq_nw_test_phase_completion_first >= 1);
+    } else {
+        WTQ_TEST_CHECK(wtq_nw_test_phase_retire_first >= 1);
+    }
+    fprintf(stderr,
+            "[phase-harness] complete_first=%d mid_phases=%d mid_app=%d "
+            "mid_transport=%d mid_closes=%d end_closes=%d\n",
+            (int)complete_first, mid_phases, mid_app, mid_transport,
+            mid_closes, end_closes);
+
+    /*
+     * FINAL OWNERSHIP, read from the STREAM-owned record pool -- never
+     * from the freed batch: no record left in use, none app-pending, none
+     * unretired. Plus the target send's own callback, exactly once with
+     * the expected disposition and no duplicate.
+     */
+    __block int ph_in_use = -1, ph_app_pending = -1, ph_unretired = -1;
+    dispatch_sync(drv->queue, ^{
+      ph_in_use = wtq_nw_test_stream_recs_in_use(app_ds);
+      ph_app_pending = wtq_nw_test_stream_recs_app_pending(app_ds);
+      ph_unretired = wtq_nw_test_stream_recs_unretired(app_ds);
+    });
+    WTQ_TEST_CHECK_EQ_INT(ph_in_use, 0);
+    WTQ_TEST_CHECK_EQ_INT(ph_app_pending, 0);
+    WTQ_TEST_CHECK_EQ_INT(ph_unretired, 0);
+    pthread_mutex_lock(&cl.mu);
+    const int ph_done = cl.ph_slot_completions;
+    const int ph_cx = cl.ph_slot_canceled;
+    cl.ph_slot_cookie = NULL;
+    pthread_mutex_unlock(&cl.mu);
+    WTQ_TEST_CHECK_EQ_INT(ph_done, 1);   /* exactly one, no duplicate */
+    WTQ_TEST_CHECK_EQ_INT(ph_cx, 1);     /* driven canceled by the harness */
+
+    WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    dispatch_release(ready);
+    if (app_st != NULL)
+        wtq_stream_release(app_st);
+    wtq_session_release(cs);
+    cs = NULL;
+    seam_restore(&sc);
+    /* the counting allocator was installed before construction, so this
+     * measures the connection's own objects. A DETACHED batch has no real
+     * transport holder, so no source-balance claim is made here; the
+     * real-path source checks remain separate. */
+    failures += cnt_assert_balanced("phase-order harness");
+    side_destroy(&cl);
+    return failures;
+}
+
+static int t_current_clean_close(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv, cl;
+    wtq_msquic_listener_t *l = NULL;
+    struct wtq_driver *drv = NULL;
+    wtq_session_t *cs = NULL;
+    const int retries0 = g_est_retry_count;
+
+    side_init(&sv);
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv,
+                                  WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    side_init(&cl);
+    cl.echo_streams = false;
+    g_nw_profile = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
+    g_nw_origin = NULL;
+    const bool up = nw_client_up_ready(&cl, wtq_msquic_listener_port(l),
+                                       "/nw", NULL, 0, NULL, &drv, &cs);
+    WTQ_TEST_CHECK(up);
+    if (up && cs != NULL && drv != NULL) {
+        WTQ_TEST_CHECK(side_wait_ge(&sv, &sv.established, 1));
+        WTQ_TEST_CHECK_EQ_INT((int)dom_close(drv, cs, 0), (int)WTQ_OK);
+        WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
+        WTQ_TEST_CHECK(side_wait(&sv, &sv.closed));
+        pthread_mutex_lock(&cl.mu);
+        WTQ_TEST_CHECK_EQ_INT(cl.established, 1);
+        WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
+        WTQ_TEST_CHECK(cl.closed_clean);
+        WTQ_TEST_CHECK_EQ_U64((uint64_t)cl.closed_code, 0u);
+        WTQ_TEST_CHECK_EQ_INT(cl.failed, 0);
+        WTQ_TEST_CHECK_EQ_INT(cl.refused, 0);
+        pthread_mutex_unlock(&cl.mu);
+        /* STRICT on the server: one CLEAN terminal, exact code, and no
+         * H3/QUIC error -- the truncated-frame disposition this task
+         * exists to eliminate would fail here. */
+        pthread_mutex_lock(&sv.mu);
+        WTQ_TEST_CHECK_EQ_INT(sv.established, 1);
+        WTQ_TEST_CHECK_EQ_INT(sv.closed, 1);
+        WTQ_TEST_CHECK(sv.closed_clean);
+        WTQ_TEST_CHECK_EQ_U64((uint64_t)sv.closed_code, 0u);
+        WTQ_TEST_CHECK_EQ_INT((int)sv.closed_err.kind,
+                              (int)WTQ_ERR_KIND_NONE);
+        WTQ_TEST_CHECK_EQ_INT(sv.failed, 0);
+        WTQ_TEST_CHECK_EQ_INT(sv.refused, 0);
+        pthread_mutex_unlock(&sv.mu);
+        WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+    }
+    if (cs != NULL)
+        wtq_session_release(cs);
+    g_nw_profile = 0;
+    g_nw_origin = NULL;
+    /* one attempt, no retries consumed */
+    WTQ_TEST_CHECK_EQ_INT(g_est_retry_count, retries0);
+    side_destroy(&cl);
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
+static int t_nw_d02_profile(wtq_msquic_env_t *env)
+{
+    int failures = 0;
+    struct side sv;
+    wtq_msquic_listener_t *l = NULL;
+    const int D02 =
+        (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
+    static const char SUB[] = "wtq-nw-test";
+
+    /* The canonical D02 row is exactly ONE attempt: snapshot the retry
+     * counter and the allowance, and assert below that neither the
+     * environmental retry policy was enabled nor a retry was consumed. */
+    const int retries0 = g_est_retry_count;
+    const int retry_allow0 = g_est_retries;
+
+    side_init(&sv);
+    /* the SERVER echoes, so one client write proves a full round trip */
+    sv.echo_streams = true;
+    WTQ_TEST_CHECK_EQ_INT(
+        (int)listener_up_profiles(env, &sv, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                  &l),
+        (int)WTQ_OK);
+    if (l == NULL) {
+        side_destroy(&sv);
+        return failures + 1;
+    }
+    const uint16_t port = wtq_msquic_listener_port(l);
+
+    /* ---- negative: D02 without an Origin fails BEFORE any effect ----- */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+
+        side_init(&cl);
+        g_nw_profile = (uint32_t)D02;
+        g_nw_origin = NULL;
+        const wtq_result_t rc =
+            nw_client_up_alloc(&cl, port, "/nw", NULL, 0, NULL, NULL, &drv,
+                               &cs);
+        WTQ_TEST_CHECK(rc != WTQ_OK);
+        WTQ_TEST_CHECK(cs == NULL);
+        pthread_mutex_lock(&cl.mu);
+        WTQ_TEST_CHECK_EQ_INT(cl.established, 0);
+        WTQ_TEST_CHECK_EQ_INT(cl.failed, 0);
+        pthread_mutex_unlock(&cl.mu);
+        side_destroy(&cl);
+        /* the globals are reset on EVERY exit path from this row */
+        g_nw_profile = 0;
+        g_nw_origin = NULL;
+    }
+
+    /* ---- positive: full D02 session across two real transports ------- */
+    {
+        struct side cl;
+        struct wtq_driver *drv = NULL;
+        wtq_session_t *cs = NULL;
+        static const char *const offer[] = { SUB };
+
+        side_init(&cl);
+        cl.echo_streams = false;
+        g_nw_profile = (uint32_t)D02;
+        g_nw_origin = "https://localhost:443";
+        const bool up =
+            nw_client_up_ready(&cl, port, "/nw", offer, 1, NULL, &drv, &cs);
+        WTQ_TEST_CHECK(up);
+        if (up && cs != NULL && drv != NULL) {
+            /* (1) exactly one establishment on BOTH sides, each with the
+             *     profile sampled INSIDE its own on_established */
+            WTQ_TEST_CHECK(side_wait_ge(&sv, &sv.established, 1));
+            pthread_mutex_lock(&cl.mu);
+            const int c_est = cl.established, c_fail = cl.failed;
+            const int c_ref = cl.refused;
+            const int c_rc = cl.cb_prof_rc, c_pr = cl.cb_prof;
+            const size_t c_sl = cl.subproto_len;
+            char c_sub[128];
+            memcpy(c_sub, cl.subproto, sizeof(c_sub));
+            pthread_mutex_unlock(&cl.mu);
+            pthread_mutex_lock(&sv.mu);
+            const int s_est = sv.established, s_fail = sv.failed;
+            const int s_rc = sv.cb_prof_rc, s_pr = sv.cb_prof;
+            const size_t s_sl = sv.subproto_len;
+            char s_sub[128];
+            memcpy(s_sub, sv.subproto, sizeof(s_sub));
+            pthread_mutex_unlock(&sv.mu);
+
+            WTQ_TEST_CHECK_EQ_INT(c_est, 1);
+            WTQ_TEST_CHECK_EQ_INT(s_est, 1);
+            WTQ_TEST_CHECK_EQ_INT(c_fail, 0);
+            WTQ_TEST_CHECK_EQ_INT(s_fail, 0);
+            WTQ_TEST_CHECK_EQ_INT(c_ref, 0);
+            /* (2) callback-time profile query: D02 on BOTH sides */
+            WTQ_TEST_CHECK_EQ_INT(c_rc, (int)WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(s_rc, (int)WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(c_pr, D02);
+            WTQ_TEST_CHECK_EQ_INT(s_pr, D02);
+            /* (3) exact negotiated subprotocol bytes on both sides */
+            WTQ_TEST_CHECK_EQ_SIZE(c_sl, sizeof(SUB) - 1);
+            WTQ_TEST_CHECK_EQ_SIZE(s_sl, sizeof(SUB) - 1);
+            WTQ_TEST_CHECK(memcmp(c_sub, SUB, sizeof(SUB) - 1) == 0);
+            WTQ_TEST_CHECK(memcmp(s_sub, SUB, sizeof(SUB) - 1) == 0);
+
+            /* (4) a REAL application exchange: exact bytes out, the
+             *     server's echo + FIN back, exact bytes in. On its own
+             *     stream, so the cap probe's abort below cannot be
+             *     mistaken for this stream's completion. */
+            {
+                static const uint8_t PAY[] = "d02-real-transport-payload";
+                wtq_stream_t *ds = NULL;
+                pthread_mutex_lock(&cl.mu);
+                const int fins0 = cl.rx_fins;
+                cl.rx_len = 0;
+                pthread_mutex_unlock(&cl.mu);
+                WTQ_TEST_CHECK_EQ_INT((int)dom_open_bidi(drv, cs, &ds),
+                                      (int)WTQ_OK);
+                if (ds != NULL) {
+                    wtq_span_t sp = { PAY, sizeof(PAY) - 1 };
+                    WTQ_TEST_CHECK_EQ_INT(
+                        (int)dom_send(drv, ds, &sp, 1, WTQ_SEND_FIN, NULL),
+                        (int)WTQ_OK);
+                    /* causal wait for the echoed FIN, no sleep */
+                    WTQ_TEST_CHECK(side_wait_ge(&cl, &cl.rx_fins,
+                                                fins0 + 1));
+                    pthread_mutex_lock(&cl.mu);
+                    const size_t got = cl.rx_len;
+                    uint8_t echo[64];
+                    memcpy(echo, cl.rx,
+                           got < sizeof(echo) ? got : sizeof(echo));
+                    pthread_mutex_unlock(&cl.mu);
+                    /* EXACT bytes crossed both transports and came back */
+                    WTQ_TEST_CHECK_EQ_SIZE(got, sizeof(PAY) - 1);
+                    if (got == sizeof(PAY) - 1)
+                        WTQ_TEST_CHECK(memcmp(echo, PAY,
+                                              sizeof(PAY) - 1) == 0);
+                } else {
+                    failures++;
+                }
+            }
+
+            /* (5) the public post-establishment query still reports D02,
+             *     and the D02 outbound cap holds over the real transport.
+             *     The cap is a PRE-transport validation: 256 is refused as
+             *     an invalid argument even on a backend that could not
+             *     perform the operation at all. A one-sided reset/stop on
+             *     a fully-open bidi is separately UNSUPPORTED on
+             *     Network.framework -- a pre-existing transport limit D02
+             *     neither introduces nor changes -- so the in-cap value
+             *     surfaces THAT, and abort (which NW implements) carries
+             *     the accepted 255. Separate stream from (4). */
+            __block int f2 = 0;
+            dispatch_sync(drv->queue, ^{ f2 = nw_d02_on_queue(cs); });
+            failures += f2;
+
+            /* (6) close normally; both sides observe exactly one terminal
+             *     and no failure, then the client runs down cleanly. */
+            WTQ_TEST_CHECK_EQ_INT((int)dom_close(drv, cs, 0),
+                                  (int)WTQ_OK);
+            WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
+            WTQ_TEST_CHECK(side_wait(&sv, &sv.closed));
+            /* EXACTLY one clean terminal per peer, with the exact code,
+             * and no failure or refusal anywhere on either side. */
+            pthread_mutex_lock(&cl.mu);
+            WTQ_TEST_CHECK_EQ_INT(cl.established, 1);
+            WTQ_TEST_CHECK_EQ_INT(cl.closed, 1);
+            WTQ_TEST_CHECK(cl.closed_clean);
+            WTQ_TEST_CHECK_EQ_U64((uint64_t)cl.closed_code, 0u);
+            WTQ_TEST_CHECK_EQ_INT(cl.failed, 0);
+            WTQ_TEST_CHECK_EQ_INT(cl.refused, 0);
+            pthread_mutex_unlock(&cl.mu);
+            pthread_mutex_lock(&sv.mu);
+            WTQ_TEST_CHECK_EQ_INT(sv.established, 1);
+            WTQ_TEST_CHECK_EQ_INT(sv.closed, 1);
+            WTQ_TEST_CHECK(sv.closed_clean);
+            WTQ_TEST_CHECK_EQ_U64((uint64_t)sv.closed_code, 0u);
+            WTQ_TEST_CHECK_EQ_INT(sv.failed, 0);
+            WTQ_TEST_CHECK_EQ_INT(sv.refused, 0);
+            pthread_mutex_unlock(&sv.mu);
+            WTQ_TEST_CHECK(wtq_nw_conn_rundown_internal(drv, WAIT_MS));
+        }
+        if (cs != NULL)
+            wtq_session_release(cs);
+        side_destroy(&cl);
+        g_nw_profile = 0;
+        g_nw_origin = NULL;
+    }
+
+    /* ONE attempt: the retry allowance was never raised for this row and
+     * no retry was consumed by it. */
+    WTQ_TEST_CHECK_EQ_INT(g_est_retries, retry_allow0);
+    WTQ_TEST_CHECK_EQ_INT(g_est_retries, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_est_retry_count, retries0);
+    /* globals are already reset on every path above; assert it so a later
+     * CURRENT scenario can never inherit this row's configuration. */
+    WTQ_TEST_CHECK_EQ_INT((int)g_nw_profile, 0);
+    WTQ_TEST_CHECK(g_nw_origin == NULL);
+    wtq_msquic_listener_stop(l);
+    side_destroy(&sv);
+    return failures;
+}
+
 static int t_conn_loss_error(void)
 {
     int failures = 0;
@@ -4258,6 +6779,32 @@ int main(int argc, char **argv)
         failures += t_meta_missing(port, &g_sv);
         failures += t_meta_recovers(port, &g_sv);
         failures += t_conn_loss_error();
+        failures += t_wait_predicate();
+        failures += t_cnt_allocator_semantics();
+        failures += t_close_flush_ordering(env);
+        failures += t_setup_failure_restores_seams(env);
+        failures += t_current_clean_close(env);
+        failures += t_fatal_shutdown_with_owed_sends(env);
+        failures += t_stop_begin_with_held_close(env);
+        failures += t_deferred_shutdown_convergence(env);
+        {
+            struct side psv;
+            wtq_msquic_listener_t *pl = NULL;
+            side_init(&psv);
+            if (listener_up_profiles(env, &psv,
+                                     WTQ_WEBTRANSPORT_PROFILES_ALL,
+                                     &pl) == WTQ_OK && pl != NULL) {
+                const uint16_t pport = wtq_msquic_listener_port(pl);
+                failures += t_watch_keying_and_lifetime(env, pport, &psv);
+                failures += t_phase_order_both(env, pport, &psv, true);
+                failures += t_phase_order_both(env, pport, &psv, false);
+                wtq_msquic_listener_stop(pl);
+            } else {
+                failures++;
+            }
+            side_destroy(&psv);
+        }
+        failures += t_nw_d02_profile(env);
         if (failures != before) {
             fprintf(stderr, "run %d/%d FAILED\n", run + 1, runs);
             break;

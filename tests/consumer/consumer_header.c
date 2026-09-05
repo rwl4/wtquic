@@ -55,6 +55,27 @@ int main(void)
         ex(&connect_cfg, sizeof(connect_cfg));
     }
 
+    /* Origin-policy tail and both serve initializer entry points. */
+    {
+        const char *origins[] = { "https://example.com" };
+        serve_cfg.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+        serve_cfg.allowed_origins = origins;
+        serve_cfg.allowed_origin_count = 1;
+        if (serve_cfg.origin_policy == WTQ_ORIGIN_POLICY_UNSET)
+            return 1;
+        (void)WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+        (void)WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+        wtq_serve_config_init(0);
+        wtq_serve_config_init_ex(0, 999);
+        void (*bare)(wtq_serve_config_t *) = &wtq_serve_config_init;
+        void (*ex)(wtq_serve_config_t *, size_t) =
+            &wtq_serve_config_init_ex;
+        bare(&serve_cfg);
+        ex(&serve_cfg, sizeof(serve_cfg));
+        if (serve_cfg.origin_policy != WTQ_ORIGIN_POLICY_UNSET)
+            return 1;
+    }
+
     /* NULL-tolerant handle helpers link and behave */
     wtq_stream_set_user(stream, 0);
     if (wtq_stream_get_user(stream) != 0)

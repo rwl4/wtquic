@@ -329,6 +329,14 @@ static size_t pump(uint64_t seed, side_t *c, side_t *s)
 }
 
 static const char *const OFFER[] = { "moqt-18" };
+static const char *const TEST_ORIGINS[] = { "https://example.com:443" };
+
+static void serve_with_test_origin(wtq_serve_config_t *path)
+{
+    path->origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+    path->allowed_origins = TEST_ORIGINS;
+    path->allowed_origin_count = 1;
+}
 
 /* One whole public-API session: connect, drain, bidi ping/pong echo
  * (the echo issued from inside the data callback), datagrams both
@@ -423,7 +431,7 @@ static int scenario_api_pair(uint64_t seed, int *fp)
  */
 
 /*
- * PUBLIC-API D02 symmetry (0014d finding 1). Everything below goes through
+ * Public-API D02 symmetry. Everything below goes through
  * wtq_connect_config_t / wtq_api_session_* — the boundary the internal
  * engine self-pair bypassed. A whitelist that omits D02 fails these
  * directly at wtq_api_session_connect.
@@ -456,6 +464,7 @@ static int scenario_public_d02(uint64_t seed, uint64_t server_set, int *fp)
     path.path = "/app";
     path.subprotocols = OFFER;
     path.subprotocol_count = 1;
+    serve_with_test_origin(&path);
     WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
 
     wtq_connect_config_t cc;
@@ -536,9 +545,89 @@ static void scenario_public_d02_config_bounds(int *fp)
     *fp += failures;
 }
 
+struct ap_noeffect {
+    int open_calls;
+    int send_calls;
+    int open_count;
+    int send_count;
+    int close_count;
+    bool driver_closed;
+    size_t wire_bytes;
+    int established;
+    int failed;
+    int draining;
+    int closed;
+    int stream_opened;
+    int stream_closed;
+    int completions;
+    int fin_events;
+    int dgram_events;
+    int profile_rc;
+    int profile;
+};
+
+static struct ap_noeffect ap_snapshot(side_t *sd)
+{
+    struct ap_noeffect snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.open_calls = sd->drv.open_calls;
+    snap.send_calls = sd->drv.send_calls;
+    snap.open_count = sd->drv.open_count;
+    snap.send_count = sd->drv.send_count;
+    snap.close_count = sd->drv.close_count;
+    snap.driver_closed = sd->drv.closed;
+    for (size_t i = 0;; i++) {
+        struct wtq_dstream *stream = fake_driver_local(&sd->drv, i);
+        if (stream == NULL)
+            break;
+        snap.wire_bytes += stream->len;
+    }
+    snap.established = sd->established;
+    snap.failed = sd->failed;
+    snap.draining = sd->draining;
+    snap.closed = sd->closed;
+    snap.stream_opened = sd->stream_opened;
+    snap.stream_closed = sd->stream_closed;
+    snap.completions = sd->completions;
+    snap.fin_events = sd->fin_events;
+    snap.dgram_events = sd->dgram_events;
+    wtq_webtransport_profile_t profile = (wtq_webtransport_profile_t)0x7f;
+    snap.profile_rc =
+        (int)wtq_session_webtransport_profile(sd->s, &profile);
+    snap.profile = (int)profile;
+    return snap;
+}
+
+static void ap_assert_no_effect(side_t *sd,
+                                const struct ap_noeffect *before, int *fp)
+{
+    int failures = 0;
+    const struct ap_noeffect after = ap_snapshot(sd);
+
+    WTQ_TEST_CHECK_EQ_INT(after.open_calls, before->open_calls);
+    WTQ_TEST_CHECK_EQ_INT(after.send_calls, before->send_calls);
+    WTQ_TEST_CHECK_EQ_INT(after.open_count, before->open_count);
+    WTQ_TEST_CHECK_EQ_INT(after.send_count, before->send_count);
+    WTQ_TEST_CHECK_EQ_INT(after.close_count, before->close_count);
+    WTQ_TEST_CHECK(after.driver_closed == before->driver_closed);
+    WTQ_TEST_CHECK_EQ_SIZE(after.wire_bytes, before->wire_bytes);
+    WTQ_TEST_CHECK_EQ_INT(after.established, before->established);
+    WTQ_TEST_CHECK_EQ_INT(after.failed, before->failed);
+    WTQ_TEST_CHECK_EQ_INT(after.draining, before->draining);
+    WTQ_TEST_CHECK_EQ_INT(after.closed, before->closed);
+    WTQ_TEST_CHECK_EQ_INT(after.stream_opened, before->stream_opened);
+    WTQ_TEST_CHECK_EQ_INT(after.stream_closed, before->stream_closed);
+    WTQ_TEST_CHECK_EQ_INT(after.completions, before->completions);
+    WTQ_TEST_CHECK_EQ_INT(after.fin_events, before->fin_events);
+    WTQ_TEST_CHECK_EQ_INT(after.dgram_events, before->dgram_events);
+    WTQ_TEST_CHECK_EQ_INT(after.profile_rc, before->profile_rc);
+    WTQ_TEST_CHECK_EQ_INT(after.profile, before->profile);
+    *fp += failures;
+}
+
 
 /*
- * PUBLIC connect-config ABI matrix (0014e finding B), driven through
+ * Public connect-config ABI matrix, driven through
  * wtq_api_session_connect on heap-backed, poisoned objects. The v1 layout
  * is spelled out INDEPENDENTLY here rather than derived from the current
  * struct, so it cannot drift with the implementation.
@@ -651,11 +740,14 @@ static void scenario_public_connect_abi(int *fp)
         path.path = "/app";
         path.subprotocols = OFFER;
         path.subprotocol_count = 1;
+        serve_with_test_origin(&path);
         WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
 
         void *obj = abi_cfg_new(rows[i].bytes, rows[i].declared,
                                 rows[i].with_profile, rows[i].val);
         WTQ_TEST_CHECK(obj != NULL);
+        pump(0xAB0 + i, &c, &s);
+        const struct ap_noeffect before = ap_snapshot(&c);
         const wtq_result_t got =
             wtq_api_session_connect(c.s, (const wtq_connect_config_t *)obj);
         WTQ_TEST_CHECK_EQ_INT((int)got, (int)rows[i].want);
@@ -670,7 +762,9 @@ static void scenario_public_connect_abi(int *fp)
             /* each row states the profile it must negotiate */
             WTQ_TEST_CHECK_EQ_INT((int)prof, rows[i].client_singular);
         } else {
-            /* 7. a rejected row leaves the session usable */
+            /* A rejected row has no engine, driver, wire, or callback effect. */
+            pump(0xAB2 + i, &c, &s);
+            ap_assert_no_effect(&c, &before, fp);
             WTQ_TEST_CHECK(c.established == 0);
             wtq_connect_config_t ok;
             wtq_connect_config_init_ex(&ok, sizeof(ok));
@@ -688,6 +782,140 @@ static void scenario_public_connect_abi(int *fp)
         wtq_session_release(c.s);
         wtq_session_release(s.s);
     }
+    *fp += failures;
+}
+
+static struct wtq_dstream *ap_newest_local(struct wtq_driver *drv)
+{
+    struct wtq_dstream *last = NULL;
+    for (size_t i = 0;; i++) {
+        struct wtq_dstream *stream = fake_driver_local(drv, i);
+        if (stream == NULL)
+            break;
+        last = stream;
+    }
+    return last;
+}
+
+typedef wtq_result_t (*ap_shutdown_fn)(wtq_stream_t *, uint32_t);
+
+typedef struct ap_shutdown_case {
+    ap_shutdown_fn fn;
+    wtq_shutdown_mode_t mode;
+    bool abort_send;
+    bool abort_recv;
+} ap_shutdown_case_t;
+
+static void ap_assert_shutdown(const struct wtq_dstream *ds, int before,
+                               const ap_shutdown_case_t *op,
+                               uint32_t code, int *fp)
+{
+    int failures = 0;
+    WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before + 1);
+    WTQ_TEST_CHECK_EQ_INT((int)ds->last_shutdown.mode, (int)op->mode);
+    WTQ_TEST_CHECK(ds->last_shutdown.abort_send == op->abort_send);
+    WTQ_TEST_CHECK(ds->last_shutdown.abort_recv == op->abort_recv);
+    if (op->abort_send)
+        WTQ_TEST_CHECK_EQ_U64(ds->last_shutdown.send_err,
+                              wtq_app_error_to_h3(code));
+    if (op->abort_recv)
+        WTQ_TEST_CHECK_EQ_U64(ds->last_shutdown.recv_err,
+                              wtq_app_error_to_h3(code));
+    *fp += failures;
+}
+
+static void scenario_public_d02_stream_cap(int *fp)
+{
+    int failures = 0;
+    static const ap_shutdown_case_t ops[] = {
+        { wtq_stream_reset, WTQ_SHUTDOWN_EXACT_HALVES, true, false },
+        { wtq_stream_stop_sending, WTQ_SHUTDOWN_EXACT_HALVES, false, true },
+        { wtq_stream_abort, WTQ_SHUTDOWN_WHOLE_STREAM, true, true },
+    };
+    static side_t c;
+    static side_t s;
+
+    if (side_up_profiles(&c, 'c', true, API_D02, 0, fp) != 0 ||
+        side_up_profiles(&s, 's', false, 0, API_D02_SET, fp) != 0)
+        return;
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    serve_with_test_origin(&path);
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
+
+    wtq_connect_config_t cfg;
+    wtq_connect_config_init_ex(&cfg, sizeof(cfg));
+    cfg.authority = "example.com";
+    cfg.path = "/app";
+    cfg.origin = "https://example.com:443";
+    cfg.subprotocols = OFFER;
+    cfg.subprotocol_count = 1;
+    cfg.webtransport_profile = API_D02;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cfg) == WTQ_OK);
+    pump(0xCA01, &c, &s);
+    WTQ_TEST_CHECK_EQ_INT(c.established, 1);
+
+    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        wtq_stream_t *stream = NULL;
+        WTQ_TEST_CHECK(wtq_session_open_bidi(c.s, &stream) == WTQ_OK);
+        struct wtq_dstream *ds = ap_newest_local(&c.drv);
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds == NULL)
+            continue;
+        const int before = ds->shutdown_count;
+        WTQ_TEST_CHECK(ops[i].fn(stream, 256) == WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
+        WTQ_TEST_CHECK(ops[i].fn(stream, UINT32_MAX) == WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
+        WTQ_TEST_CHECK(ops[i].fn(stream, 255) == WTQ_OK);
+        ap_assert_shutdown(ds, before, &ops[i], 255, fp);
+    }
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+
+    /* The cap is profile-specific: CURRENT preserves the full public range. */
+    static side_t current_c;
+    static side_t current_s;
+    if (side_up_profiles(&current_c, 'c', true,
+                         (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT, 0,
+                         fp) != 0 ||
+        side_up_profiles(&current_s, 's', false, 0,
+                         WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT, fp) != 0)
+        return;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    path.subprotocols = OFFER;
+    path.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_serve(current_s.s, &path, 1) == WTQ_OK);
+    wtq_connect_config_init_ex(&cfg, sizeof(cfg));
+    cfg.authority = "example.com";
+    cfg.path = "/app";
+    cfg.subprotocols = OFFER;
+    cfg.subprotocol_count = 1;
+    WTQ_TEST_CHECK(wtq_api_session_connect(current_c.s, &cfg) == WTQ_OK);
+    pump(0xCA02, &current_c, &current_s);
+    WTQ_TEST_CHECK_EQ_INT(current_c.established, 1);
+
+    static const uint32_t wide[] = { 256u, UINT32_MAX };
+    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        for (size_t j = 0; j < sizeof(wide) / sizeof(wide[0]); j++) {
+            wtq_stream_t *stream = NULL;
+            WTQ_TEST_CHECK(wtq_session_open_bidi(current_c.s, &stream) ==
+                           WTQ_OK);
+            struct wtq_dstream *ds = ap_newest_local(&current_c.drv);
+            WTQ_TEST_CHECK(ds != NULL);
+            if (ds == NULL)
+                continue;
+            const int before = ds->shutdown_count;
+            WTQ_TEST_CHECK(ops[i].fn(stream, wide[j]) == WTQ_OK);
+            ap_assert_shutdown(ds, before, &ops[i], wide[j], fp);
+        }
+    }
+    wtq_session_release(current_c.s);
+    wtq_session_release(current_s.s);
     *fp += failures;
 }
 
@@ -730,12 +958,14 @@ static int scenario_profile_query(uint64_t seed, int client_profile,
     path.path = "/app";
     path.subprotocols = OFFER;
     path.subprotocol_count = 1;
+    serve_with_test_origin(&path);
     WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
 
     wtq_connect_config_t cc;
     wtq_connect_config_init(&cc);
     cc.authority = "example.com";
     cc.path = "/app";
+    cc.origin = TEST_ORIGINS[0];
     cc.subprotocols = OFFER;
     cc.subprotocol_count = 1;
     cc.webtransport_profile = (uint32_t)client_profile;
@@ -913,12 +1143,14 @@ static int scenario_authoritative_set_ignores_singular(uint64_t seed, int *fp)
     path.path = "/app";
     path.subprotocols = OFFER;
     path.subprotocol_count = 1;
+    serve_with_test_origin(&path);
     WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &path, 1) == WTQ_OK);
 
     wtq_connect_config_t cc;
     wtq_connect_config_init(&cc);
     cc.authority = "example.com";
     cc.path = "/app";
+    cc.origin = TEST_ORIGINS[0];
     cc.subprotocols = OFFER;
     cc.subprotocol_count = 1;
     cc.webtransport_profile =
@@ -950,6 +1182,7 @@ int main(void)
                               &failures);
     scenario_public_d02_config_bounds(&failures);
     scenario_public_connect_abi(&failures);
+    scenario_public_d02_stream_cap(&failures);
     (void)scenario_profile_query(0xC0FFEE,
                                  (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
                                  (int)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,

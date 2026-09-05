@@ -31,6 +31,17 @@
 extern "C" {
 #endif
 
+/* Frozen element layout used by the legacy session-serve ABI. Keep this
+ * internal: it exists so an old binary's array stride remains knowable after
+ * wtq_serve_config_t grows. */
+typedef struct wtq_serve_config_v1 {
+    uint32_t struct_size;
+    const char *path;
+    const char *const *subprotocols;
+    size_t subprotocol_count;
+    bool require_subprotocol;
+} wtq_serve_config_v1_t;
+
 /*
  * struct_size-gated field presence: true only when the WHOLE field lies
  * within the caller's declared struct_size. A size landing mid-field must be
@@ -104,10 +115,19 @@ WTQ_SPI wtq_result_t wtq_api_session_start(wtq_session_t *session,
 WTQ_SPI wtq_result_t wtq_api_session_connect(wtq_session_t *session,
                                      const wtq_connect_config_t *cfg);
 
-/* Server: register the accept policy (max 4 paths). */
+/* Server: register the accept policy (max 4 paths). The bare symbol is
+ * frozen to the v1 array stride for already-compiled backends. Current source
+ * calls route through _ex with the current element stride; a backend retaining
+ * an older element layout can call _ex with that layout's stride explicitly. */
 WTQ_SPI wtq_result_t wtq_api_session_serve(wtq_session_t *session,
                                    const wtq_serve_config_t *paths,
                                    size_t count);
+WTQ_SPI wtq_result_t wtq_api_session_serve_ex(wtq_session_t *session,
+                                      const wtq_serve_config_t *paths,
+                                      size_t count, size_t path_stride);
+#define wtq_api_session_serve(session, paths, count)                         \
+    wtq_api_session_serve_ex((session), (paths), (count),                    \
+                             sizeof(wtq_serve_config_t))
 
 /* The underlying engine connection — for backends to feed transport
  * events into (wtq_conn_on_*). */

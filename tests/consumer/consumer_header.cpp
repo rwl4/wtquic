@@ -46,6 +46,22 @@ int main()
     ex(&connect_cfg, sizeof(connect_cfg));
     if (connect_cfg.authority != nullptr || serve_cfg.path != nullptr)
         return 1;
+
+    const char *origins[] = { "https://example.com" };
+    serve_cfg.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+    serve_cfg.allowed_origins = origins;
+    serve_cfg.allowed_origin_count = 1;
+    (void)WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+    (void)WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+    wtq_serve_config_init(nullptr);
+    wtq_serve_config_init_ex(nullptr, 999);
+    void (*serve_bare)(wtq_serve_config_t *) = &wtq_serve_config_init;
+    void (*serve_ex)(wtq_serve_config_t *, size_t) =
+        &wtq_serve_config_init_ex;
+    serve_bare(&serve_cfg);
+    serve_ex(&serve_cfg, sizeof(serve_cfg));
+    if (serve_cfg.origin_policy != WTQ_ORIGIN_POLICY_UNSET)
+        return 1;
     (void)WTQ_SEND_FIN;
     wtq_stream_set_user(stream, nullptr);
 
@@ -62,6 +78,23 @@ int main()
             WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
         wtq_webtransport_profile_t prof =
             static_cast<wtq_webtransport_profile_t>(0x7f);
+        static_assert(
+            WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT !=
+                WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
+            "D02 profile must differ from current");
+        static_assert(
+            WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT !=
+                WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
+            "D02 profile must differ from D13/14");
+        static_assert(
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT !=
+                WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT,
+            "D02 mask must differ from current");
+        static_assert(
+            (WTQ_WEBTRANSPORT_PROFILES_ALL &
+             WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT) ==
+                WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT,
+            "D02 mask must be in the complete set");
         if (set != WTQ_WEBTRANSPORT_PROFILES_ALL)
             return 1;
         if (wtq_session_webtransport_profile(nullptr, &prof) !=

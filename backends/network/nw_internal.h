@@ -168,6 +168,13 @@ struct wtq_dstream {
     struct wtq_nw_pending_send *pending_sends;      /* FIFO head */
     struct wtq_nw_pending_send *pending_sends_tail;
     bool send_inflight;      /* one nw_connection_send outstanding */
+#ifdef WTQ_NW_TESTING
+    void *live_batch_for_test;  /* the batch currently issued */
+    /* ONE-SHOT, per-stream: build+account the NEXT batch exactly as
+     * production does but do not submit it to the transport. Consumed in
+     * the same domain turn that issues it. */
+    bool detach_next_batch;
+#endif
 
     struct wtq_nw_send_rec recs[WTQ_NW_SEND_RECORDS];
     size_t inflight_bytes;
@@ -235,6 +242,31 @@ struct wtq_driver {
     int dgram_inflight;              /* datagram sends awaiting completion */
     bool closed_fed;                 /* wtq_conn_on_conn_closed delivered */
     bool shutdown_started;           /* group cancel issued             */
+    /*
+     * An ORDERLY session terminal (CLOSED/REJECTED/FAILED) must not
+     * cancel the transport while accepted engine bytes -- notably the
+     * CLOSE capsule and its FIN -- are still queued or in flight, or the
+     * peer sees a truncated H3 frame. When that is the case the graceful
+     * shutdown is deferred here and re-polled from the send-completion
+     * path. Engine-FATAL closes never set this: a protocol error still
+     * shuts the connection down immediately.
+     */
+    bool shutdown_when_flushed;
+#ifdef WTQ_NW_TESTING
+    /*
+     * BATCH-KEYED completion watch, per driver and domain-confined.
+     * Only batch_on_complete(target, ...) may satisfy it; registration,
+     * match/consume and cancellation all linearize on the driver queue.
+     * The callback/context are cleared BEFORE the callback runs, so a
+     * later completion can never reach a released context.
+     */
+    void *watch_batch;
+    void (*watch_cb)(void *ctx);
+    void *watch_ctx;
+    int watch_hits;          /* completions of the TARGET batch only */
+    bool watch_canceled;     /* target completion was non-canceled? */
+    int completions_total;   /* every batch completion on this driver */
+#endif
     bool rundown;                    /* internal rundown in progress    */
     dispatch_semaphore_t rundown_done;
 
@@ -337,6 +369,46 @@ extern int wtq_nw_test_force_concat_failures;
 extern void (*wtq_nw_test_on_earliest)(void *ctx);
 extern void *wtq_nw_test_on_earliest_ctx;
 extern int wtq_nw_test_concat_skip;
+/* Cancels issued while accepted engine bytes were still owed. An orderly
+ * session terminal must never contribute to this. */
+extern _Atomic int wtq_nw_test_cancel_with_owed;
+/* Hold accepted sends in the queue (still owed) without issuing them. */
+extern int wtq_nw_test_hold_pump;
+/* op_conn_close bodies actually executed (exactly-once oracle). */
+extern _Atomic int wtq_nw_test_conn_closes;
+extern int wtq_nw_test_force_rundown_false;
+extern _Atomic int wtq_nw_test_phase_completion_first;
+extern _Atomic int wtq_nw_test_phase_retire_first;
+/* Batch-keyed completion watch. All calls MUST run on the driver queue. */
+void wtq_nw_test_watch_arm(struct wtq_driver *drv, void *batch,
+                           void (*cb)(void *), void *ctx);
+/* Unconditional disarm; safe if the target already completed. Returns the
+ * number of TARGET completions observed while armed. */
+int wtq_nw_test_watch_disarm(struct wtq_driver *drv);
+bool wtq_nw_test_watch_armed(const struct wtq_driver *drv);
+int wtq_nw_test_watch_hits(const struct wtq_driver *drv);
+bool wtq_nw_test_watch_was_canceled(const struct wtq_driver *drv);
+int wtq_nw_test_driver_completions(const struct wtq_driver *drv);
+void wtq_nw_test_detach_next(struct wtq_dstream *ds);
+void wtq_nw_test_batch_phase_one(void *batch, bool complete_first,
+                                 bool canceled);
+void wtq_nw_test_batch_phase_two(void *batch, bool complete_first,
+                                 bool canceled);
+void *wtq_nw_test_stream_live_batch(struct wtq_dstream *ds);
+int wtq_nw_test_stream_recs_in_use(const struct wtq_dstream *ds);
+int wtq_nw_test_stream_recs_app_pending(const struct wtq_dstream *ds);
+int wtq_nw_test_stream_recs_unretired(const struct wtq_dstream *ds);
+int wtq_nw_test_batch_phases_done(void *batch);
+int wtq_nw_test_batch_nrecs(void *batch);
+bool wtq_nw_test_batch_rec_app_done(void *batch, int i);
+bool wtq_nw_test_batch_rec_transport_done(void *batch, int i);
+bool wtq_nw_test_batch_rec_in_use(void *batch, int i);
+void ds_pump_sends_for_test(struct wtq_dstream *ds);
+void nw_poll_after_balanced_test_callback(struct wtq_driver *drv);
+/* Caller MUST already hold wtq_api_session_enter() -- see nw_conn.c. */
+void nw_leave_and_poll_with_enter_held(struct wtq_driver *drv);
+bool wtq_nw_test_sends_owed(const struct wtq_driver *drv);
+bool wtq_nw_test_stream_drainable(const struct wtq_dstream *ds);
 
 /* Main-thread START GATE hook: called on the main thread by the start
  * trampoline BEFORE nw_connection_group_start(), so a test can hold an

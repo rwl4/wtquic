@@ -15,13 +15,12 @@
  * be first", "no second SETTINGS frame") belong to the control-stream
  * semantic layer, not here.
  *
- * Value validity: ENABLE_CONNECT_PROTOCOL (RFC 8441 s3) and H3_DATAGRAM
- * (RFC 9297 s2.1.1) are BOOLEAN — only 0 and 1 are legal, and a peer
- * sending anything else must be terminated with H3_SETTINGS_ERROR
- * rather than treated as "feature not supported". WT_ENABLED and the
- * legacy max-sessions codepoints are NOT boolean (any value > 0 is the
- * WT signal / a session count), and unknown identifiers carry arbitrary
- * values.
+ * Value validity: ENABLE_CONNECT_PROTOCOL (RFC 8441 s3), H3_DATAGRAM
+ * (RFC 9297 s2.1.1), draft-16 WT_ENABLED, and draft-02
+ * ENABLE_WEBTRANSPORT are BOOLEAN — only 0 and 1 are legal, and a peer
+ * sending anything else must be terminated with H3_SETTINGS_ERROR rather
+ * than treated as "feature not supported". The legacy max-sessions
+ * codepoints and unknown identifiers carry arbitrary values.
  *
  * Codepoints verified against the local draft-ietf-webtrans-http3-16
  * and picoquic/picohttp/h3zero.h:
@@ -29,8 +28,12 @@
  *     boolean — value > 1 is a settings error; both sides send 1)
  *   - SETTINGS_H3_DATAGRAM 0x33 (RFC 9297; both sides send value 1)
  *   - SETTINGS_ENABLE_CONNECT_PROTOCOL 0x8 (RFC 9220)
- *   - legacy receive-compat: WT_MAX_SESSIONS 0x14e9cd29 (drafts 13-14),
- *     0xc671706a (drafts 7-12), Chrome ENABLE_WEBTRANSPORT 0x2b603742
+ *   - ENABLE_WEBTRANSPORT 0x2b603742 (drafts 00-03): EMITTED by the
+ *     D02/RFC9297 profile and used to select it, not receive-only
+ *   - WT_MAX_SESSIONS 0x14e9cd29 (drafts 13-14): emitted by the D13/14
+ *     compat profile
+ *   - legacy receive-only: 0xc671706a (drafts 7-12), never emitted and
+ *     never selecting any profile
  *   - QPACK_MAX_TABLE_CAPACITY 0x1, QPACK_BLOCKED_STREAMS 0x7 (RFC 9204),
  *     MAX_FIELD_SECTION_SIZE 0x6 (RFC 9114 — a VALID id, not reserved)
  *
@@ -63,7 +66,8 @@ typedef int wtq_h3_settings_status_t;
 #define WTQ_H3_SETTINGS_RANGE       WTQ_VARINT_RANGE
 /* Duplicate identifier (known or unknown), HTTP/2-reserved identifier
  * 0x02-0x05, or an invalid value for a known setting (the boolean
- * settings ENABLE_CONNECT_PROTOCOL and H3_DATAGRAM accept only 0/1).
+ * settings ENABLE_CONNECT_PROTOCOL, H3_DATAGRAM, WT_ENABLED, and
+ * ENABLE_WEBTRANSPORT accept only 0/1).
  * Maps to H3_SETTINGS_ERROR (0x109) at the connection layer. */
 #define WTQ_H3_SETTINGS_ERR_SETTING (-3)
 
@@ -123,7 +127,10 @@ typedef enum wtq_h3_wt_profile {
      * = exactly 1) carried over RFC 9297 datagrams (H3_DATAGRAM 0x33 = 1).
      * NOT byte-faithful draft-02/-05: draft-02 references
      * masque-h3-datagram-05 (0xffd277, optional Context ID), which this
-     * profile deliberately neither emits nor accepts. */
+     * profile never implements. Exact 0xffd277 contract: it is NEVER
+     * emitted; on receive the generic decoder tolerates it like any other
+     * unrecognised setting, observed and ignored, but it never counts as
+     * datagram support and never contributes to selecting a profile. */
     WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT = 2
 } wtq_h3_wt_profile_t;
 
@@ -175,8 +182,9 @@ wtq_h3_wt_profile_bit(wtq_h3_wt_profile_t profile)
  *           zeros: unambiguous "no dynamic table" signal, matches h3zero),
  *           H3_DATAGRAM=1
  *   profiles: one WT setting per member of wt_profiles, in ascending
- *           identifier order — WT_MAX_SESSIONS 0x14e9cd29=1 (D13/14 compat)
- *           and/or WT_ENABLED 0x2c7cf000=1 (current). Never the D07
+ *           identifier order — WT_MAX_SESSIONS 0x14e9cd29=1 (D13/14),
+ *           ENABLE_WEBTRANSPORT 0x2b603742=1 (D02/RFC9297), and/or
+ *           WT_ENABLED 0x2c7cf000=1 (current). Never the D07
  *           0xc671706a codepoint, which stays receive-only.
  *   config: ENABLE_CONNECT_PROTOCOL (servers MUST send it; harmless from
  *           clients).
@@ -228,7 +236,7 @@ wtq_h3_settings_status_t wtq_h3_settings_encode_frame(
 /*
  * Choose the wire profile to speak with this peer: the HIGHEST-precedence
  * member of (our `set` INTERSECT the profiles the peer advertised) that
- * also meets the profile-independent requirements. Pure function, no
+ * also meets that profile's transport requirements. Pure function, no
  * connection state.
  *
  * Returns true and writes *out on success; returns false and leaves *out
@@ -244,12 +252,14 @@ wtq_h3_settings_status_t wtq_h3_settings_encode_frame(
  * counts, and never selects a profile on its own):
  *   WTQ_H3_WT_PROFILE_CURRENT:        WT_ENABLED == 1.
  *   WTQ_H3_WT_PROFILE_D13_14_COMPAT:  WT_MAX_SESSIONS (0x14e9cd29) > 0.
+ *   WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT:
+ *     ENABLE_WEBTRANSPORT (0x2b603742) == 1.
  *
- * Profile-independent requirements:
- *   peer_is_server true (we are the client evaluating a server):
- *     H3_DATAGRAM == 1 AND ENABLE_CONNECT_PROTOCOL == 1.
- *   peer_is_server false (we are the server evaluating a client):
- *     H3_DATAGRAM == 1.
+ * CURRENT and D13/14 additionally require H3_DATAGRAM == 1, and when
+ * `peer_is_server` is true they require ENABLE_CONNECT_PROTOCOL == 1.
+ * D02/RFC9297 requires H3_DATAGRAM == 1 but not an explicit
+ * ENABLE_CONNECT_PROTOCOL setting: draft-02 s3.2 defines
+ * ENABLE_WEBTRANSPORT as implying Extended CONNECT support.
  *
  * Present-with-value-0 settings count as NOT enabled.
  */

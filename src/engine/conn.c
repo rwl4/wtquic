@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include <wtquic/session.h>
 #include <wtquic/stream.h> /* WTQ_STREAM_MAX_SPANS: the public span-
                               count contract is enforced HERE, centrally
                               for every backend */
@@ -21,77 +22,6 @@
  */
 
 #define WTQ_CONN_MAX_PEER_UNI 16
-#include <stdarg.h>
-
-#ifdef WTQ_TESTING
-/*
- * Test-only evidence ledger. Line-delimited, machine-parseable records on
- * a file named by WTQ_LEDGER. NOT a public API and never compiled into a
- * shipping build: it exists solely so an isolated evidence harness can
- * assert on decoded server-side facts rather than on browser behaviour.
- */
-#include <stdio.h>
-#include <stdlib.h>
-static FILE *wtq_led_fp(void)
-{
-    static FILE *fp;
-    static int tried;
-    if (!tried) {
-        const char *p = getenv("WTQ_LEDGER");
-        tried = 1;
-        if (p != NULL)
-            fp = fopen(p, "a");
-    }
-    return fp;
-}
-#include <pthread.h>
-static pthread_mutex_t wtq_led_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *wtq_led_run(void)
-{
-    const char *r = getenv("WTQ_RUN_ID");
-    return r ? r : "norun";
-}
-/* Every record carries run and connection id, written under one lock, so a
- * concurrent or prior connection can never be attributed to this scenario. */
-static void wtq_led_c(uint64_t cid, const char *fmt, ...)
-{
-    FILE *fp = wtq_led_fp();
-    if (fp == NULL)
-        return;
-    pthread_mutex_lock(&wtq_led_mu);
-    fprintf(fp, "run=%s conn=%llu ", wtq_led_run(),
-            (unsigned long long)cid);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
-    va_end(ap);
-    fputc('\n', fp);
-    fflush(fp);
-    pthread_mutex_unlock(&wtq_led_mu);
-}
-static void wtq_led_bytes_c(uint64_t cid, const char *key, const void *p,
-                            size_t n)
-{
-    FILE *fp = wtq_led_fp();
-    if (fp == NULL)
-        return;
-    pthread_mutex_lock(&wtq_led_mu);
-    fprintf(fp, "run=%s conn=%llu %s=", wtq_led_run(),
-            (unsigned long long)cid, key);
-    const unsigned char *b = (const unsigned char *)p;
-    for (size_t i = 0; i < n; i++)
-        fprintf(fp, "%02x", b[i]);
-    fprintf(fp, " len=%zu\n", n);
-    fflush(fp);
-    pthread_mutex_unlock(&wtq_led_mu);
-}
-#define wtq_led(...) wtq_led_c(conn->led_conn_id, __VA_ARGS__)
-#define wtq_led_bytes(k, p, n) \
-    wtq_led_bytes_c(conn->led_conn_id, (k), (p), (n))
-#else
-#define wtq_led(...) ((void)0)
-#define wtq_led_bytes(k, p, n) ((void)0)
-#endif
 
 #define WTQ_CONN_SETTINGS_CAP 512
 
@@ -246,7 +176,11 @@ struct wtq_conn {
         wtq_sf_str_t protos[WTQ_CONN_MAX_OFFERED];
         size_t proto_count;
         bool require;
+        uint32_t origin_policy;
+        wtq_sf_str_t origins[WTQ_CONN_MAX_ORIGINS];
+        size_t origin_count;
     } paths[WTQ_CONN_MAX_PATHS];
+    char origin_buf[WTQ_CONN_ORIGIN_STORAGE_TOTAL];
     size_t path_count;
     char req_path[256];
     size_t req_path_len;
@@ -260,17 +194,6 @@ struct wtq_conn {
      * request per connection, so one buffer. */
     struct wtq_estream *parked_es;
     uint8_t parked_buf[WTQ_CONN_SETTINGS_CAP];
-#ifdef WTQ_TESTING
-    /* Evidence-only state. Compiled out entirely in a non-testing build so
-     * observability can never change ordinary connection layout. */
-    char req_origin[320];
-    size_t req_origin_len;
-    bool req_has_origin;
-    bool req_had_d02_marker;
-    uint64_t led_conn_id;
-    const char *expect_origin;   /* harness-supplied exact page origin */
-    size_t expect_origin_len;
-#endif
     uint16_t parked_fill;
     bool parked_fin; /* peer FIN arrived while parked */
 
@@ -300,26 +223,20 @@ struct wtq_conn {
 };
 
 static const wtq_connect_opts_t CONN_STRICT_OPTS = { false, false };
-/* Server inbound-request decode for the D13/14 compat profile: accept the
- * bare "webtransport" :protocol token. The current profile decodes with
- * CONN_STRICT_OPTS (webtransport-h3 only). Either profile still rejects the
- * OTHER profile's token — see the symmetry gate in server_request_done. */
+/* Server inbound-request decode for the D13/14 and D02/RFC9297 profiles:
+ * accept the bare "webtransport" :protocol token. CURRENT uses
+ * CONN_STRICT_OPTS (webtransport-h3 only). server_request_done then checks
+ * the token and markers against the profile selected from SETTINGS. */
 static const wtq_connect_opts_t CONN_SERVER_COMPAT_OPTS = { false, true };
 
 /*
- * The ONE mapping from a latched profile to its inbound-CONNECT decode
- * policy and the token that profile expects. Centralized deliberately: a
- * future typed profile that is not handled here fails CLOSED (this returns
- * false and the request is answered generically), so it cannot accidentally
- * bypass the latch or inherit another generation's token rules.
- */
-/*
- * Per-profile CONNECT policy. Axes 3, 4, 5 and 7 all read this ONE map so
- * profile knowledge stays in a single place: the expected :protocol token,
- * whether the draft-02 request marker is required inbound, whether the
- * draft-02 response marker is emitted on success, and whether an Origin
- * must be present. draft-02 s6 defines no receiver-side failure rule, so
- * the marker requirement is deliberate wtquic policy.
+ * The one mapping from a latched profile to its CONNECT policy: expected
+ * :protocol token, draft-02 request-marker requirement, draft-02 response
+ * marker emission, Origin requirement, and outbound application-error
+ * range. A future profile not handled here fails closed, so it cannot
+ * accidentally inherit another generation's rules. draft-02 s6 defines no
+ * receiver-side marker-failure rule; requiring its marker is deliberate
+ * wtquic policy.
  */
 typedef struct conn_profile_policy {
     const wtq_connect_opts_t *opts;
@@ -327,53 +244,239 @@ typedef struct conn_profile_policy {
     bool require_d02_request_marker;
     bool emit_d02_response_marker;
     bool require_origin;
-    uint32_t max_outbound_app_error; /* axis 6: D02 caps at 255 */
+    uint32_t max_outbound_app_error; /* D02 caps at 255 */
 } conn_profile_policy_t;
 
-/*
- * EVIDENCE FIXTURE VALIDATOR — deliberately narrow, and NOT the production
- * RFC 6454 / RFC 3986 parser planned for commit 4a. It accepts exactly the
- * grammar this harness uses:
- *     ("http://" | "https://") host ":" port
- * with a nonempty host containing no userinfo/path/query/fragment/comma/
- * whitespace/control bytes, and a decimal port in 1..65535 ending the
- * string. Shared by the client preflight and the server guard so both
- * sides judge an Origin by one rule.
- */
-static bool conn_origin_fixture_valid(const char *o, size_t on)
+/* RFC 6454 origin-list-or-null classification. HTTP field syntax and
+ * duplicate detection remain the CONNECT decoder's responsibility; this
+ * layer validates serialized-origin structure and deliberately distinguishes
+ * a valid multi-origin list so policy can deny it with 403. */
+typedef enum conn_origin_kind {
+    CONN_ORIGIN_INVALID = 0,
+    CONN_ORIGIN_TUPLE,
+    CONN_ORIGIN_NULL,
+    CONN_ORIGIN_MULTI
+} conn_origin_kind_t;
+
+static bool origin_alpha(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool origin_digit(unsigned char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+static bool origin_hex(unsigned char c)
+{
+    return origin_digit(c) || (c >= 'A' && c <= 'F') ||
+           (c >= 'a' && c <= 'f');
+}
+
+static bool origin_unreserved(unsigned char c)
+{
+    return origin_alpha(c) || origin_digit(c) || c == '-' || c == '.' ||
+           c == '_' || c == '~';
+}
+
+static bool origin_subdelim(unsigned char c)
+{
+    switch (c) {
+    case '!': case '$': case '&': case '\'': case '(':
+    case ')': case '*': case '+': case ',': case ';': case '=':
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool origin_ipv4(const char *s, size_t n)
+{
+    size_t i = 0;
+    for (unsigned part = 0; part < 4; part++) {
+        if (i == n || !origin_digit((unsigned char)s[i]))
+            return false;
+        const size_t start = i;
+        unsigned v = 0, digits = 0;
+        while (i < n && origin_digit((unsigned char)s[i])) {
+            v = v * 10u + (unsigned)(s[i] - '0');
+            if (++digits > 3 || v > 255u)
+                return false;
+            i++;
+        }
+        /* RFC 3986 dec-octet permits "0", but not a multi-digit octet
+         * with a leading zero. */
+        if (digits > 1 && s[start] == '0')
+            return false;
+        if (part == 3)
+            return i == n;
+        if (i == n || s[i++] != '.')
+            return false;
+    }
+    return false;
+}
+
+static bool origin_ipv6(const char *s, size_t n)
+{
+    size_t i = 0;
+    unsigned groups = 0;
+    bool compressed = false;
+
+    if (n == 0)
+        return false;
+    if (s[0] == ':') {
+        if (n < 2 || s[1] != ':')
+            return false;
+        compressed = true;
+        i = 2;
+        if (i == n)
+            return true;
+    }
+
+    while (i < n) {
+        size_t start = i;
+        bool dot = false;
+        while (i < n && s[i] != ':') {
+            dot = dot || s[i] == '.';
+            i++;
+        }
+        size_t len = i - start;
+        if (dot) {
+            if (i != n || !origin_ipv4(s + start, len) || groups > 6)
+                return false;
+            groups += 2;
+            break;
+        }
+        if (len == 0 || len > 4)
+            return false;
+        for (size_t j = start; j < i; j++)
+            if (!origin_hex((unsigned char)s[j]))
+                return false;
+        if (++groups > 8)
+            return false;
+        if (i == n)
+            break;
+        i++;
+        if (i < n && s[i] == ':') {
+            if (compressed)
+                return false;
+            compressed = true;
+            i++;
+            if (i == n)
+                break;
+        } else if (i == n) {
+            return false;
+        }
+    }
+    return compressed ? groups < 8 : groups == 8;
+}
+
+static bool origin_ip_literal(const char *s, size_t n)
+{
+    if (n >= 4 && (s[0] == 'v' || s[0] == 'V')) {
+        size_t i = 1;
+        while (i < n && origin_hex((unsigned char)s[i]))
+            i++;
+        if (i == 1 || i == n || s[i++] != '.' || i == n)
+            return false;
+        for (; i < n; i++)
+            if (!origin_unreserved((unsigned char)s[i]) &&
+                !origin_subdelim((unsigned char)s[i]) && s[i] != ':')
+                return false;
+        return true;
+    }
+    return origin_ipv6(s, n);
+}
+
+static bool origin_tuple_valid(const char *o, size_t on)
 {
     if (o == NULL || on == 0)
         return false;
     size_t i = 0;
-    if (on > 7 && memcmp(o, "http://", 7) == 0)
-        i = 7;
-    else if (on > 8 && memcmp(o, "https://", 8) == 0)
-        i = 8;
-    else
+    if (!origin_alpha((unsigned char)o[i++]))
         return false;
-    const size_t hs = i;
-    while (i < on) {
-        const unsigned char c = (unsigned char)o[i];
-        if (c == ':')
-            break;
-        if (c == '/' || c == '?' || c == '#' || c == '@' || c == ',' ||
-            c <= 0x20 || c == 0x7f)
+    while (i < on && (origin_alpha((unsigned char)o[i]) ||
+                      origin_digit((unsigned char)o[i]) || o[i] == '+' ||
+                      o[i] == '-' || o[i] == '.'))
+        i++;
+    if (i + 2 >= on || o[i] != ':' || o[i + 1] != '/' || o[i + 2] != '/')
+        return false;
+    i += 3;
+
+    if (i == on)
+        return false;
+    if (o[i] == '[') {
+        size_t hs = ++i;
+        while (i < on && o[i] != ']')
+            i++;
+        if (i == on || !origin_ip_literal(o + hs, i - hs))
             return false;
         i++;
-    }
-    if (i == hs || i >= on || o[i] != ':')
-        return false;
-    const size_t ps = ++i;
-    unsigned long port = 0;
-    while (i < on && o[i] >= '0' && o[i] <= '9') {
-        port = port * 10UL + (unsigned long)(o[i] - '0');
-        if (port > 65535UL)
+    } else {
+        size_t hs = i;
+        while (i < on && o[i] != ':') {
+            unsigned char c = (unsigned char)o[i];
+            if (c == '%') {
+                if (i + 2 >= on || !origin_hex((unsigned char)o[i + 1]) ||
+                    !origin_hex((unsigned char)o[i + 2]))
+                    return false;
+                i += 3;
+                continue;
+            }
+            if (!origin_unreserved(c) && !origin_subdelim(c))
+                return false;
+            i++;
+        }
+        if (i == hs)
             return false;
-        i++;
     }
-    if (i == ps || i != on || port < 1UL)
-        return false;
+
+    if (i < on) {
+        if (o[i++] != ':' || i == on)
+            return false;
+        unsigned port = 0;
+        for (; i < on; i++) {
+            if (!origin_digit((unsigned char)o[i]))
+                return false;
+            const unsigned digit = (unsigned)(o[i] - '0');
+            if (port > (65535u - digit) / 10u)
+                return false;
+            port = port * 10u + digit;
+        }
+        if (port == 0)
+            return false;
+    }
     return true;
+}
+
+static conn_origin_kind_t conn_origin_parse(const char *o, size_t on)
+{
+    if (o == NULL || on == 0 || on > WTQ_CONN_ORIGIN_MAX_BYTES)
+        return CONN_ORIGIN_INVALID;
+
+    /* The CONNECT decoder has already enforced HTTP field-content syntax,
+     * including no leading/trailing whitespace. RFC 6454 origin lists use
+     * SP, not arbitrary whitespace, between serialized origins. */
+    if (on == 4 && memcmp(o, "null", 4) == 0)
+        return CONN_ORIGIN_NULL;
+
+    size_t start = 0;
+    unsigned count = 0;
+    while (start < on) {
+        size_t end = start;
+        while (end < on && o[end] != ' ')
+            end++;
+        if (!origin_tuple_valid(o + start, end - start))
+            return CONN_ORIGIN_INVALID;
+        count++;
+        if (end == on)
+            break;
+        start = end + 1;
+        if (start == on || o[start] == ' ')
+            return CONN_ORIGIN_INVALID;
+    }
+    return count == 1 ? CONN_ORIGIN_TUPLE : CONN_ORIGIN_MULTI;
 }
 
 static bool conn_connect_policy(wtq_h3_wt_profile_t profile,
@@ -467,6 +570,65 @@ wtq_result_t wtq_conn_validate_protocols(const char *const *protocols,
         buf_off += len;
     }
     return WTQ_OK;
+}
+
+wtq_result_t wtq_conn_validate_origin_policy(uint32_t mode,
+                                             const char *const *origins,
+                                             size_t count)
+{
+    if (mode > WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL)
+        return WTQ_ERR_INVALID_ARG;
+    if (mode != WTQ_ORIGIN_POLICY_ALLOWLIST) {
+        if (origins != NULL || count != 0)
+            return WTQ_ERR_INVALID_ARG;
+        return WTQ_OK;
+    }
+    if (origins == NULL || count == 0)
+        return WTQ_ERR_INVALID_ARG;
+    if (count > WTQ_CONN_MAX_ORIGINS)
+        return WTQ_ERR_TOO_LARGE;
+
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (origins[i] == NULL)
+            return WTQ_ERR_INVALID_ARG;
+        size_t len = strlen(origins[i]);
+        if (len > WTQ_CONN_ORIGIN_MAX_BYTES)
+            return WTQ_ERR_TOO_LARGE;
+        conn_origin_kind_t kind = conn_origin_parse(origins[i], len);
+        if (kind != CONN_ORIGIN_TUPLE && kind != CONN_ORIGIN_NULL)
+            return WTQ_ERR_INVALID_ARG;
+        if (len == WTQ_CONN_PATH_ORIGIN_STORAGE ||
+            total > WTQ_CONN_PATH_ORIGIN_STORAGE - (len + 1))
+            return WTQ_ERR_TOO_LARGE;
+        total += len + 1;
+        for (size_t j = 0; j < i; j++)
+            if (strcmp(origins[i], origins[j]) == 0)
+                return WTQ_ERR_INVALID_ARG;
+    }
+    return WTQ_OK;
+}
+
+static bool conn_origin_authorized(const wtq_conn_t *conn, size_t path,
+                                   const char *origin, size_t origin_len)
+{
+    conn_origin_kind_t kind = conn_origin_parse(origin, origin_len);
+    uint32_t mode = conn->paths[path].origin_policy;
+
+    if (kind != CONN_ORIGIN_TUPLE && kind != CONN_ORIGIN_NULL)
+        return false;
+    if (mode == WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE)
+        return kind == CONN_ORIGIN_TUPLE;
+    if (mode == WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL)
+        return true;
+    if (mode == WTQ_ORIGIN_POLICY_ALLOWLIST) {
+        for (size_t i = 0; i < conn->paths[path].origin_count; i++)
+            if (conn->paths[path].origins[i].len == origin_len &&
+                memcmp(conn->paths[path].origins[i].data, origin,
+                       origin_len) == 0)
+                return true;
+    }
+    return false;
 }
 
 static void conn_fatal(wtq_conn_t *conn, uint64_t h3_err);
@@ -767,17 +929,6 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
      * singleton in wtq_conn_client_connect, before start emits SETTINGS.
      */
     conn->wt_profiles = profiles;
-#ifdef WTQ_TESTING
-    {
-        static uint64_t led_next;
-        conn->led_conn_id = ++led_next;
-        /* Evidence-only: the harness names the exact page origin it will
-         * present. Absent -> semantic-only check. */
-        const char *eo = getenv("WTQ_EXPECT_ORIGIN");
-        conn->expect_origin = (eo != NULL && eo[0] != '\0') ? eo : NULL;
-        conn->expect_origin_len = conn->expect_origin ? strlen(eo) : 0;
-    }
-#endif
     /* Never carry an IGNORED singular into live state: when the set is
      * authoritative the incoming value may be out of range, so seed the
      * placeholder deterministically instead of casting it. Nothing reads
@@ -819,8 +970,6 @@ static wtq_result_t conn_open_locals(wtq_conn_t *conn)
      * the deterministic union BEFORE it can know the peer's choice — this is
      * capability advertisement, not selection. */
     wtq_h3_settings_encode_cfg_t scfg = { conn->ecp, conn->wt_profiles };
-    wtq_led("LOCAL_SETTINGS_CFG ecp=%d profiles=0x%llx", (int)conn->ecp,
-            (unsigned long long)conn->wt_profiles);
     size_t flen = 0;
 
     buf[0] = 0x00;
@@ -1144,26 +1293,6 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                 } else {
                     conn->wt_supported = false;
                 }
-                wtq_led("PEER_SETTINGS ecp=%d/%llu dgram=%d/%llu "
-                        "leg_0x2b603742=%d/%llu d13_0x14e9cd29=%d/%llu "
-                        "d07_0xc671706a=%d/%llu cur_0x2c7cf000=%d/%llu "
-                        "unknown=%u",
-                        (int)s.has_enable_connect_protocol,
-                        (unsigned long long)s.enable_connect_protocol,
-                        (int)s.has_h3_datagram,
-                        (unsigned long long)s.h3_datagram,
-                        (int)s.has_enable_webtransport_leg,
-                        (unsigned long long)s.enable_webtransport_leg,
-                        (int)s.has_wt_max_sessions_d13,
-                        (unsigned long long)s.wt_max_sessions_d13,
-                        (int)s.has_wt_max_sessions_d07,
-                        (unsigned long long)s.wt_max_sessions_d07,
-                        (int)s.has_wt_enabled,
-                        (unsigned long long)s.wt_enabled,
-                        s.unknown_count);
-                wtq_led("LATCH supported=%d latched=%d profile=%d parked=%d",
-                        (int)conn->wt_supported, (int)conn->profile_latched,
-                        (int)conn->wt_profile, (int)(conn->parked_es != NULL));
                 if (conn->cb.on_peer_settings != NULL)
                     conn->cb.on_peer_settings(conn, conn->wt_supported,
                                               conn->cb.ctx);
@@ -1721,8 +1850,6 @@ static void server_send_response(wtq_conn_t *conn, wtq_dstream_t *ds,
         if (conn_connect_policy(conn->wt_profile, &rp))
             emit_marker = rp.emit_d02_response_marker;
     }
-    wtq_led("RESPONSE status=%u d02_response_marker=%d subproto=%d",
-            (unsigned)status, (int)emit_marker, (int)(selected != NULL));
     if (wtq_connect_encode_response_ex(status, selected, emit_marker, section,
                                     sizeof(section), &slen) !=
         WTQ_CONNECT_OK) {
@@ -1782,7 +1909,7 @@ static void client_response_done(wtq_conn_t *conn, struct wtq_estream *es)
     }
 
     /*
-     * Axis 5, client half — the draft-02 s6 RESPONSE marker. Required on a
+     * The draft-02 s6 response marker is required on a
      * SUCCESSFUL D02 response, checked BEFORE subprotocol validation and
      * before establishment. Non-2xx keeps its own refusal path above and is
      * never masked by marker validation. draft-02 defines no receiver rule,
@@ -1797,8 +1924,6 @@ static void client_response_done(wtq_conn_t *conn, struct wtq_estream *es)
             const bool ok = resp.has_d02_marker &&
                             resp.d02_marker_len == 7 &&
                             memcmp(resp.d02_marker, "draft02", 7) == 0;
-            wtq_led("CLIENT_RESP_MARKER present=%d len=%zu ok=%d",
-                    (int)resp.has_d02_marker, resp.d02_marker_len, (int)ok);
             if (!ok) {
                 session_failed(conn, WTQ_SESSION_FAIL_BAD_RESPONSE);
                 return;
@@ -1969,13 +2094,15 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
 
     /*
      * The token VALIDATES the latch; it never selects. A CURRENT latch
-     * accepts only "webtransport-h3"; a D13/14 latch accepts only the bare
-     * "webtransport". req.legacy_protocol records which token matched, and
-     * the expected value comes from the central policy map — so generations
-     * that share a bare token can never be told apart here. A mismatch is
-     * answered like any other non-WebTransport request: a generic 400, and
-     * the connection lives. (STRICT already rejects the bare token before
-     * here, so a CURRENT latch never false-rejects.) */
+     * accepts only "webtransport-h3"; D13/14 and D02/RFC9297 latches each
+     * accept only the bare "webtransport". That is why the token can only
+     * validate the profile already selected from SETTINGS, not choose
+     * between those generations. req.legacy_protocol records which token
+     * matched, and the expected value comes from the central policy map, so
+     * generations that share a bare token can never be told apart here. A
+     * mismatch is answered like any other non-WebTransport request: a
+     * generic 400, and the connection lives. (STRICT already rejects the
+     * bare token before here, so a CURRENT latch never false-rejects.) */
     if (req.legacy_protocol != expect_legacy) {
         server_send_response(conn, es->ds, 400, NULL);
         es->request_dead = true;
@@ -1988,19 +2115,8 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         return;
     }
 
-    /* Path lookup (exact match). */
-    wtq_led("CONNECT token_legacy=%d expect_legacy=%d marker=%d marker_len=%zu "
-            "origin=%d origin_len=%zu offers=%zu",
-            (int)req.legacy_protocol, (int)expect_legacy,
-            (int)req.has_d02_marker, req.d02_marker_len,
-            (int)req.has_origin, req.origin_len, offered_count);
-    if (req.has_d02_marker)
-        wtq_led_bytes("MARKER_VALUE", req.d02_marker, req.d02_marker_len);
-    if (req.has_origin)
-        wtq_led_bytes("ORIGIN_VALUE", req.origin, req.origin_len);
-
     /*
-     * Axis 4 — the draft-02 s6 request marker. draft-02 defines no
+     * The draft-02 s6 request marker. draft-02 defines no
      * receiver-side failure rule, so requiring exactly one field with the
      * exact value "1" is deliberate wtquic policy. A wrong-but-valid value
      * is a profile validation failure (generic 400); a DUPLICATE field is
@@ -2014,6 +2130,7 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         return;
     }
 
+    /* Path lookup (exact match). */
     size_t p = conn->path_count;
     for (size_t i = 0; i < conn->path_count; i++)
         if (conn->paths[i].path_len == req.path_len &&
@@ -2028,49 +2145,18 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
     }
 
     /*
-     * Axis 7 — the draft-02 s3.3 Origin duty, enforced AFTER path lookup
+     * The draft-02 s3.3 Origin duty is enforced after path lookup
      * (the policy is per-path) and BEFORE subprotocol selection, any 2xx,
      * and establishment. draft-02 s3.3 makes both halves unconditional
      * MUSTs and defines no status; draft-16 s3.2 prescribes 403, which is
      * what we use. One generic 403, no reason, revealing nothing.
      */
-    if (pol.require_origin) {
-        bool ok = req.has_origin;
-#ifdef WTQ_TESTING
-        /*
-         * EVIDENCE FIXTURE VALIDATOR — deliberately NARROW. It validates
-         * only the fixture grammar this harness actually uses:
-         *   scheme "://" host ":" port      (no userinfo/path/query/
-         *                                    fragment/whitespace/controls)
-         * with a decimal port in 1..65535. It is NOT the production
-         * RFC 6454 / RFC 3986 parser planned for commit 4a, and must not
-         * be mistaken for one. Setup FAILS CLOSED when no expected origin
-         * is supplied.
-         */
-        const char *o = req.origin;
-        size_t on = req.origin_len;
-        bool sem = conn_origin_fixture_valid(o, on);
-        bool exact = sem && conn->expect_origin != NULL &&
-                     on == conn->expect_origin_len &&
-                     memcmp(o, conn->expect_origin, on) == 0;
-        /*
-         * When the harness names an expected origin, enforce byte-exact
-         * equality. When it does NOT, fall back to the PRODUCTION rule
-         * (presence) rather than refusing: WTQ_TESTING is defined for the
-         * whole library, so failing closed here would silently change
-         * behaviour for every other test binary. "Fail closed" belongs in
-         * the evidence server's own setup, which refuses to start without
-         * WTQ_EXPECT_ORIGIN.
-         */
-        ok = (conn->expect_origin != NULL) ? exact : req.has_origin;
-        wtq_led("ORIGIN_VERDICT present=%d semantic=%d exact=%d "
-                "expected_supplied=%d expected_len=%zu",
-                (int)req.has_origin, (int)sem, (int)exact,
-                (int)(conn->expect_origin != NULL), conn->expect_origin_len);
-        if (conn->expect_origin != NULL)
-            wtq_led_bytes("ORIGIN_EXPECTED", conn->expect_origin,
-                          conn->expect_origin_len);
-#endif
+    if (pol.require_origin ||
+        conn->paths[p].origin_policy != WTQ_ORIGIN_POLICY_UNSET) {
+        bool ok = req.has_origin &&
+                  conn->paths[p].origin_policy != WTQ_ORIGIN_POLICY_UNSET &&
+                  conn_origin_authorized(conn, p, req.origin,
+                                         req.origin_len);
         if (!ok) {
             server_send_response(conn, es->ds, 403, NULL);
             es->request_dead = true;
@@ -2102,15 +2188,6 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         memcpy(conn->req_auth, req.authority, req.authority_len);
         conn->req_auth_len = req.authority_len;
     }
-#ifdef WTQ_TESTING
-    conn->req_origin_len = 0;
-    conn->req_has_origin = req.has_origin;
-    if (req.has_origin && req.origin_len <= sizeof(conn->req_origin)) {
-        memcpy(conn->req_origin, req.origin, req.origin_len);
-        conn->req_origin_len = req.origin_len;
-    }
-    conn->req_had_d02_marker = req.has_d02_marker;
-#endif
     server_send_response(conn, es->ds, 200, selected);
     if (!conn->closed)
         session_established(conn, es, selected ? selected->data : "",
@@ -2209,9 +2286,6 @@ static void session_capsule_bytes(wtq_conn_t *conn,
             }
             break;
         default:
-            wtq_led("CAPSULE_UNKNOWN type=0x%llx len=%llu skipped=1",
-                    (unsigned long long)cap.type,
-                    (unsigned long long)cap.length);
             break; /* unknown capsules: payload already skipped */
         }
     }
@@ -2509,15 +2583,16 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
     memset(&rpol, 0, sizeof(rpol));
     if (!conn_connect_policy(req_profile, &rpol))
         return WTQ_ERR_INVALID_ARG;
-    /*
-     * PREFLIGHT, zero-effect: a D02 client MUST provide an Origin
-     * (draft-02 s3.3). Validated with the bounded evidence helper before
-     * any connection state changes or any I/O.
-     */
+    /* PREFLIGHT, zero-effect: a D02 client MUST provide a valid serialized
+     * Origin (draft-02 s3.3) before any connection state changes or I/O. */
     if (rpol.require_origin) {
         if (cfg->origin == NULL || cfg->origin[0] == '\0')
             return WTQ_ERR_INVALID_ARG;
-        if (!conn_origin_fixture_valid(cfg->origin, strlen(cfg->origin)))
+        size_t origin_len = strlen(cfg->origin);
+        if (origin_len > WTQ_CONN_ORIGIN_MAX_BYTES)
+            return WTQ_ERR_TOO_LARGE;
+        conn_origin_kind_t kind = conn_origin_parse(cfg->origin, origin_len);
+        if (kind != CONN_ORIGIN_TUPLE && kind != CONN_ORIGIN_NULL)
             return WTQ_ERR_INVALID_ARG;
     }
     const bool compat = rpol.expect_legacy_token;
@@ -2625,6 +2700,7 @@ wtq_result_t wtq_conn_server_set_paths(wtq_conn_t *conn,
      * half-updated table behind. The protocol_count bound must be
      * checked here, before any protocols[j] access — an oversized count
      * would otherwise walk past the caller's array. */
+    size_t origin_total = 0;
     for (size_t i = 0; i < count; i++) {
         if (paths[i].path == NULL ||
             (paths[i].protocol_count > 0 && paths[i].protocols == NULL))
@@ -2641,8 +2717,25 @@ wtq_result_t wtq_conn_server_set_paths(wtq_conn_t *conn,
                                         paths[i].protocol_count);
         if (prc != WTQ_OK)
             return prc;
+        wtq_result_t orc = wtq_conn_validate_origin_policy(
+            paths[i].origin_policy, paths[i].allowed_origins,
+            paths[i].allowed_origin_count);
+        if (orc != WTQ_OK)
+            return orc;
+        if ((conn->wt_profiles &
+             WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) != 0 &&
+            paths[i].origin_policy == WTQ_ORIGIN_POLICY_UNSET)
+            return WTQ_ERR_INVALID_ARG;
+        for (size_t j = 0; j < paths[i].allowed_origin_count; j++) {
+            size_t len = strlen(paths[i].allowed_origins[j]);
+            if (len == WTQ_CONN_ORIGIN_STORAGE_TOTAL ||
+                origin_total > WTQ_CONN_ORIGIN_STORAGE_TOTAL - (len + 1))
+                return WTQ_ERR_TOO_LARGE;
+            origin_total += len + 1;
+        }
     }
 
+    size_t origin_off = 0;
     for (size_t i = 0; i < count; i++) {
         size_t plen = strlen(paths[i].path);
         memcpy(conn->paths[i].path, paths[i].path, plen);
@@ -2659,6 +2752,16 @@ wtq_result_t wtq_conn_server_set_paths(wtq_conn_t *conn,
             buf_off += sl;
         }
         conn->paths[i].proto_count = paths[i].protocol_count;
+        conn->paths[i].origin_policy = paths[i].origin_policy;
+        conn->paths[i].origin_count = paths[i].allowed_origin_count;
+        for (size_t j = 0; j < paths[i].allowed_origin_count; j++) {
+            size_t len = strlen(paths[i].allowed_origins[j]);
+            memcpy(conn->origin_buf + origin_off,
+                   paths[i].allowed_origins[j], len + 1);
+            conn->paths[i].origins[j].data = conn->origin_buf + origin_off;
+            conn->paths[i].origins[j].len = len;
+            origin_off += len + 1;
+        }
     }
     conn->path_count = count;
     return WTQ_OK;
@@ -2703,20 +2806,25 @@ static bool session_active(const wtq_conn_t *conn)
            conn->sess_state == SS_DRAINING;
 }
 
-/* Send one capsule inside a DATA frame on the session stream. */
+/* Send one capsule inside a DATA frame on the session stream. The frame
+ * header and capsule body are one transport submission so teardown cannot
+ * leave a valid header on the wire without its body. This also makes a CLOSE
+ * capsule and its FIN indivisible at the backend boundary. */
 static wtq_result_t session_send_capsule(wtq_conn_t *conn,
                                          const uint8_t *cap, size_t clen,
                                          bool fin)
 {
-    uint8_t hdr[16];
+    uint8_t unit[16 + 16 + WTQ_CAPSULE_MAX_REASON];
     size_t hl = 0;
 
-    if (wtq_h3_frame_encode_header(WTQ_H3_FRAME_DATA, clen, hdr,
-                                   sizeof(hdr), &hl) != 0)
+    if (wtq_h3_frame_encode_header(WTQ_H3_FRAME_DATA, clen, unit,
+                                   sizeof(unit), &hl) != 0)
         return WTQ_ERR_BACKEND;
+    if (clen > sizeof(unit) - hl)
+        return WTQ_ERR_BACKEND;
+    memcpy(unit + hl, cap, clen);
     wtq_dstream_t *ds = conn->session_es->ds;
-    if (conn->ops.send(conn->drv, ds, hdr, hl, false) != WTQ_OK ||
-        conn->ops.send(conn->drv, ds, cap, clen, fin) != WTQ_OK) {
+    if (conn->ops.send(conn->drv, ds, unit, hl + clen, fin) != WTQ_OK) {
         conn_fatal(conn, WTQ_H3_INTERNAL_ERROR);
         return WTQ_ERR_BACKEND;
     }
@@ -2950,7 +3058,7 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
 }
 
 /*
- * Axis 6 — the ONE profile-aware outbound application-error conversion.
+ * The single profile-aware outbound application-error conversion.
  * D02/RFC9297 may send only 0..255 (the common subset both stable
  * browsers decode); CURRENT and D13/14 keep the full 32-bit range. All
  * three stream paths funnel through here, so the cap has a single home.

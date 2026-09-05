@@ -283,7 +283,7 @@ static void establish_server(rig_t *r, int *fp)
     int failures = 0;
 
     rig_up(r, WTQ_PERSPECTIVE_SERVER, fp);
-    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false };
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) ==
                    WTQ_OK);
     deliver_peer_settings(r, fp);
@@ -386,6 +386,48 @@ static void establish_then_local_close(rig_t *r, int *fp)
                    WTQ_SESSION_CLOSED);
     WTQ_TEST_CHECK_EQ_SIZE((size_t)r->app.closed_events, 1);
     WTQ_TEST_CHECK(r->app.closed_clean);
+    *fp += failures;
+}
+
+/* A CLOSE atom must reach the transport as one accepted send. Splitting the
+ * DATA header from its capsule body lets orderly teardown truncate the frame. */
+static void test_close_wire_unit_is_one_send(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+    establish_client(&r, fp);
+
+    struct wtq_dstream *ds = r.sess_ds;
+    WTQ_TEST_CHECK(ds != NULL);
+    if (ds == NULL) {
+        rig_down(&r);
+        *fp += failures + 1;
+        return;
+    }
+    const size_t len_before = ds->len;
+    const int calls_before = r.drv.send_calls;
+
+    WTQ_TEST_CHECK(wtq_conn_session_close(r.conn, 7,
+                                          (const uint8_t *)"bye", 3) ==
+                   WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(r.drv.send_calls, calls_before + 1);
+
+    uint8_t cap[24];
+    size_t clen = 0;
+    WTQ_TEST_CHECK(wtq_capsule_encode_close(7, (const uint8_t *)"bye", 3,
+                                            cap, sizeof(cap), &clen) == 0);
+    uint8_t hdr[16];
+    size_t hlen = 0;
+    WTQ_TEST_CHECK(wtq_h3_frame_encode_header(WTQ_H3_FRAME_DATA, clen, hdr,
+                                              sizeof(hdr), &hlen) == 0);
+    WTQ_TEST_CHECK_EQ_SIZE(ds->len - len_before, hlen + clen);
+    WTQ_TEST_CHECK(memcmp(ds->bytes + len_before, hdr, hlen) == 0);
+    WTQ_TEST_CHECK(memcmp(ds->bytes + len_before + hlen, cap, clen) == 0);
+    WTQ_TEST_CHECK(ds->fin);
+
+    rig_down(&r);
     *fp += failures;
 }
 
@@ -1299,7 +1341,7 @@ static void test_conn_lost_server(int *fp)
         rig_t r;
 
         rig_up(&r, WTQ_PERSPECTIVE_SERVER, fp);
-        wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false };
+        wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false, 0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_conn_server_set_paths(r.conn, &path, 1) ==
                        WTQ_OK);
         if (parked) {
@@ -1445,6 +1487,7 @@ int main(void)
     test_conn_lost_after_terminal(&failures);
     test_conn_lost_established_unchanged(&failures);
 
+    test_close_wire_unit_is_one_send(&failures);
     test_post_close_drain(&failures);
     test_post_close_peer_close(&failures);
     test_post_close_unknown_capsule(&failures);

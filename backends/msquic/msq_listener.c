@@ -58,37 +58,61 @@ static void cfg_copy(void *dst, size_t dst_size, const void *src,
  * fails here, not on the first accept. */
 static wtq_result_t copy_paths(struct wtq_msquic_listener *l,
                                const wtq_serve_config_t *paths,
-                               size_t count)
+                               size_t count, size_t path_stride)
 {
+    wtq_serve_config_t norm[WTQ_MSQ_MAX_PATHS];
+
     if (count == 0 || count > WTQ_MSQ_MAX_PATHS || paths == NULL)
         return WTQ_ERR_INVALID_ARG;
+    if (path_stride < sizeof(wtq_serve_config_v1_t) ||
+        path_stride > UINT32_MAX ||
+        (count > 1 && path_stride > SIZE_MAX / (count - 1)))
+        return WTQ_ERR_INVALID_ARG;
 
+    /* Normalize and validate the entire table before touching listener-owned
+     * state. A failure on a later path therefore has no partial-copy effect. */
+    size_t origin_total = 0;
     for (size_t i = 0; i < count; i++) {
-        if (paths[i].struct_size == 0)
+        const unsigned char *raw =
+            (const unsigned char *)(const void *)paths + i * path_stride;
+        uint32_t declared_size = 0;
+        memcpy(&declared_size, raw, sizeof(declared_size));
+        if (declared_size == 0 ||
+            (count > 1 && declared_size > path_stride))
             return WTQ_ERR_INVALID_ARG;
         /* path is required and dereferenced below; reject a size that does
          * not cover it whole (a truncated pointer would pass the NULL check
          * and then be strlen'd). */
-        if (!wtq_cfg_has(paths[i].struct_size,
+        if (!wtq_cfg_has(declared_size,
                          offsetof(wtq_serve_config_t, path),
                          sizeof(((wtq_serve_config_t *)0)->path)))
             return WTQ_ERR_INVALID_ARG;
-        wtq_serve_config_t p;
-        cfg_copy(&p, sizeof(p), &paths[i], paths[i].struct_size);
+        wtq_serve_config_t *p = &norm[i];
+        cfg_copy(p, sizeof(*p), raw, declared_size);
         /* Drop the subprotocols/count pair unless BOTH are wholly present. */
-        if (!wtq_cfg_has(paths[i].struct_size,
+        if (!wtq_cfg_has(declared_size,
                          offsetof(wtq_serve_config_t, subprotocol_count),
-                         sizeof(p.subprotocol_count))) {
-            p.subprotocols = NULL;
-            p.subprotocol_count = 0;
+                         sizeof(p->subprotocol_count))) {
+            p->subprotocols = NULL;
+            p->subprotocol_count = 0;
         }
-        if (p.path == NULL ||
-            (p.subprotocol_count > 0 && p.subprotocols == NULL))
+        if (!wtq_cfg_has(declared_size,
+                         offsetof(wtq_serve_config_t, origin_policy),
+                         sizeof(p->origin_policy)))
+            p->origin_policy = WTQ_ORIGIN_POLICY_UNSET;
+        if (!wtq_cfg_has(declared_size,
+                         offsetof(wtq_serve_config_t, allowed_origin_count),
+                         sizeof(p->allowed_origin_count))) {
+            p->allowed_origins = NULL;
+            p->allowed_origin_count = 0;
+        }
+        if (p->path == NULL ||
+            (p->subprotocol_count > 0 && p->subprotocols == NULL))
             return WTQ_ERR_INVALID_ARG;
 
-        size_t plen = strlen(p.path);
+        size_t plen = strlen(p->path);
         if (plen == 0 || plen > WTQ_MSQ_PATH_CAP ||
-            p.subprotocol_count > WTQ_MSQ_MAX_PROTOS)
+            p->subprotocol_count > WTQ_MSQ_MAX_PROTOS)
             return WTQ_ERR_TOO_LARGE;
 
         /*
@@ -99,24 +123,50 @@ static wtq_result_t copy_paths(struct wtq_msquic_listener *l,
          * so the two can never disagree.
          */
         wtq_result_t prc =
-            wtq_conn_validate_protocols(p.subprotocols,
-                                        p.subprotocol_count);
+            wtq_conn_validate_protocols(p->subprotocols,
+                                        p->subprotocol_count);
         if (prc != WTQ_OK)
             return prc;
+        wtq_result_t orc = wtq_conn_validate_origin_policy(
+            p->origin_policy, p->allowed_origins, p->allowed_origin_count);
+        if (orc != WTQ_OK)
+            return orc;
+        if ((l->webtransport_profiles &
+             WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) != 0 &&
+            p->origin_policy == WTQ_ORIGIN_POLICY_UNSET)
+            return WTQ_ERR_INVALID_ARG;
+        for (size_t j = 0; j < p->allowed_origin_count; j++) {
+            size_t len = strlen(p->allowed_origins[j]);
+            if (origin_total > sizeof(l->origin_storage) - (len + 1))
+                return WTQ_ERR_TOO_LARGE;
+            origin_total += len + 1;
+        }
+    }
 
-        memcpy(l->paths[i].path, p.path, plen + 1);
+    size_t origin_off = 0;
+    for (size_t i = 0; i < count; i++) {
+        const wtq_serve_config_t *p = &norm[i];
+        size_t plen = strlen(p->path);
+        memcpy(l->paths[i].path, p->path, plen + 1);
 
         size_t off = 0;
-        for (size_t j = 0; j < p.subprotocol_count; j++) {
-            size_t sl = strlen(p.subprotocols[j]);
-            if (off + sl + 1 > sizeof(l->paths[i].protos))
-                return WTQ_ERR_TOO_LARGE;
-            memcpy(l->paths[i].protos + off, p.subprotocols[j], sl + 1);
+        for (size_t j = 0; j < p->subprotocol_count; j++) {
+            size_t sl = strlen(p->subprotocols[j]);
+            memcpy(l->paths[i].protos + off, p->subprotocols[j], sl + 1);
             l->paths[i].proto_ptr[j] = l->paths[i].protos + off;
             off += sl + 1;
         }
-        l->paths[i].proto_count = p.subprotocol_count;
-        l->paths[i].require = p.require_subprotocol;
+        l->paths[i].proto_count = p->subprotocol_count;
+        l->paths[i].require = p->require_subprotocol;
+        l->paths[i].origin_policy = p->origin_policy;
+        l->paths[i].origin_count = p->allowed_origin_count;
+        for (size_t j = 0; j < p->allowed_origin_count; j++) {
+            size_t len = strlen(p->allowed_origins[j]);
+            memcpy(l->origin_storage + origin_off, p->allowed_origins[j],
+                   len + 1);
+            l->paths[i].origin_ptr[j] = l->origin_storage + origin_off;
+            origin_off += len + 1;
+        }
     }
     l->path_count = count;
     return WTQ_OK;
@@ -132,6 +182,11 @@ static void build_serve(const struct wtq_msquic_listener *l,
         out[i].subprotocols = l->paths[i].proto_ptr;
         out[i].subprotocol_count = l->paths[i].proto_count;
         out[i].require_subprotocol = l->paths[i].require;
+        out[i].origin_policy = l->paths[i].origin_policy;
+        out[i].allowed_origins = l->paths[i].origin_count > 0
+                                     ? l->paths[i].origin_ptr
+                                     : NULL;
+        out[i].allowed_origin_count = l->paths[i].origin_count;
     }
 }
 
@@ -372,6 +427,14 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
                      offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles),
                      sizeof(cfg.webtransport_profiles)))
         cfg.webtransport_profiles = 0;
+    const bool path_stride_present = wtq_cfg_has(
+        cfg_in->struct_size,
+        offsetof(wtq_msquic_listener_cfg_t, path_stride),
+        sizeof(cfg.path_stride));
+    if (!path_stride_present)
+        cfg.path_stride = sizeof(wtq_serve_config_v1_t);
+    else if (cfg.path_stride == 0)
+        cfg.path_stride = sizeof(wtq_serve_config_t);
 
     if (cfg.cert_file == NULL || cfg.key_file == NULL ||
         cfg.events == NULL || cfg.events->struct_size == 0)
@@ -433,7 +496,8 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
      * different one to its sessions. */
     l->webtransport_profiles = profiles;
 
-    wtq_result_t rc = copy_paths(l, cfg.paths, cfg.path_count);
+    wtq_result_t rc =
+        copy_paths(l, cfg.paths, cfg.path_count, cfg.path_stride);
     if (rc != WTQ_OK) {
         env->alloc.free(l, sizeof(*l), env->alloc.ctx);
         return rc;

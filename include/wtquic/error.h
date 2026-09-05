@@ -33,7 +33,11 @@ WTQ_API const char *wtq_strerror(wtq_result_t rc);
  *
  * WebTransport stream error codes are 32-bit application values carried in
  * a reserved HTTP/3 error-code range, skipping the GREASE codepoints
- * (0x1f * N + 0x21).
+ * (0x1f * N + 0x21). This mapping itself is profile-independent and total
+ * over the 32-bit domain; what a given session may SEND is a separate,
+ * profile-specific limit (H3_DRAFT_02_RFC9297_COMPAT caps outbound codes
+ * at 0..255), enforced above this function, never by it. Decoding is
+ * always full-range.
  */
 
 /* Map a 32-bit WebTransport application error to its H3 wire code. */

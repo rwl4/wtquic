@@ -33,15 +33,22 @@ int main(void)
      * compiling no-op under pedantic C. */
     wtq_msquic_client_cfg_init(&ccfg);
     wtq_msquic_listener_cfg_init(&lcfg);
+    lcfg.path_stride = sizeof(wtq_serve_config_t);
     wtq_msquic_client_cfg_init(NULL);
     wtq_msquic_listener_cfg_init(NULL);
 
     /* the listener-wide WebTransport profile field is present and defaults to
-     * current after init; both profile enumerators are usable. */
+     * current after init; all three profile enumerators are usable. */
     if (lcfg.webtransport_profile != WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT)
         return 1;
     lcfg.webtransport_profile = WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
     (void)lcfg.webtransport_profile;
+    lcfg.webtransport_profile =
+        WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
+    if (lcfg.webtransport_profile == WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT ||
+        lcfg.webtransport_profile ==
+            WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT)
+        return 1;
 
     (void)open_fn;
     (void)close_fn;
@@ -59,6 +66,15 @@ int main(void)
         return 1;
     lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
     if (lcfg.webtransport_profiles != WTQ_WEBTRANSPORT_PROFILES_ALL)
+        return 1;
+    lcfg.webtransport_profiles =
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
+    if (lcfg.webtransport_profiles == 0 ||
+        lcfg.webtransport_profiles == WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT ||
+        lcfg.webtransport_profiles ==
+            WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT ||
+        (WTQ_WEBTRANSPORT_PROFILES_ALL & lcfg.webtransport_profiles) !=
+            lcfg.webtransport_profiles)
         return 1;
     return 0;
 }

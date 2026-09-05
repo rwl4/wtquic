@@ -529,6 +529,10 @@ void wtq_conn_seal_transport_error(wtq_conn_t *conn);
 #define WTQ_CONN_MAX_PATHS 4
 /* Aggregate bytes of subprotocol text the engine stores per served path. */
 #define WTQ_CONN_PATH_PROTO_STORAGE 256u
+#define WTQ_CONN_MAX_ORIGINS 8
+#define WTQ_CONN_ORIGIN_MAX_BYTES 320u
+#define WTQ_CONN_PATH_ORIGIN_STORAGE 512u
+#define WTQ_CONN_ORIGIN_STORAGE_TOTAL 1024u
 
 /*
  * Validate one served path's subprotocol list, transport-neutrally: the
@@ -546,6 +550,11 @@ void wtq_conn_seal_transport_error(wtq_conn_t *conn);
  */
 WTQ_SPI wtq_result_t wtq_conn_validate_protocols(
     const char *const *protocols, size_t count);
+
+/* Validate one path's Origin policy without retaining caller storage. The
+ * numeric mode values mirror wtq_origin_policy_mode_t. */
+WTQ_SPI wtq_result_t wtq_conn_validate_origin_policy(
+    uint32_t mode, const char *const *origins, size_t count);
 
 /*
  * Client: request a WebTransport session. Strings are copied into
@@ -590,6 +599,9 @@ typedef struct wtq_server_path_cfg {
     const char *const *protocols;
     size_t protocol_count;      /* <= WTQ_CONN_MAX_OFFERED */
     bool require_protocol;
+    uint32_t origin_policy;
+    const char *const *allowed_origins;
+    size_t allowed_origin_count;
 } wtq_server_path_cfg_t;
 
 wtq_result_t wtq_conn_server_set_paths(wtq_conn_t *conn,

@@ -77,6 +77,38 @@ known member, fail `wtq_msquic_listener_start` with
 `_ex(cfg, struct_size)`. A client profile changed after start is
 `WTQ_ERR_STATE`.
 
+### Server Origin authorization
+
+Origin authorization is configured per served path with
+`wtq_serve_config_t.origin_policy`. A listener that advertises
+`H3_DRAFT_02_RFC9297_COMPAT` must give every path a non-`UNSET` policy;
+configuration fails before listener side effects otherwise. A non-`UNSET`
+policy applies to every selected profile on that path and requires exactly one
+valid RFC 6454 serialized origin (or `null` where the chosen policy permits
+it). Missing, semantically invalid, unsupported multi-origin, and unauthorized
+values get one generic 403 after path lookup and before subprotocol selection
+or session establishment. Malformed HTTP field syntax and duplicate Origin
+fields remain stream-local H3 message errors.
+
+`ALLOW_ANY_NON_OPAQUE` accepts any valid tuple origin but not `null`.
+`ALLOW_ANY_INCLUDING_NULL` accepts either. `ALLOWLIST` accepts only an exact,
+case-sensitive byte match; `null` must be listed explicitly. wtquic performs no
+canonicalization, wildcard, suffix, or same-site matching, so callers must list
+every serialized spelling they intend to trust. Allowlist storage is copied
+and bounded: 8 entries and 512 bytes per path, 320 bytes per entry, and 1024
+bytes per connection.
+
+The serve config's Origin block is an ABI-safe tail. The bare
+`wtq_serve_config_init` symbol remains frozen to the old layout; current source
+uses `wtq_serve_config_init_ex` through the initializer macro. An absent or
+partial tail is `UNSET`, preserving existing CURRENT/D13 behavior. Because
+serve configs are also passed in arrays, the core's bare session-serve SPI
+retains the frozen v1 element stride while current source routes through its
+stride-aware entry point. The MsQuic listener records the same distinction in
+its optional `path_stride` tail: absent means frozen v1; present and zero means
+the current element size. This keeps multi-path arrays from older binaries
+valid after the struct grows.
+
 ### Interop evidence
 
 Evidence for the D13/14 compat profile (captured 2026-07-15): proxygen

@@ -125,6 +125,25 @@ typedef struct wtq_msquic_listener_cfg_v3 {
     uint32_t webtransport_profile;
 } wtq_msquic_listener_cfg_v3_t;
 
+/* Frozen v4 layout, immediately before path_stride was added to preserve
+ * arrays of the now-extended wtq_serve_config_t. */
+typedef struct wtq_msquic_listener_cfg_v4 {
+    uint32_t struct_size;
+    const char *bind_address;
+    uint16_t port;
+    const char *cert_file;
+    const char *key_file;
+    const wtq_serve_config_t *paths;
+    size_t path_count;
+    const wtq_session_events_t *events;
+    void *user;
+    wtq_msquic_accept_prepare_fn accept_prepare;
+    wtq_msquic_accept_abandon_fn accept_abandon;
+    wtq_msquic_transport_quiesced_fn on_transport_quiesced;
+    uint32_t webtransport_profile;
+    wtq_webtransport_profile_set_t webtransport_profiles;
+} wtq_msquic_listener_cfg_v4_t;
+
 /* Pin a field to the offset a FROZEN layout shadow records for it. Used for
  * every frozen generation, so the diagnostic names the field and both types
  * rather than one particular version. */
@@ -226,6 +245,21 @@ _Static_assert(offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles) >=
                    sizeof(wtq_msquic_listener_cfg_v3_t),
                "listener v4 set must begin at or after the end of frozen v3 "
                "- otherwise a v3 caller's tail padding reads as a set");
+
+/* Every v4 field remains at the offset used by a v4 caller. */
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v4_t,
+                   struct_size);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v4_t,
+                   paths);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v4_t,
+                   path_count);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v4_t,
+                   webtransport_profile);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v4_t,
+                   webtransport_profiles);
+_Static_assert(offsetof(wtq_msquic_listener_cfg_t, path_stride) >=
+                   sizeof(wtq_msquic_listener_cfg_v4_t),
+               "listener v5 stride must follow the complete frozen v4");
 
 /*
  * The public capability masks and the engine's internal masks are separate
@@ -513,7 +547,11 @@ struct wtq_msquic_listener {
         const char *proto_ptr[WTQ_MSQ_MAX_PROTOS];
         size_t proto_count;
         bool require;
+        uint32_t origin_policy;
+        const char *origin_ptr[WTQ_CONN_MAX_ORIGINS];
+        size_t origin_count;
     } paths[WTQ_MSQ_MAX_PATHS];
+    char origin_storage[WTQ_CONN_ORIGIN_STORAGE_TOTAL];
 };
 
 /* msq_settings.c — tuning to QUIC_SETTINGS (values + IsSet bits). */

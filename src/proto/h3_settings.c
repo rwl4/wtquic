@@ -77,10 +77,10 @@ wtq_h3_settings_status_t wtq_h3_settings_decode(const uint8_t *payload,
             s.has_qpack_blocked_streams = true;
             s.qpack_blocked_streams = value;
             break;
-        /* The two BOOLEAN settings: any value but 0 or 1 is a SETTINGS
-         * error, not merely "unsupported" (RFC 8441 s3, RFC 9297
-         * s2.1.1). The check is on the DECODED value, so a non-minimal
-         * varint cannot smuggle a 2 past it. */
+        /* These RFC-defined boolean settings accept only 0 or 1. The
+         * profile-specific boolean settings are checked in their cases
+         * below. All checks use the decoded value, so a non-minimal varint
+         * cannot smuggle a 2 past them. */
         case WTQ_H3_SET_ENABLE_CONNECT_PROTOCOL:
             if (value > 1)
                 return WTQ_H3_SETTINGS_ERR_SETTING;
@@ -155,7 +155,8 @@ static size_t build_out_settings(const wtq_h3_settings_encode_cfg_t *cfg,
     out[n++].value = 1;
     /*
      * One WT setting per set member, in ASCENDING identifier order so the
-     * payload stays byte-exact testable (0x14e9cd29 < 0x2c7cf000). This is
+     * payload stays byte-exact testable
+     * (0x14e9cd29 < 0x2b603742 < 0x2c7cf000). This is
      * a capability advertisement, not a selection: several members is a
      * legitimate multi-version offer. The D07 codepoint (0xc671706a) is
      * never emitted — it stays receive-only.

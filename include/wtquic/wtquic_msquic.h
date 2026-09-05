@@ -279,7 +279,9 @@ typedef void (*wtq_msquic_accept_abandon_fn)(void *listener_user, void *user);
  *     PEM files. Both required.
  *   - paths / path_count: the accept policy — which request paths this
  *     server serves and with which application subprotocols (count <= 4,
- *     path <= 128 bytes; see wtq_serve_config_t).
+ *     path <= 128 bytes; see wtq_serve_config_t). Current callers normally
+ *     leave path_stride zero; the listener then uses the current element
+ *     size. Its ABI behavior for older arrays is documented on path_stride.
  *   - events / user: the event table and context every accepted session
  *     is created with. The app first sees a session in its callbacks
  *     (normally on_established); distinguish concurrent sessions by the
@@ -335,11 +337,20 @@ typedef struct wtq_msquic_listener_cfg {
      * several members enables negotiation; it does not select anything, and
      * it adds no fallback or retry. */
     wtq_webtransport_profile_set_t webtransport_profiles;
+    /* v5 (struct_size-gated): byte stride between elements of paths.
+     *
+     * Leave zero in a current-size config to use sizeof(wtq_serve_config_t).
+     * If this field is absent, the listener uses the frozen pre-Origin v1
+     * stride so an already-compiled caller's multi-path array remains ABI
+     * safe. A non-zero value is useful only to describe a deliberately sized
+     * versioned array and, when path_count is greater than one, must cover
+     * every element's declared struct_size. */
+    size_t path_stride;
 } wtq_msquic_listener_cfg_t;
 
 #define WTQ_MSQUIC_LISTENER_CFG_INIT                              \
     { (uint32_t)sizeof(wtq_msquic_listener_cfg_t), NULL, 0, NULL, \
-      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0 }
+      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0, 0 }
 
 /*
  * Initialise a listener config. Same ABI rule as the client (see above):

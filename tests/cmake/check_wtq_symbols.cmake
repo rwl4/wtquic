@@ -23,6 +23,7 @@ set(ALLOWED_SYMBOLS
     wtq_connect_config_init
     wtq_connect_config_init_ex
     wtq_serve_config_init
+    wtq_serve_config_init_ex
     wtq_session_add_ref
     wtq_session_release
     wtq_session_close
@@ -59,6 +60,7 @@ set(ALLOWED_SYMBOLS
     wtq_api_session_start
     wtq_api_session_connect
     wtq_api_session_serve
+    wtq_api_session_serve_ex
     wtq_api_session_conn
     wtq_api_session_enter
     wtq_api_session_leave
@@ -77,6 +79,7 @@ set(ALLOWED_SYMBOLS
     wtq_conn_on_send_complete
     wtq_conn_session_state
     wtq_conn_validate_protocols
+    wtq_conn_validate_origin_policy
     wtq_conn_is_closed
     wtq_conn_close_code
 )

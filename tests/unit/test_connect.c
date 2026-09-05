@@ -662,7 +662,7 @@ static void test_not_webtransport_classification(int *fp)
         f[4].value_len = 9;
         WTQ_TEST_CHECK(decode_fields(f, 5, &STRICT) ==
                        WTQ_CONNECT_NOT_WEBTRANSPORT);
-        /* the pre-draft-13 token is "another protocol" under STRICT and
+        /* the compatibility token is "another protocol" under STRICT and
          * WebTransport only when leniency is enabled */
         f[4].value = "webtransport";
         f[4].value_len = 12;
@@ -1047,6 +1047,58 @@ static void test_encode_value_validation(int *fp)
     *fp += failures;
 }
 
+static void test_encode_protocol_token(int *fp)
+{
+    int failures = 0;
+    static const wtq_sf_str_t invalid[] = {
+        SF("web transport"), SF("web\ttransport"),
+        SF("web/transport"), SF("web:transport"),
+        SF("\"webtransport\""), SF("web\x80transport"),
+        SF("web\0transport"), SF("web\r\ntransport")
+    };
+    static const wtq_sf_str_t valid[] = {
+        { NULL, 0 }, SF(""),
+        SF("webtransport-h3"), SF("webtransport"),
+        SF("AZaz09!#$%&'*+-.^_`|~")
+    };
+    uint8_t buf[256], untouched[256];
+    memset(untouched, 0xA5, sizeof(untouched));
+
+    for (int d02 = 0; d02 < 2; d02++) {
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            size_t out_len = 99;
+            memcpy(buf, untouched, sizeof(buf));
+            wtq_connect_status_t st = d02
+                ? wtq_connect_encode_request_d02(
+                      "example.com", 11, "/wt", 3, NULL, 0, NULL, 0,
+                      invalid[i].data, invalid[i].len, true,
+                      buf, sizeof(buf), &out_len)
+                : wtq_connect_encode_request_ex(
+                      "example.com", 11, "/wt", 3, NULL, 0, NULL, 0,
+                      invalid[i].data, invalid[i].len,
+                      buf, sizeof(buf), &out_len);
+            WTQ_TEST_CHECK(st == WTQ_CONNECT_MALFORMED);
+            WTQ_TEST_CHECK_EQ_SIZE(out_len, 99);
+            WTQ_TEST_CHECK(memcmp(buf, untouched, sizeof(buf)) == 0);
+        }
+        for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+            size_t out_len = 0;
+            wtq_connect_status_t st = d02
+                ? wtq_connect_encode_request_d02(
+                      "example.com", 11, "/wt", 3, NULL, 0, NULL, 0,
+                      valid[i].data, valid[i].len, true,
+                      buf, sizeof(buf), &out_len)
+                : wtq_connect_encode_request_ex(
+                      "example.com", 11, "/wt", 3, NULL, 0, NULL, 0,
+                      valid[i].data, valid[i].len,
+                      buf, sizeof(buf), &out_len);
+            WTQ_TEST_CHECK(st == WTQ_CONNECT_OK);
+            WTQ_TEST_CHECK(out_len > 0);
+        }
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1062,6 +1114,7 @@ int main(void)
     test_field_value_validation(&failures);
     test_response_value_validation(&failures);
     test_encode_value_validation(&failures);
+    test_encode_protocol_token(&failures);
     test_sf_handling(&failures);
     test_response_rejects_and_caps(&failures);
     test_select(&failures);

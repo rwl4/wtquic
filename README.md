@@ -10,11 +10,10 @@ gets out of the way of your data.
   backend driver interface. After a stream is associated with a session,
   payload bytes flow directly between your application and the transport —
   zero copies, zero queues, zero steady-state allocations inside wtquic.
-- **Spec**: draft-ietf-webtrans-http3-16 for the current profile —
-  native-H3 WebTransport with `:protocol = webtransport-h3` (bare
-  `webtransport` is capsule-based WebTransport); an explicit opt-in
-  drafts-13/14 compatibility profile is available (see below). Legacy
-  SETTINGS codepoints are still accepted on receive.
+- **Spec**: draft-ietf-webtrans-http3-16 for the default current profile,
+  plus explicit drafts-13/14 and browser-oriented draft-02/RFC9297
+  compatibility profiles (see below). Profile selection is typed and never
+  changes the default implicitly.
 - **Backends**: [MsQuic](https://github.com/microsoft/msquic) (primary;
   client + server) and **Apple Network.framework** (client-only, no
   external dependency; macOS 13 / iOS 16 or later).
@@ -40,13 +39,17 @@ A **server** configures a capability SET per listener
 of it, and then selects ONE profile per connection from the peer's
 settings:
 
-| | `H3_CURRENT` (default) | `H3_DRAFT_13_14_COMPAT` |
-|---|---|---|
-| extended CONNECT `:protocol` | `webtransport-h3` | `webtransport` |
-| WebTransport setting emitted | WT_ENABLED (0x2c7cf000) = 1 | WT_MAX_SESSIONS (0x14e9cd29) = 1 |
-| WT flow-control settings | none | none (flow control disabled) |
-| peer setting accepted as WT | WT_ENABLED = 1 | WT_MAX_SESSIONS > 0 |
-| interop | wtquic draft-16 self-loopback | proxygen/moxygen, picoquic h3zero (moqx, pico_wt) |
+| | `H3_CURRENT` (default) | `H3_DRAFT_13_14_COMPAT` | `H3_DRAFT_02_RFC9297_COMPAT` |
+|---|---|---|---|
+| extended CONNECT `:protocol` | `webtransport-h3` | `webtransport` | `webtransport` |
+| local WT setting | WT_ENABLED (0x2c7cf000) = 1 | WT_MAX_SESSIONS (0x14e9cd29) = 1 | ENABLE_WEBTRANSPORT (0x2b603742) = 1 |
+| peer-selection predicate | WT_ENABLED = 1 | WT_MAX_SESSIONS > 0 | ENABLE_WEBTRANSPORT = 1 and H3_DATAGRAM (0x33) = 1; ENABLE_CONNECT_PROTOCOL (0x08) is not required |
+| CONNECT markers | none | none | request `sec-webtransport-http3-draft02: 1`; response `sec-webtransport-http3-draft: draft02` |
+| Origin | optional unless server policy says otherwise | optional unless server policy says otherwise | required, syntactically validated, and authorized by the selected path |
+| outbound stream error codes | full 32 bit | full 32 bit | 0..255 |
+| inbound stream error codes | full 32 bit | full 32 bit | full 32 bit |
+| datagrams | RFC 9297 (0x33) | RFC 9297 (0x33) | RFC 9297 (0x33); legacy 0xffd277 is not implemented |
+| interop evidence | wtquic self-loopback | proxygen/moxygen, picoquic h3zero | exact Chrome 152.0.7977.66 live; Firefox 155 source-coherent only; no Safari claim |
 
 Selection happens once, from the peer's settings, by explicit
 newest-first precedence, and before the extended CONNECT is processed.
@@ -58,8 +61,14 @@ usable; peers sharing no profile simply never establish, with **no
 fallback and no retry**.
 
 ```c
-/* one listener serving both generations */
+/* one listener serving all configured generations */
 lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
+
+/* D02-capable listeners must authorize Origin explicitly per path. */
+static const char *const origins[] = { "https://app.example" };
+path.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+path.allowed_origins = origins;
+path.allowed_origin_count = 1;
 
 /* what THIS session actually selected (valid from on_established on) */
 wtq_webtransport_profile_t prof;
@@ -75,12 +84,18 @@ unaffected.
 compatibility.** A third profile, `H3_DRAFT_02_RFC9297_COMPAT`, does:
 draft-02 WebTransport signaling and the 8-bit outbound stream-error contract
 carried over **RFC 9297** datagrams. It is **not** byte-faithful draft-02/-05:
-the legacy datagram codepoint `0xffd277` is neither emitted nor accepted, no
-datagram context/registration is implemented, and D07 `0xc671706a` is not
-supported. Evidence status: **proven against exact Google Chrome
+the legacy datagram codepoint `0xffd277` is never emitted; on receive it is
+decoded and ignored as an unknown setting and never counts as D02 support.
+A peer offering only `0xffd277`, without `0x33`, therefore does not select
+this profile. No datagram context/registration is implemented, and D07
+`0xc671706a` is not supported. Evidence status: **proven against exact Google Chrome
 152.0.7977.66**; Firefox 155 is source-coherent but has **no exact-binary live
 row yet**; **no Safari claim**. Profile selection is from peer SETTINGS only,
-with an explicit Origin requirement and **no heuristic fallback**.
+with an explicit Origin requirement and **no heuristic fallback**. Every path
+on a D02-capable listener must configure an Origin policy; there is no
+allow-everything default. `ALLOWLIST` is exact and case-sensitive, while the
+two conspicuously named allow-any modes still reject malformed or multi-origin
+values. See the public header for their treatment of opaque `null` origins.
 Published evidence points at stable Chrome and Firefox emitting the older
 draft-02 `ENABLE_WEBTRANSPORT` (0x2b603742) — a different generation from
 the drafts-7–12 codepoint (0xc671706a). wtquic emits **`0x2b603742`** for
@@ -91,22 +106,20 @@ No live third-party draft-16 relay (a peer signalling WT_ENABLED with
 `:protocol = webtransport-h3`) is available here, so the current profile
 is exercised by wtquic self-loopback.
 
-On imquic, note that what a peer ACCEPTS and what it EMITS are separate
-observations. HEAD 99fa77d **emits** `:protocol = webtransport` with
-`ENABLE_WEBTRANSPORT` (0x2b603742) — the draft-02 generation — alongside
-`WEBTRANSPORT_MAX_SESSIONS` (0xc671706a), which is the distinct
-drafts-7–12 generation. Those are two different generations and are not
-one "Chrome" dialect. wtquic emits `0x2b603742` only, never `0xc671706a`, and implements no
-profile that selects on them. Interoperating would need a separately
-typed, separately evidenced profile, which is not added here.
+imquic is source-read only; no live wtquic/imquic session has been run. At
+HEAD 99fa77d its source emits `:protocol = webtransport` with both
+`ENABLE_WEBTRANSPORT` (0x2b603742) and the distinct drafts-7–12
+`WEBTRANSPORT_MAX_SESSIONS` (0xc671706a). wtquic selects D02 from
+`0x2b603742 = 1` plus `0x33 = 1`, tolerates unrelated settings, and never
+selects on or emits `0xc671706a`. No interoperability conclusion is claimed.
 
-All three profiles share everything below the H3 SETTINGS/CONNECT layer —
-stream preambles, quarter-stream-ID datagrams, application <!-- api-boundary-exempt: deliberate profile-scope description -->
-error-code mapping, RESET_STREAM_AT requirements, and CLOSE / DRAIN /
-teardown are identical. The compatibility profile is safe only because it
-is EXPLICIT: the bare `webtransport` token also names capsule-based
-WebTransport in the current architecture, so it is used only when paired
-with the historical drafts-13/14 H3 SETTINGS dialect.
+All three profiles share stream preambles, quarter-stream-ID datagrams, the <!-- api-boundary-exempt: deliberate profile-scope description -->
+CLOSE and DRAIN capsules, and session teardown. The full 32-bit inbound
+application-error mapping is also shared. D02 differs on encode: it caps
+outbound stream application error codes at 255, in addition to requiring its
+CONNECT markers and an authorized Origin. The compatibility profiles are safe
+only because they are explicit: the bare `webtransport` token cannot identify
+a draft generation by itself.
 `H3_DRAFT_13_14_COMPAT` never advertises the current settings and never
 emits the drafts-7–12 codepoint (0xc671706a). A server's selection is
 per connection and is driven by the peer's settings intersected with the

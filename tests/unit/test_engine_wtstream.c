@@ -368,7 +368,7 @@ static void establish_server(rig_t *r, int *fp)
     int failures = 0;
 
     rig_up(r, WTQ_PERSPECTIVE_SERVER, fp);
-    wtq_server_path_cfg_t path = { "/moq", OFFER, 1, false };
+    wtq_server_path_cfg_t path = { "/moq", OFFER, 1, false, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) ==
                    WTQ_OK);
     deliver_peer_settings(r, fp);

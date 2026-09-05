@@ -151,13 +151,42 @@ _Static_assert(offsetof(wtq_connect_config_t, webtransport_profile) >=
                    sizeof(wtq_connect_config_v1_t),
                "connect v2 tail must not begin before the end of frozen v1");
 
+void wtq_serve_config_init_ex(wtq_serve_config_t *cfg, size_t struct_size)
+{
+    static const wtq_serve_config_t def = WTQ_SERVE_CONFIG_INIT;
+    size_t n = struct_size < sizeof(def) ? struct_size : sizeof(def);
+
+    if (cfg == NULL)
+        return;
+    memcpy(cfg, &def, n);
+    if (n >= sizeof(cfg->struct_size))
+        cfg->struct_size = (uint32_t)n;
+}
+
+#undef wtq_serve_config_init
 void wtq_serve_config_init(wtq_serve_config_t *cfg)
 {
-    if (cfg != NULL) {
-        memset(cfg, 0, sizeof(*cfg));
-        cfg->struct_size = (uint32_t)sizeof(*cfg);
-    }
+    wtq_serve_config_init_ex(cfg, sizeof(wtq_serve_config_v1_t));
 }
+
+_Static_assert(offsetof(wtq_serve_config_t, struct_size) ==
+                   offsetof(wtq_serve_config_v1_t, struct_size),
+               "serve struct_size offset frozen");
+_Static_assert(offsetof(wtq_serve_config_t, path) ==
+                   offsetof(wtq_serve_config_v1_t, path),
+               "serve path offset frozen");
+_Static_assert(offsetof(wtq_serve_config_t, subprotocols) ==
+                   offsetof(wtq_serve_config_v1_t, subprotocols),
+               "serve subprotocols offset frozen");
+_Static_assert(offsetof(wtq_serve_config_t, subprotocol_count) ==
+                   offsetof(wtq_serve_config_v1_t, subprotocol_count),
+               "serve subprotocol_count offset frozen");
+_Static_assert(offsetof(wtq_serve_config_t, require_subprotocol) ==
+                   offsetof(wtq_serve_config_v1_t, require_subprotocol),
+               "serve require_subprotocol offset frozen");
+_Static_assert(offsetof(wtq_serve_config_t, origin_policy) >=
+                   sizeof(wtq_serve_config_v1_t),
+               "serve v2 tail must follow frozen v1");
 
 /* Copy a struct_size-prefixed struct into a full-size zeroed local:
  * fields past the caller's (older) size read as zero/NULL. */
@@ -779,43 +808,82 @@ wtq_result_t wtq_api_session_connect(wtq_session_t *s,
     return rc;
 }
 
-wtq_result_t wtq_api_session_serve(wtq_session_t *s,
-                                   const wtq_serve_config_t *paths,
-                                   size_t count)
+static wtq_result_t session_serve_sized(wtq_session_t *s,
+                                        const wtq_serve_config_t *paths,
+                                        size_t count, size_t path_stride)
 {
     if (s == NULL || (paths == NULL && count > 0) ||
         count > WTQ_API_MAX_PATHS)
         return WTQ_ERR_INVALID_ARG;
+    if (count > 0 &&
+        (path_stride < sizeof(wtq_serve_config_v1_t) ||
+         path_stride > UINT32_MAX ||
+         (count > 1 && path_stride > SIZE_MAX / (count - 1))))
+        return WTQ_ERR_INVALID_ARG;
 
     wtq_server_path_cfg_t ecfg[WTQ_API_MAX_PATHS];
     for (size_t i = 0; i < count; i++) {
-        if (paths[i].struct_size == 0)
+        const unsigned char *raw =
+            (const unsigned char *)(const void *)paths + i * path_stride;
+        uint32_t declared_size = 0;
+        memcpy(&declared_size, raw, sizeof(declared_size));
+        if (declared_size == 0 ||
+            (count > 1 && declared_size > path_stride))
             return WTQ_ERR_INVALID_ARG;
         /* path is required and dereferenced; reject a size that does not
          * cover it whole. */
-        if (!wtq_cfg_has(paths[i].struct_size,
+        if (!wtq_cfg_has(declared_size,
                          offsetof(wtq_serve_config_t, path),
                          sizeof(((wtq_serve_config_t *)0)->path)))
             return WTQ_ERR_INVALID_ARG;
         wtq_serve_config_t p;
-        cfg_copy(&p, sizeof(p), &paths[i], paths[i].struct_size);
+        cfg_copy(&p, sizeof(p), raw, declared_size);
         /* Drop the subprotocols/count pair unless BOTH are wholly present, so
          * a size straddling the pointer or the count never yields a partial. */
-        if (!wtq_cfg_has(paths[i].struct_size,
+        if (!wtq_cfg_has(declared_size,
                          offsetof(wtq_serve_config_t, subprotocol_count),
                          sizeof(p.subprotocol_count))) {
             p.subprotocols = NULL;
             p.subprotocol_count = 0;
         }
+        if (!wtq_cfg_has(declared_size,
+                         offsetof(wtq_serve_config_t, origin_policy),
+                         sizeof(p.origin_policy)))
+            p.origin_policy = WTQ_ORIGIN_POLICY_UNSET;
+        if (!wtq_cfg_has(declared_size,
+                         offsetof(wtq_serve_config_t, allowed_origin_count),
+                         sizeof(p.allowed_origin_count))) {
+            p.allowed_origins = NULL;
+            p.allowed_origin_count = 0;
+        }
         ecfg[i].path = p.path;
         ecfg[i].protocols = p.subprotocols;
         ecfg[i].protocol_count = p.subprotocol_count;
         ecfg[i].require_protocol = p.require_subprotocol;
+        ecfg[i].origin_policy = p.origin_policy;
+        ecfg[i].allowed_origins = p.allowed_origins;
+        ecfg[i].allowed_origin_count = p.allowed_origin_count;
     }
     session_enter(s);
     wtq_result_t rc = wtq_conn_server_set_paths(s->conn, ecfg, count);
     session_exit(s);
     return rc;
+}
+
+wtq_result_t wtq_api_session_serve_ex(wtq_session_t *s,
+                                      const wtq_serve_config_t *paths,
+                                      size_t count, size_t path_stride)
+{
+    return session_serve_sized(s, paths, count, path_stride);
+}
+
+#undef wtq_api_session_serve
+wtq_result_t wtq_api_session_serve(wtq_session_t *s,
+                                   const wtq_serve_config_t *paths,
+                                   size_t count)
+{
+    return session_serve_sized(s, paths, count,
+                               sizeof(wtq_serve_config_v1_t));
 }
 
 wtq_conn_t *wtq_api_session_conn(wtq_session_t *s)

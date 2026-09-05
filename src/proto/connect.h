@@ -15,8 +15,8 @@
  * generic HTTP/3 header layer.
  *
  * SPEC NOTE: draft-16 requires ":protocol = webtransport-h3" for the
- * current profile; the bare "webtransport" token is the drafts 13/14
- * native-H3 compatibility profile's :protocol (also the token for
+ * current profile; the bare "webtransport" token is shared by the D13/14
+ * and D02/RFC9297 compatibility profiles (also the token for
  * capsule-based WebTransport in the current architecture — it is used
  * only under an EXPLICIT compat profile). As a SERVER it is accepted on
  * receive only behind accept_legacy_protocol. Requests must carry
@@ -178,10 +178,18 @@ wtq_connect_status_t wtq_connect_encode_request(
  * As wtq_connect_encode_request, but with an explicit extended-CONNECT
  * :protocol token to select the WebTransport wire profile:
  * WTQ_CONNECT_PROTOCOL_TOKEN ("webtransport-h3", current) or
- * WTQ_CONNECT_PROTOCOL_TOKEN_LEGACY ("webtransport", D13/14 compat).
- * NULL/0 token defaults to the current token (so the bare
+ * WTQ_CONNECT_PROTOCOL_TOKEN_LEGACY ("webtransport", D13/14 or
+ * D02/RFC9297 compat). Non-token values are rejected before output.
+ * A NULL token or zero length defaults to the current token (so the bare
  * wtq_connect_encode_request is exactly this with the current token).
  */
+wtq_connect_status_t wtq_connect_encode_request_ex(
+    const char *authority, size_t authority_len, const char *path,
+    size_t path_len, const char *origin, size_t origin_len,
+    const wtq_sf_str_t *protocols, size_t protocol_count,
+    const char *protocol_token, size_t protocol_token_len, uint8_t *dst,
+    size_t cap, size_t *out_len);
+
 /*
  * As _ex, plus an explicit draft-02 marker decision: when
  * emit_d02_marker is true exactly one "sec-webtransport-http3-draft02: 1"
@@ -194,13 +202,6 @@ wtq_connect_status_t wtq_connect_encode_request_d02(
     const wtq_sf_str_t *protocols, size_t protocol_count,
     const char *protocol_token, size_t protocol_token_len,
     bool emit_d02_marker, uint8_t *dst, size_t cap, size_t *out_len);
-
-wtq_connect_status_t wtq_connect_encode_request_ex(
-    const char *authority, size_t authority_len, const char *path,
-    size_t path_len, const char *origin, size_t origin_len,
-    const wtq_sf_str_t *protocols, size_t protocol_count,
-    const char *protocol_token, size_t protocol_token_len, uint8_t *dst,
-    size_t cap, size_t *out_len);
 
 /*
  * Encode a response field section: :status, plus wt-protocol when

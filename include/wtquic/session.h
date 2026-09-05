@@ -224,8 +224,7 @@ WTQ_API void wtq_session_events_init(wtq_session_events_t *events);
  * older callers get WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT, exactly as before.
  *
  * wtquic implements THREE profiles. H3_CURRENT and H3_DRAFT_13_14_COMPAT do
- * NOT
- * provide stock-browser compatibility (see COMPATIBILITY.md).
+ * not provide stock-browser compatibility (see COMPATIBILITY.md).
  */
 typedef enum wtq_webtransport_profile {
     /*
@@ -321,14 +320,15 @@ WTQ_API wtq_result_t wtq_session_webtransport_profile(
  * old caller's struct_size can never expose uninitialised padding as the
  * profile). Zero (a partial or absent tail) means H3_CURRENT.
  *
- * Use WTQ_CONNECT_CONFIG_INIT / wtq_connect_config_init (frozen v1) or
- * wtq_connect_config_init_ex(cfg, struct_size) for the current size.
+ * WTQ_CONNECT_CONFIG_INIT and the wtq_connect_config_init(cfg) header
+ * macro initialize the caller's compiled size. The bare initializer symbol
+ * stays frozen to v1; wtq_connect_config_init_ex accepts an explicit size.
  */
 typedef struct wtq_connect_config {
     uint32_t struct_size;
     const char *authority;            /* required, e.g. "example.com" */
     const char *path;                 /* required, e.g. "/app" */
-    const char *origin;               /* optional (NULL = absent) */
+    const char *origin;               /* required by D02; otherwise optional */
     const char *const *subprotocols;  /* offered, in preference order */
     size_t subprotocol_count;
     bool require_subprotocol;         /* fail unless one is selected */
@@ -343,8 +343,8 @@ typedef struct wtq_connect_config {
                                          0 = H3_CURRENT */
 } wtq_connect_config_t;
 
-/* The frozen v1 shadow struct is INTERNAL (defined in session.c, with
- * the layout static-asserts); the bare wtq_connect_config_init writes
+/* The frozen v1 shadow struct is INTERNAL (with layout static-asserts in
+ * session.c); the bare wtq_connect_config_init writes
  * exactly sizeof(v1), so an old binary that linked it is never written
  * past its smaller object. It is deliberately NOT part of the public
  * surface. */
@@ -370,9 +370,39 @@ WTQ_API void wtq_connect_config_init_ex(wtq_connect_config_t *cfg,
 #define wtq_connect_config_init(cfg) \
     wtq_connect_config_init_ex((cfg), sizeof(wtq_connect_config_t))
 
+typedef enum wtq_origin_policy_mode {
+    /* Preserve legacy CURRENT/D13 behavior: do not inspect Origin. This is
+     * invalid for a listener that advertises the D02 compatibility profile. */
+    WTQ_ORIGIN_POLICY_UNSET = 0,
+    /* Accept one valid tuple origin; reject the opaque serialized origin
+     * "null". */
+    WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE = 1,
+    /* Accept one valid serialized origin only when its bytes exactly match an
+     * entry in allowed_origins. No canonicalization or wildcard matching. */
+    WTQ_ORIGIN_POLICY_ALLOWLIST = 2,
+    /* Accept one valid tuple origin or the opaque serialized origin "null". */
+    WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL = 3
+} wtq_origin_policy_mode_t;
+
 /*
- * One server path registration: which request path to accept and which
- * subprotocols it supports. Use WTQ_SERVE_CONFIG_INIT.
+ * One server path registration: which request path to accept, which
+ * subprotocols it supports, and its Origin authorization policy.
+ *
+ * Any non-UNSET policy requires a present, syntactically valid, single
+ * RFC 6454 serialized origin on every request, regardless of the selected
+ * WebTransport profile. A listener advertising the D02/RFC9297 profile must
+ * configure a non-UNSET policy for every path; otherwise listener/serve
+ * configuration fails with WTQ_ERR_INVALID_ARG.
+ *
+ * ALLOWLIST entries are copied before the configuration call returns. They
+ * are compared byte-for-byte, case-sensitively, with no URI normalization,
+ * wildcard, suffix, or same-site matching. Each entry must be one serialized
+ * origin or "null". Limits are 8 entries and 512 copied bytes per path,
+ * 320 bytes per entry, and 1024 copied bytes across the connection.
+ *
+ * ABI: the frozen v1 prefix ends at require_subprotocol. The reserved field
+ * occupies v1 tail padding so origin_policy begins at or after sizeof(v1).
+ * Older and zero-initialized callers therefore behave as UNSET.
  */
 typedef struct wtq_serve_config {
     uint32_t struct_size;
@@ -380,12 +410,24 @@ typedef struct wtq_serve_config {
     const char *const *subprotocols;  /* supported (server order) */
     size_t subprotocol_count;
     bool require_subprotocol;         /* refuse when no overlap */
+    uint32_t _reserved_v1_tail;       /* frozen v1 padding; ignored */
+    /* ---- v2 tail (begins at or after sizeof frozen v1) ---- */
+    uint32_t origin_policy;           /* wtq_origin_policy_mode_t */
+    const char *const *allowed_origins;
+    size_t allowed_origin_count;
 } wtq_serve_config_t;
 
 #define WTQ_SERVE_CONFIG_INIT \
-    { (uint32_t)sizeof(wtq_serve_config_t), 0, 0, 0, 0 }
+    { (uint32_t)sizeof(wtq_serve_config_t), 0, 0, 0, 0, 0, 0, 0, 0 }
 
 WTQ_API void wtq_serve_config_init(wtq_serve_config_t *cfg);
+WTQ_API void wtq_serve_config_init_ex(wtq_serve_config_t *cfg,
+                                      size_t struct_size);
+/* Concrete type size keeps wtq_serve_config_init(NULL) a compiling no-op.
+ * The bare symbol selected by &wtq_serve_config_init remains the frozen v1
+ * initializer; use &_ex for a current-size function pointer. */
+#define wtq_serve_config_init(cfg) \
+    wtq_serve_config_init_ex((cfg), sizeof(wtq_serve_config_t))
 
 /* --- lifetime ----------------------------------------------------------- */
 

@@ -780,7 +780,16 @@ static void abi_serve(wtq_serve_config_t *serve)
     serve->path = "/x";
     serve->subprotocols = protos;
     serve->subprotocol_count = 1;
+    serve->origin_policy = WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
 }
+
+typedef struct abi_serve_cfg_v1 {
+    uint32_t struct_size;
+    const char *path;
+    const char *const *subprotocols;
+    size_t subprotocol_count;
+    bool require_subprotocol;
+} abi_serve_cfg_v1_t;
 
 /* exact v1 prefix through listener_start: a legacy-sized listener starts and
  * carries NO admission/quiescence. Heap-backed (sizeof frozen v1) so an over-read trips
@@ -791,17 +800,30 @@ static int test_abi_listener_exact_v1(void)
     struct wtq_msquic_env env;
     QUIC_API_TABLE api;
     abi_env_init(&env, &api);
-    wtq_serve_config_t serve;
-    abi_serve(&serve);
+    static const char *const protos[] = { "wtq-test" };
+    abi_serve_cfg_v1_t *serve = malloc(2 * sizeof(*serve));
+    WTQ_TEST_CHECK(serve != NULL);
     wtq_session_events_t ev;
     wtq_session_events_init(&ev);
 
     const size_t sz = sizeof(wtq_msquic_listener_cfg_v1_t);
     unsigned char *buf = malloc(sz);
     WTQ_TEST_CHECK(buf != NULL);
-    if (buf != NULL) {
+    if (buf != NULL && serve != NULL) {
+        memset(serve, 0, 2 * sizeof(*serve));
+        serve[0].struct_size = (uint32_t)sizeof(*serve);
+        serve[0].path = "/old-a";
+        serve[0].subprotocols = protos;
+        serve[0].subprotocol_count = 1;
+        serve[1].struct_size = (uint32_t)sizeof(*serve);
+        serve[1].path = "/old-b";
+        serve[1].subprotocols = protos;
+        serve[1].subprotocol_count = 1;
         memset(buf, 0, sz);
-        abi_set_listener_v1(buf, (uint32_t)sz, &serve, &ev, NULL);
+        abi_set_listener_v1(
+            buf, (uint32_t)sz,
+            (const wtq_serve_config_t *)(const void *)serve, &ev, NULL);
+        ((wtq_msquic_listener_cfg_t *)(void *)buf)->path_count = 2;
         wtq_msquic_listener_t *l = NULL;
         WTQ_TEST_CHECK_EQ_INT(
             (int)wtq_msquic_listener_start(&env, (void *)buf, &l),
@@ -811,11 +833,131 @@ static int test_abi_listener_exact_v1(void)
             WTQ_TEST_CHECK(l->accept_prepare == NULL &&
                            l->accept_abandon == NULL &&
                            l->on_transport_quiesced == NULL);
+            WTQ_TEST_CHECK_EQ_SIZE(l->path_count, 2);
+            WTQ_TEST_CHECK(strcmp(l->paths[0].path, "/old-a") == 0);
+            WTQ_TEST_CHECK(strcmp(l->paths[1].path, "/old-b") == 0);
             wtq_msquic_listener_stop(l);
         }
+    }
+    free(buf);
+    free(serve);
+    abi_env_destroy(&env);
+    return failures;
+}
+
+/* A current-size listener with the default zero path_stride walks a current
+ * two-element array and retains each element's Origin tail independently. */
+static int test_listener_current_path_stride(void)
+{
+    int failures = 0;
+    struct wtq_msquic_env env;
+    QUIC_API_TABLE api;
+    abi_env_init(&env, &api);
+
+    static const char *const protos[] = { "wtq-test" };
+    static const char *const origin_a[] = { "https://a.example" };
+    static const char *const origin_b[] = { "https://b.example" };
+    wtq_serve_config_t serve[2] = {
+        WTQ_SERVE_CONFIG_INIT, WTQ_SERVE_CONFIG_INIT,
+    };
+    serve[0].path = "/new-a";
+    serve[0].subprotocols = protos;
+    serve[0].subprotocol_count = 1;
+    serve[0].origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+    serve[0].allowed_origins = origin_a;
+    serve[0].allowed_origin_count = 1;
+    serve[1].path = "/new-b";
+    serve[1].subprotocols = protos;
+    serve[1].subprotocol_count = 1;
+    serve[1].origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+    serve[1].allowed_origins = origin_b;
+    serve[1].allowed_origin_count = 1;
+
+    wtq_session_events_t ev;
+    wtq_session_events_init(&ev);
+    wtq_msquic_listener_cfg_t cfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
+    cfg.bind_address = "127.0.0.1";
+    cfg.cert_file = "cert.pem";
+    cfg.key_file = "key.pem";
+    cfg.paths = serve;
+    cfg.path_count = 2;
+    cfg.events = &ev;
+    WTQ_TEST_CHECK_EQ_SIZE(cfg.path_stride, 0);
+
+    wtq_msquic_listener_t *l = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_msquic_listener_start(&env, &cfg, &l), WTQ_OK);
+    WTQ_TEST_CHECK(l != NULL);
+    if (l != NULL) {
+        WTQ_TEST_CHECK_EQ_SIZE(l->path_count, 2);
+        WTQ_TEST_CHECK(strcmp(l->paths[0].path, "/new-a") == 0);
+        WTQ_TEST_CHECK(strcmp(l->paths[1].path, "/new-b") == 0);
+        WTQ_TEST_CHECK_EQ_SIZE(l->paths[0].origin_count, 1);
+        WTQ_TEST_CHECK_EQ_SIZE(l->paths[1].origin_count, 1);
+        WTQ_TEST_CHECK(strcmp(l->paths[0].origin_ptr[0], origin_a[0]) == 0);
+        WTQ_TEST_CHECK(strcmp(l->paths[1].origin_ptr[0], origin_b[0]) == 0);
+        wtq_msquic_listener_stop(l);
+    }
+
+    cfg.path_stride = sizeof(wtq_serve_config_t) - 1;
+    l = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_msquic_listener_start(&env, &cfg, &l),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK(l == NULL);
+
+    abi_env_destroy(&env);
+    return failures;
+}
+
+/* A listener size ending inside path_stride treats the field as absent. The
+ * poisoned fragment must never become an enormous stride. */
+static int test_listener_partial_path_stride(void)
+{
+    int failures = 0;
+    static const char *const protos[] = { "wtq-test" };
+    abi_serve_cfg_v1_t serve[2];
+    memset(serve, 0, sizeof(serve));
+    serve[0].struct_size = (uint32_t)sizeof(serve[0]);
+    serve[0].path = "/partial-a";
+    serve[0].subprotocols = protos;
+    serve[0].subprotocol_count = 1;
+    serve[1].struct_size = (uint32_t)sizeof(serve[1]);
+    serve[1].path = "/partial-b";
+    serve[1].subprotocols = protos;
+    serve[1].subprotocol_count = 1;
+
+    wtq_session_events_t ev;
+    wtq_session_events_init(&ev);
+    const size_t off = offsetof(wtq_msquic_listener_cfg_t, path_stride);
+    const size_t width = sizeof(((wtq_msquic_listener_cfg_t *)0)->path_stride);
+    for (size_t n = 1; n < width; n++) {
+        const size_t bytes = off + n;
+        unsigned char *buf = malloc(bytes);
+        WTQ_TEST_CHECK(buf != NULL);
+        if (buf == NULL)
+            continue;
+        memset(buf, 0, bytes);
+        abi_set_listener_v1(
+            buf, (uint32_t)bytes,
+            (const wtq_serve_config_t *)(const void *)serve, &ev, NULL);
+        wtq_msquic_listener_cfg_t *cfg = (void *)buf;
+        cfg->path_count = 2;
+        memset(buf + off, 0xA5, n);
+
+        struct wtq_msquic_env env;
+        QUIC_API_TABLE api;
+        abi_env_init(&env, &api);
+        wtq_msquic_listener_t *l = NULL;
+        WTQ_TEST_CHECK_EQ_INT(wtq_msquic_listener_start(&env, cfg, &l),
+                              WTQ_OK);
+        WTQ_TEST_CHECK(l != NULL);
+        if (l != NULL) {
+            WTQ_TEST_CHECK_EQ_SIZE(l->path_count, 2);
+            WTQ_TEST_CHECK(strcmp(l->paths[1].path, "/partial-b") == 0);
+            wtq_msquic_listener_stop(l);
+        }
+        abi_env_destroy(&env);
         free(buf);
     }
-    abi_env_destroy(&env);
     return failures;
 }
 
@@ -1024,6 +1166,7 @@ static int test_abi_listener_profile_set(void)
     int failures = 0;
     const size_t v1 = sizeof(wtq_msquic_listener_cfg_v1_t);
     const size_t v3 = sizeof(wtq_msquic_listener_cfg_v3_t);
+    const size_t v4 = sizeof(wtq_msquic_listener_cfg_v4_t);
     const size_t full = sizeof(wtq_msquic_listener_cfg_t);
     const size_t soff =
         offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles);
@@ -1036,27 +1179,38 @@ static int test_abi_listener_profile_set(void)
     const uint32_t v_current = (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT;
     const uint32_t v_compat =
         (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;
+    const uint32_t v_d02 =
+        (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
     const uint32_t v_bad = 99u;
     const uint64_t m_cur = WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT;
     const uint64_t m_cmp = WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT;
-    const uint64_t m_both = WTQ_WEBTRANSPORT_PROFILES_ALL;
+    const uint64_t m_d02 =
+        WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
+    const uint64_t m_all = WTQ_WEBTRANSPORT_PROFILES_ALL;
     const uint64_t m_unknown = UINT64_C(1) << 3;
     const uint64_t m_mixed = WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT |
                              (UINT64_C(1) << 3);
     const unsigned char *CURRENT = (const unsigned char *)&v_current;
     const unsigned char *COMPAT = (const unsigned char *)&v_compat;
+    const unsigned char *D02 = (const unsigned char *)&v_d02;
     const unsigned char *BAD_SINGULAR = (const unsigned char *)&v_bad;
     const unsigned char *SET_CUR = (const unsigned char *)&m_cur;
     const unsigned char *SET_CMP = (const unsigned char *)&m_cmp;
-    const unsigned char *SET_BOTH = (const unsigned char *)&m_both;
+    const unsigned char *SET_D02 = (const unsigned char *)&m_d02;
+    const unsigned char *SET_ALL = (const unsigned char *)&m_all;
     const unsigned char *SET_UNKNOWN = (const unsigned char *)&m_unknown;
     const unsigned char *SET_MIXED = (const unsigned char *)&m_mixed;
     wtq_result_t rc;
     int singular;
 
-    /* the derived layout itself: the set begins at/after a COMPLETE v3 */
+    const size_t stride_off =
+        offsetof(wtq_msquic_listener_cfg_t, path_stride);
+
+    /* The set begins after v3; the stride begins after frozen v4. */
     WTQ_TEST_CHECK(soff >= v3);
-    WTQ_TEST_CHECK_EQ_SIZE(full, soff + slen);
+    WTQ_TEST_CHECK_EQ_SIZE(v4, soff + slen);
+    WTQ_TEST_CHECK(stride_off >= v4);
+    WTQ_TEST_CHECK_EQ_SIZE(full, stride_off + sizeof(size_t));
 
     /* (1) exact frozen v1: accepted, defaults CURRENT */
     WTQ_TEST_CHECK_EQ_U64(
@@ -1080,6 +1234,11 @@ static int test_abi_listener_profile_set(void)
                                &rc),
         WTQ_WEBTRANSPORT_PROFILES_H3_CURRENT);
     WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)v3, D02, sizeof(v_d02), NULL, 0,
+                               &singular, &rc),
+        m_d02);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
     /* a v3 caller's out-of-range singular is still rejected */
     (void)abi_listener_set_start((uint32_t)v3, BAD_SINGULAR, 4, NULL, 0, NULL,
                                  &rc);
@@ -1093,6 +1252,17 @@ static int test_abi_listener_profile_set(void)
                                SET_CUR, slen - 1, &singular, &rc),
         WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
     WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* Every partial set boundary leaves the complete D02 singular field
+     * authoritative; no fragment of the set may be interpreted. */
+    for (size_t missing = 1; missing <= slen; missing++) {
+        WTQ_TEST_CHECK_EQ_U64(
+            abi_listener_set_start(
+                (uint32_t)(soff + slen - missing), D02, sizeof(v_d02),
+                SET_ALL, slen - missing, &singular, &rc),
+            m_d02);
+        WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    }
 
     /* (5) exact current object, zero set: singular fallback */
     WTQ_TEST_CHECK_EQ_U64(
@@ -1111,9 +1281,21 @@ static int test_abi_listener_profile_set(void)
                                &singular, &rc),
         WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT);
     WTQ_TEST_CHECK_EQ_U64(
-        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_BOTH, slen,
+        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_ALL, slen,
                                &singular, &rc),
         WTQ_WEBTRANSPORT_PROFILES_ALL);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, CURRENT, 4, SET_D02, slen,
+                               &singular, &rc),
+        m_d02);
+    WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+
+    /* A complete set is authoritative regardless of the singular value. */
+    WTQ_TEST_CHECK_EQ_U64(
+        abi_listener_set_start((uint32_t)full, D02, sizeof(v_d02), SET_CUR,
+                               slen, &singular, &rc),
+        m_cur);
     WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
 
     /* (9) authoritative set + a valid singular NON-MEMBER: set wins, the
@@ -1144,9 +1326,14 @@ static int test_abi_listener_profile_set(void)
     {
         uint32_t big = (uint32_t)(full + 32);
         WTQ_TEST_CHECK_EQ_U64(
-            abi_listener_set_start(big, CURRENT, 4, SET_BOTH, slen, &singular,
+            abi_listener_set_start(big, CURRENT, 4, SET_ALL, slen, &singular,
                                    &rc),
             WTQ_WEBTRANSPORT_PROFILES_ALL);
+        WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
+        WTQ_TEST_CHECK_EQ_U64(
+            abi_listener_set_start(big, CURRENT, sizeof(v_current), SET_D02,
+                                   slen, &singular, &rc),
+            m_d02);
         WTQ_TEST_CHECK_EQ_INT((int)rc, (int)WTQ_OK);
     }
 
@@ -1234,7 +1421,7 @@ static int test_abi_listener_profile(void)
     }
     wtq_result_t rc;
 
-    /* --- D02/RFC9297 singular rows (0014f item 3) --------------------- */
+    /* --- D02/RFC9297 singular profile rows ---------------------------- */
     /* exact current struct, D02 in the singular field, zero set. */
     WTQ_TEST_CHECK_EQ_INT(
         abi_listener_profile_start((uint32_t)full, D02, plen, &rc),
@@ -1677,6 +1864,8 @@ int main(void)
     failures += test_abi_connect_oversized();
     failures += test_abi_listener_prefix_minus_one();
     failures += test_abi_listener_exact_v1();
+    failures += test_listener_current_path_stride();
+    failures += test_listener_partial_path_stride();
     failures += test_abi_listener_partial_pair();
     failures += test_abi_listener_partial_quiesce();
     failures += test_abi_listener_oversized();

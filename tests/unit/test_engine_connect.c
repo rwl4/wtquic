@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <wtquic/session.h>
+
 #include "fake_driver.h"
 #include "wt_driver.h"
 
@@ -18,6 +20,7 @@ typedef struct app_state {
     int established_events;
     char selected[512];
     size_t selected_len;
+    bool selected_overflow;
     int rejected_events;
     uint16_t rejected_status;
     int failed_events;
@@ -52,9 +55,10 @@ static void cb_established(wtq_conn_t *c, const char *sel, size_t len,
 
     (void)c;
     st->established_events++;
-    st->selected_len = len < sizeof(st->selected) ? len : 0;
-    if (st->selected_len > 0)
-        memcpy(st->selected, sel, st->selected_len);
+    st->selected_len = len;
+    st->selected_overflow = len > sizeof(st->selected);
+    if (!st->selected_overflow && len > 0)
+        memcpy(st->selected, sel, len);
 }
 
 static void cb_rejected(wtq_conn_t *c, uint16_t status, void *ctx)
@@ -744,7 +748,7 @@ static void server_paths_up(rig_t *r, bool require, int *fp)
     int failures = 0;
 
     rig_up(r, WTQ_PERSPECTIVE_SERVER, fp);
-    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require };
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) ==
                    WTQ_OK);
     *fp += failures;
@@ -954,7 +958,7 @@ static void server_up_profile(rig_t *r, int profile, bool require, int *fp)
     WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r->drv, fake_driver_ops(),
                                    &r->conn) == WTQ_OK);
     WTQ_TEST_CHECK(wtq_conn_start(r->conn, 1000) == WTQ_OK);
-    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require };
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
     *fp += failures;
 }
@@ -984,7 +988,7 @@ static void server_up_profile_set(rig_t *r, wtq_h3_wt_profile_set_t set,
     WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r->drv, fake_driver_ops(),
                                    &r->conn) == WTQ_OK);
     WTQ_TEST_CHECK(wtq_conn_start(r->conn, 1000) == WTQ_OK);
-    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require };
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, require, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
     *fp += failures;
 }
@@ -2959,18 +2963,18 @@ static void test_config_validation(int *fp)
     rig_t s;
     rig_up(&s, WTQ_PERSPECTIVE_SERVER, fp);
     {
-        wtq_server_path_cfg_t path = { NULL, NULL, 0, false };
+        wtq_server_path_cfg_t path = { NULL, NULL, 0, false, 0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_conn_server_set_paths(s.conn, &path, 1) ==
                        WTQ_ERR_INVALID_ARG);
     }
     {
-        wtq_server_path_cfg_t path = { "/x", NULL, 2, false };
+        wtq_server_path_cfg_t path = { "/x", NULL, 2, false, 0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_conn_server_set_paths(s.conn, &path, 1) ==
                        WTQ_ERR_INVALID_ARG);
     }
     {
         static const char *const holey[] = { "moqt-18", NULL };
-        wtq_server_path_cfg_t path = { "/x", holey, 2, false };
+        wtq_server_path_cfg_t path = { "/x", holey, 2, false, 0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_conn_server_set_paths(s.conn, &path, 1) ==
                        WTQ_ERR_INVALID_ARG);
     }
@@ -2979,7 +2983,8 @@ static void test_config_validation(int *fp)
          * fire before any protocols[j] access walks past the array */
         static const char *const one[] = { "moqt-18" };
         wtq_server_path_cfg_t path = { "/x", one,
-                                       WTQ_CONN_MAX_OFFERED + 1, false };
+                                       WTQ_CONN_MAX_OFFERED + 1, false,
+                                       0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_conn_server_set_paths(s.conn, &path, 1) ==
                        WTQ_ERR_TOO_LARGE);
     }
@@ -3023,7 +3028,7 @@ static wtq_result_t server_policy_rc(const char *proto)
     const char *const supported[] = { proto };
 
     rig_up(&r, WTQ_PERSPECTIVE_SERVER, &fp);
-    wtq_server_path_cfg_t path = { "/moq", supported, 1, true };
+    wtq_server_path_cfg_t path = { "/moq", supported, 1, true, 0, NULL, 0 };
     wtq_result_t rc = wtq_conn_server_set_paths(r.conn, &path, 1);
     rig_down(&r);
     return rc;
@@ -3114,7 +3119,7 @@ static void server_selects(const char *proto, size_t n, int *fp)
     const char *const offer[] = { proto };
 
     rig_up(&r, WTQ_PERSPECTIVE_SERVER, fp);
-    wtq_server_path_cfg_t path = { "/moq", supported, 1, true };
+    wtq_server_path_cfg_t path = { "/moq", supported, 1, true, 0, NULL, 0 };
     WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, &path, 1),
                           WTQ_OK);
     deliver_peer_settings(&r, fp);
@@ -3415,10 +3420,10 @@ static void test_subprotocol_malformed_content(int *fp)
     *fp += failures;
 }
 
-/* ---- D02 marker policy, causal at the ENGINE (0014e finding F) ------- */
+/* ---- D02 marker policy, causal at the engine ------------------------- */
 
 #define CD02 WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT
-static const char *const D02_ORG = "https://example.com:443";
+static const char D02_ORG[] = "https://example.com:443";
 
 /*
  * Build a D02 CONNECT request with a controlled marker. `marker_mode`:
@@ -3427,7 +3432,7 @@ static const char *const D02_ORG = "https://example.com:443";
  *   only the marker fields are placed deliberately.
  */
 static size_t build_d02_request(uint8_t *dst, size_t cap, int marker_mode,
-                                bool with_origin)
+                                const char *origin)
 {
     static const char MK[] = "sec-webtransport-http3-draft02";
     wtq_qpack_field_t f[9];
@@ -3439,9 +3444,9 @@ static size_t build_d02_request(uint8_t *dst, size_t cap, int marker_mode,
     f[n++] = (wtq_qpack_field_t){ ":path", 5, "/moq", 4, false };
     f[n++] = (wtq_qpack_field_t){ ":protocol", 9, "webtransport", 12,
                                   false };
-    if (with_origin)
-        f[n++] = (wtq_qpack_field_t){ "origin", 6, D02_ORG,
-                                      sizeof(D02_ORG) - 1, false };
+    if (origin != NULL)
+        f[n++] = (wtq_qpack_field_t){ "origin", 6, origin,
+                                      strlen(origin), false };
     if (marker_mode == 0 || marker_mode == 3)
         f[n++] = (wtq_qpack_field_t){ MK, sizeof(MK) - 1, "1", 1, false };
     if (marker_mode == 2)
@@ -3477,7 +3482,22 @@ static void server_d02_up(rig_t *r, int *fp)
     int failures = 0;
     rig_up_profiles(r, WTQ_PERSPECTIVE_SERVER,
                     WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
-    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false };
+    wtq_server_path_cfg_t path = { "/moq", SUPPORTED, 2, false, 0, NULL, 0 };
+    path.origin_policy = WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+    WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
+    *fp += failures;
+}
+
+static void server_d02_up_policy(rig_t *r, uint32_t policy,
+                                 const char *const *origins, size_t count,
+                                 int *fp)
+{
+    int failures = 0;
+    rig_up_profiles(r, WTQ_PERSPECTIVE_SERVER,
+                    WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+    wtq_server_path_cfg_t path = {
+        "/moq", SUPPORTED, 2, false, policy, origins, count,
+    };
     WTQ_TEST_CHECK(wtq_conn_server_set_paths(r->conn, &path, 1) == WTQ_OK);
     *fp += failures;
 }
@@ -3486,15 +3506,15 @@ static void test_d02_request_marker_policy(int *fp)
 {
     int failures = 0;
     const struct {
-        const char *name; int mode; bool origin;
+        const char *name; int mode; const char *origin;
         uint16_t status;      /* 0 = expect NO HTTP response at all */
         bool stream_error;    /* stream-local malformed instead */
     } cases[] = {
-        { "correct",   0, true,  200, false },
-        { "missing",   1, true,  400, false },
-        { "wrong",     2, true,  400, false },
-        { "duplicate", 3, true,  0,   true  },  /* malformed message */
-        { "no_origin", 0, false, 403, false },  /* Origin gate precedes 2xx */
+        { "correct",   0, D02_ORG, 200, false },
+        { "missing",   1, D02_ORG, 400, false },
+        { "wrong",     2, D02_ORG, 400, false },
+        { "duplicate", 3, D02_ORG, 0,   true  }, /* malformed message */
+        { "no_origin", 0, NULL,    403, false }, /* Origin precedes 2xx */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         rig_t r;
@@ -3511,9 +3531,23 @@ static void test_d02_request_marker_policy(int *fp)
         deliver_d02_peer_settings(&r, fp);
 
         if (cases[i].stream_error) {
-            /* malformed message: stream-local, no HTTP response body */
+            /* Malformed message: one whole-stream H3_MESSAGE_ERROR, no
+             * HTTP response, no connection failure, and no later effect. */
             WTQ_TEST_CHECK_EQ_U64(ds->len, 0);
-            WTQ_TEST_CHECK(ds->reset || ds->stopped);
+            WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, 1);
+            WTQ_TEST_CHECK_EQ_INT((int)ds->last_shutdown.mode,
+                                  (int)WTQ_SHUTDOWN_WHOLE_STREAM);
+            WTQ_TEST_CHECK(ds->last_shutdown.abort_send);
+            WTQ_TEST_CHECK(ds->last_shutdown.abort_recv);
+            WTQ_TEST_CHECK_EQ_U64(ds->last_shutdown.send_err,
+                                  WTQ_H3_MESSAGE_ERROR);
+            WTQ_TEST_CHECK_EQ_U64(ds->last_shutdown.recv_err,
+                                  WTQ_H3_MESSAGE_ERROR);
+            const int shutdowns = ds->shutdown_count;
+            (void)feed_request(&r, 0, req, qlen, 13, fp);
+            WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, shutdowns);
+            WTQ_TEST_CHECK_EQ_INT(r.app.closed_events, 0);
+            WTQ_TEST_CHECK_EQ_INT(r.app.failed_events, 0);
         } else {
             expect_response_status(ds, cases[i].status, fp);
         }
@@ -3526,6 +3560,685 @@ static void test_d02_request_marker_policy(int *fp)
         WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 0);
         rig_down(&r);
     }
+    *fp += failures;
+}
+
+/* Build a response whose draft-02 marker cardinality and value are under
+ * test control. All parsing still goes through the production decoder. */
+static size_t build_d02_response(uint8_t *dst, size_t cap, uint16_t status,
+                                 const char *protocol, int marker_mode)
+{
+    static const char marker[] = "sec-webtransport-http3-draft";
+    char status_text[4] = {
+        (char)('0' + status / 100),
+        (char)('0' + (status / 10) % 10),
+        (char)('0' + status % 10),
+        '\0',
+    };
+    wtq_qpack_field_t fields[4];
+    size_t count = 0;
+
+    fields[count++] =
+        (wtq_qpack_field_t){ ":status", 7, status_text, 3, false };
+    if (marker_mode == 0 || marker_mode == 3)
+        fields[count++] = (wtq_qpack_field_t){ marker, sizeof(marker) - 1,
+                                               "draft02", 7, false };
+    if (marker_mode == 2)
+        fields[count++] = (wtq_qpack_field_t){ marker, sizeof(marker) - 1,
+                                               "draft07", 7, false };
+    if (marker_mode == 3)
+        fields[count++] = (wtq_qpack_field_t){ marker, sizeof(marker) - 1,
+                                               "draft02", 7, false };
+
+    char sfbuf[64];
+    size_t sflen = 0;
+    if (protocol != NULL) {
+        if (wtq_sf_string_encode_item(protocol, strlen(protocol), sfbuf,
+                                      sizeof(sfbuf), &sflen) != WTQ_SF_OK)
+            return 0;
+        fields[count++] = (wtq_qpack_field_t){ "wt-protocol", 11, sfbuf,
+                                               sflen, false };
+    }
+
+    uint8_t section[512];
+    size_t section_len = 0;
+    if (wtq_qpack_encode_section(fields, count, section, sizeof(section),
+                                 &section_len) != WTQ_QPACK_OK)
+        return 0;
+    size_t header_len = 0;
+    if (wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, section_len, dst,
+                                   cap, &header_len) != 0 ||
+        section_len > cap - header_len)
+        return 0;
+    memcpy(dst + header_len, section, section_len);
+    return header_len + section_len;
+}
+
+static wtq_result_t connect_d02(rig_t *r)
+{
+    wtq_client_connect_cfg_t cfg = {
+        "example.com", "/moq", D02_ORG, OFFER, 2, false, (int)CD02,
+    };
+    return wtq_conn_client_connect(r->conn, &cfg);
+}
+
+typedef struct d02_outcome {
+    int established;
+    int rejected;
+    int failed;
+    int errors;
+    int closed;
+    int settings;
+    int failed_reason;
+    uint16_t rejected_status;
+    uint64_t last_error;
+    bool closed_clean;
+    size_t callback_protocol_len;
+    char callback_protocol[512];
+    bool callback_overflow;
+    size_t query_protocol_len;
+    char query_protocol[512];
+    bool query_protocol_present;
+    bool query_overflow;
+    int state;
+    bool was_established;
+    bool connection_closed;
+} d02_outcome_t;
+
+static d02_outcome_t capture_d02_outcome(const rig_t *r)
+{
+    d02_outcome_t out;
+    memset(&out, 0, sizeof(out));
+    out.established = r->app.established_events;
+    out.rejected = r->app.rejected_events;
+    out.failed = r->app.failed_events;
+    out.errors = r->app.error_events;
+    out.closed = r->app.closed_events;
+    out.settings = r->app.settings_events;
+    out.failed_reason = r->app.failed_reason;
+    out.rejected_status = r->app.rejected_status;
+    out.last_error = r->app.last_error;
+    out.closed_clean = r->app.closed_clean;
+    out.callback_protocol_len = r->app.selected_len;
+    out.callback_overflow = r->app.selected_overflow;
+    if (!out.callback_overflow &&
+        out.callback_protocol_len <= sizeof(out.callback_protocol) &&
+        out.callback_protocol_len > 0) {
+        memcpy(out.callback_protocol, r->app.selected,
+               out.callback_protocol_len);
+    }
+
+    size_t protocol_len = 0;
+    const char *protocol = wtq_conn_selected_protocol(r->conn, &protocol_len);
+    out.query_protocol_present = protocol != NULL;
+    out.query_protocol_len = protocol_len;
+    out.query_overflow = protocol_len > sizeof(out.query_protocol);
+    if (protocol != NULL && !out.query_overflow && protocol_len > 0)
+        memcpy(out.query_protocol, protocol, protocol_len);
+    out.state = (int)wtq_conn_session_state(r->conn);
+    out.was_established = wtq_conn_session_established(r->conn);
+    out.connection_closed = wtq_conn_is_closed(r->conn);
+    return out;
+}
+
+static int d02_outcome_diff(const d02_outcome_t *a,
+                            const d02_outcome_t *b)
+{
+    int differences = 0;
+    if (a->established != b->established ||
+        a->rejected != b->rejected || a->failed != b->failed ||
+        a->errors != b->errors || a->closed != b->closed ||
+        a->settings != b->settings ||
+        a->failed_reason != b->failed_reason ||
+        a->rejected_status != b->rejected_status ||
+        a->last_error != b->last_error ||
+        a->closed_clean != b->closed_clean ||
+        a->callback_protocol_len != b->callback_protocol_len ||
+        a->callback_overflow != b->callback_overflow ||
+        memcmp(a->callback_protocol, b->callback_protocol,
+               sizeof(a->callback_protocol)) != 0 ||
+        a->query_protocol_len != b->query_protocol_len ||
+        a->query_protocol_present != b->query_protocol_present ||
+        a->query_overflow != b->query_overflow ||
+        memcmp(a->query_protocol, b->query_protocol,
+               sizeof(a->query_protocol)) != 0 ||
+        a->state != b->state ||
+        a->was_established != b->was_established ||
+        a->connection_closed != b->connection_closed) {
+        differences++;
+    }
+    if (a->callback_overflow || b->callback_overflow ||
+        a->query_overflow || b->query_overflow)
+        differences++;
+    return differences;
+}
+
+static void assert_d02_outcome_unchanged(const d02_outcome_t *before,
+                                         const d02_outcome_t *after,
+                                         const char *label, int *fp)
+{
+    int differences = d02_outcome_diff(before, after);
+    if (differences != 0) {
+        fprintf(stderr, "FAIL: %s: repeated response changed outcome\n",
+                label);
+        *fp += differences;
+    }
+}
+
+static void test_d02_response_marker_policy(int *fp)
+{
+    int failures = 0;
+    const struct {
+        const char *name;
+        uint16_t status;
+        const char *protocol;
+        int marker_mode;
+        int established;
+        int failed;
+        int rejected;
+        uint16_t rejected_status;
+        int state;
+        int failed_reason;
+        const char *selected;
+        bool terminal;
+    } cases[] = {
+        { "ok", 200, "moqt-18", 0, 1, 0, 0, 0,
+          (int)WTQ_SESSION_ESTABLISHED, 0, "moqt-18", false },
+        { "missing", 200, "moqt-18", 1, 0, 1, 0, 0,
+          (int)WTQ_SESSION_FAILED, (int)WTQ_SESSION_FAIL_BAD_RESPONSE,
+          NULL, true },
+        { "wrong", 200, "moqt-18", 2, 0, 1, 0, 0,
+          (int)WTQ_SESSION_FAILED, (int)WTQ_SESSION_FAIL_BAD_RESPONSE,
+          NULL, true },
+        { "refused_missing", 404, NULL, 1, 0, 0, 1, 404,
+          (int)WTQ_SESSION_REJECTED, 0, NULL, true },
+        { "refused_wrong", 404, NULL, 2, 0, 0, 1, 404,
+          (int)WTQ_SESSION_REJECTED, 0, NULL, true },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rig_t r;
+        uint8_t response[512];
+        const size_t response_len = build_d02_response(
+            response, sizeof(response), cases[i].status, cases[i].protocol,
+            cases[i].marker_mode);
+        WTQ_TEST_CHECK(response_len > 0);
+        rig_up_profiles(&r, WTQ_PERSPECTIVE_CLIENT,
+                        WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+        WTQ_TEST_CHECK(connect_d02(&r) == WTQ_OK);
+        deliver_d02_peer_settings(&r, fp);
+        feed_response(&r, response, response_len, 9, fp);
+
+        const d02_outcome_t outcome = capture_d02_outcome(&r);
+        WTQ_TEST_CHECK_EQ_INT(outcome.established, cases[i].established);
+        WTQ_TEST_CHECK_EQ_INT(outcome.failed, cases[i].failed);
+        WTQ_TEST_CHECK_EQ_INT(outcome.rejected, cases[i].rejected);
+        WTQ_TEST_CHECK_EQ_INT(outcome.rejected_status,
+                              cases[i].rejected_status);
+        WTQ_TEST_CHECK_EQ_INT(outcome.state, cases[i].state);
+        WTQ_TEST_CHECK_EQ_INT(outcome.failed_reason,
+                              cases[i].failed_reason);
+        WTQ_TEST_CHECK_EQ_INT(outcome.errors, 0);
+        WTQ_TEST_CHECK_EQ_INT(outcome.closed, 0);
+        WTQ_TEST_CHECK_EQ_INT(outcome.settings, 1);
+        WTQ_TEST_CHECK_EQ_U64(outcome.last_error, 0);
+        WTQ_TEST_CHECK(!outcome.connection_closed);
+        WTQ_TEST_CHECK(!outcome.callback_overflow);
+        WTQ_TEST_CHECK(!outcome.query_overflow);
+        WTQ_TEST_CHECK(outcome.was_established ==
+                       (cases[i].established == 1));
+        if (cases[i].selected != NULL) {
+            const size_t len = strlen(cases[i].selected);
+            WTQ_TEST_CHECK_EQ_SIZE(outcome.callback_protocol_len, len);
+            WTQ_TEST_CHECK(memcmp(outcome.callback_protocol,
+                                  cases[i].selected, len) == 0);
+            WTQ_TEST_CHECK(outcome.query_protocol_present);
+            WTQ_TEST_CHECK_EQ_SIZE(outcome.query_protocol_len, len);
+            WTQ_TEST_CHECK(memcmp(outcome.query_protocol,
+                                  cases[i].selected, len) == 0);
+        } else {
+            WTQ_TEST_CHECK_EQ_SIZE(outcome.callback_protocol_len, 0);
+            WTQ_TEST_CHECK_EQ_SIZE(outcome.query_protocol_len, 0);
+        }
+        if (cases[i].terminal) {
+            feed_response(&r, response, response_len, 9, fp);
+            const d02_outcome_t replayed = capture_d02_outcome(&r);
+            assert_d02_outcome_unchanged(&outcome, &replayed,
+                                         cases[i].name, fp);
+        }
+        rig_down(&r);
+    }
+
+    /* A duplicate singleton is malformed and closes the H3 connection. */
+    {
+        rig_t r;
+        uint8_t response[512];
+        const size_t response_len =
+            build_d02_response(response, sizeof(response), 200, "moqt-18",
+                               3);
+        WTQ_TEST_CHECK(response_len > 0);
+        rig_up_profiles(&r, WTQ_PERSPECTIVE_CLIENT,
+                        WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+        WTQ_TEST_CHECK(connect_d02(&r) == WTQ_OK);
+        deliver_d02_peer_settings(&r, fp);
+        feed_response(&r, response, response_len, 9, fp);
+        const d02_outcome_t outcome = capture_d02_outcome(&r);
+        WTQ_TEST_CHECK_EQ_INT(outcome.established, 0);
+        WTQ_TEST_CHECK_EQ_INT(outcome.failed, 1);
+        WTQ_TEST_CHECK_EQ_INT(outcome.rejected, 0);
+        WTQ_TEST_CHECK_EQ_INT(outcome.errors, 1);
+        WTQ_TEST_CHECK_EQ_INT(outcome.closed, 0);
+        WTQ_TEST_CHECK_EQ_INT(outcome.settings, 1);
+        WTQ_TEST_CHECK_EQ_INT(outcome.failed_reason,
+                              (int)WTQ_SESSION_FAIL_BAD_RESPONSE);
+        WTQ_TEST_CHECK_EQ_INT(outcome.state, (int)WTQ_SESSION_FAILED);
+        WTQ_TEST_CHECK_EQ_U64(outcome.last_error, WTQ_H3_MESSAGE_ERROR);
+        WTQ_TEST_CHECK(outcome.connection_closed);
+        WTQ_TEST_CHECK(!outcome.was_established);
+        feed_response(&r, response, response_len, 9, fp);
+        const d02_outcome_t replayed = capture_d02_outcome(&r);
+        assert_d02_outcome_unchanged(&outcome, &replayed, "duplicate", fp);
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
+static void test_d02_second_success_response(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+    uint8_t response[512];
+    const size_t response_len =
+        build_d02_response(response, sizeof(response), 200, "moqt-18", 0);
+
+    WTQ_TEST_CHECK(response_len > 0);
+    rig_up_profiles(&r, WTQ_PERSPECTIVE_CLIENT,
+                    WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+    WTQ_TEST_CHECK(connect_d02(&r) == WTQ_OK);
+    deliver_d02_peer_settings(&r, fp);
+    feed_response(&r, response, response_len, 9, fp);
+    const d02_outcome_t first = capture_d02_outcome(&r);
+    WTQ_TEST_CHECK_EQ_INT(first.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(first.state, (int)WTQ_SESSION_ESTABLISHED);
+
+    feed_response(&r, response, response_len, 9, fp);
+    const d02_outcome_t second = capture_d02_outcome(&r);
+    WTQ_TEST_CHECK_EQ_INT(second.established, first.established);
+    WTQ_TEST_CHECK_EQ_INT(second.rejected, first.rejected);
+    WTQ_TEST_CHECK_EQ_INT(second.failed, first.failed);
+    WTQ_TEST_CHECK_EQ_INT(second.errors, first.errors);
+    WTQ_TEST_CHECK_EQ_INT(second.settings, first.settings);
+    WTQ_TEST_CHECK_EQ_SIZE(second.callback_protocol_len,
+                           first.callback_protocol_len);
+    WTQ_TEST_CHECK(memcmp(second.callback_protocol, first.callback_protocol,
+                          sizeof(first.callback_protocol)) == 0);
+    WTQ_TEST_CHECK_EQ_SIZE(second.query_protocol_len,
+                           first.query_protocol_len);
+    WTQ_TEST_CHECK(memcmp(second.query_protocol, first.query_protocol,
+                          sizeof(first.query_protocol)) == 0);
+    WTQ_TEST_CHECK_EQ_INT(second.closed, 1);
+    WTQ_TEST_CHECK(!second.closed_clean);
+    WTQ_TEST_CHECK_EQ_INT(second.state, (int)WTQ_SESSION_CLOSED);
+    WTQ_TEST_CHECK(!second.connection_closed);
+    WTQ_TEST_CHECK(second.was_established);
+    rig_down(&r);
+    *fp += failures;
+}
+
+static void test_d02_selected_snapshot_bounds(int *fp)
+{
+    int failures = 0;
+    app_state_t state;
+    static char value[sizeof(((app_state_t *)0)->selected) + 1];
+    memset(value, 'q', sizeof(value));
+
+    memset(&state, 0, sizeof(state));
+    cb_established(NULL, value, sizeof(state.selected), CD02, &state);
+    WTQ_TEST_CHECK_EQ_SIZE(state.selected_len, sizeof(state.selected));
+    WTQ_TEST_CHECK(!state.selected_overflow);
+    WTQ_TEST_CHECK(memcmp(state.selected, value, sizeof(state.selected)) == 0);
+
+    memset(&state, 0, sizeof(state));
+    cb_established(NULL, value, sizeof(value), CD02, &state);
+    WTQ_TEST_CHECK_EQ_SIZE(state.selected_len, sizeof(value));
+    WTQ_TEST_CHECK(state.selected_overflow);
+
+    d02_outcome_t a;
+    d02_outcome_t b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    WTQ_TEST_CHECK_EQ_INT(d02_outcome_diff(&a, &b), 0);
+    b.callback_overflow = true;
+    WTQ_TEST_CHECK(d02_outcome_diff(&a, &b) > 0);
+    *fp += failures;
+}
+
+static void test_d02_outcome_snapshot_is_owned(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+    uint8_t response[512];
+    const size_t response_len =
+        build_d02_response(response, sizeof(response), 200, "moqt-18", 0);
+
+    WTQ_TEST_CHECK(response_len > 0);
+    rig_up_profiles(&r, WTQ_PERSPECTIVE_CLIENT,
+                    WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+    WTQ_TEST_CHECK(connect_d02(&r) == WTQ_OK);
+    deliver_d02_peer_settings(&r, fp);
+    feed_response(&r, response, response_len, 9, fp);
+
+    const d02_outcome_t before = capture_d02_outcome(&r);
+    WTQ_TEST_CHECK_EQ_SIZE(before.query_protocol_len, 7);
+    WTQ_TEST_CHECK(memcmp(before.query_protocol, "moqt-18", 7) == 0);
+
+    size_t live_len = 0;
+    char *live = (char *)wtq_conn_selected_protocol(r.conn, &live_len);
+    WTQ_TEST_CHECK(live != NULL && live_len == 7);
+    if (live != NULL && live_len == 7) {
+        live[0] = 'X';
+        const d02_outcome_t after = capture_d02_outcome(&r);
+        WTQ_TEST_CHECK(memcmp(before.query_protocol, "moqt-18", 7) == 0);
+        WTQ_TEST_CHECK_EQ_INT((int)after.query_protocol[0], (int)'X');
+        WTQ_TEST_CHECK(d02_outcome_diff(&before, &after) > 0);
+        live[0] = 'm';
+    }
+    rig_down(&r);
+    *fp += failures;
+}
+
+static bool make_origin_len(char *dst, size_t cap, size_t total, char host_ch)
+{
+    static const char prefix[] = "https://";
+    static const char suffix[] = ":443";
+    const size_t fixed = sizeof(prefix) - 1 + sizeof(suffix) - 1;
+
+    if (total < fixed + 1 || cap <= total)
+        return false;
+    memcpy(dst, prefix, sizeof(prefix) - 1);
+    memset(dst + sizeof(prefix) - 1, host_ch, total - fixed);
+    memcpy(dst + total - (sizeof(suffix) - 1), suffix,
+           sizeof(suffix) - 1);
+    dst[total] = '\0';
+    return true;
+}
+
+static void run_d02_origin_case(uint64_t seed, uint32_t policy,
+                                const char *const *allowed,
+                                size_t allowed_count, const char *origin,
+                                uint16_t status, int *fp)
+{
+    int failures = 0;
+    rig_t r;
+    uint8_t req[512];
+    size_t qlen = build_d02_request(req, sizeof(req), 0, origin);
+
+    (void)seed;
+
+    WTQ_TEST_CHECK(qlen > 0);
+    server_d02_up_policy(&r, policy, allowed, allowed_count, fp);
+    struct wtq_dstream *ds = feed_request(&r, 0, req, qlen, 17, fp);
+    WTQ_TEST_CHECK_EQ_U64(ds->len, 0);
+    deliver_d02_peer_settings(&r, fp);
+    expect_response_status(ds, status, fp);
+    WTQ_TEST_CHECK_EQ_INT(r.app.established_events, status == 200 ? 1 : 0);
+    if (status != 200)
+        WTQ_TEST_CHECK_EQ_SIZE(r.app.selected_len, 0);
+    rig_down(&r);
+    *fp += failures;
+}
+
+static void test_origin_policy_modes(int *fp)
+{
+    int failures = 0;
+    static const char *const exact[] = { "https://example.com:443" };
+    static const char *const no_port[] = { "https://example.com" };
+    static const char *const opaque[] = { "null" };
+    static const char *const case_variant[] = { "https://EXAMPLE.com:443" };
+
+    run_d02_origin_case(0x0A01, WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE,
+                        NULL, 0, "https://example.com", 200, fp);
+    run_d02_origin_case(0x0A02, WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE,
+                        NULL, 0, "https://[2001:db8::1]:8443", 200, fp);
+    run_d02_origin_case(0x0A03, WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE,
+                        NULL, 0, "null", 403, fp);
+    run_d02_origin_case(0x0A04, WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+                        NULL, 0, "null", 200, fp);
+    run_d02_origin_case(0x0A05, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        exact, 1, exact[0], 200, fp);
+    run_d02_origin_case(0x0A06, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        exact, 1, case_variant[0], 403, fp);
+    run_d02_origin_case(0x0A07, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        no_port, 1, exact[0], 403, fp);
+    run_d02_origin_case(0x0A08, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        opaque, 1, "null", 200, fp);
+    run_d02_origin_case(0x0A09, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        exact, 1, "null", 403, fp);
+    run_d02_origin_case(0x0A0A, WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+                        NULL, 0,
+                        "https://a.example https://b.example", 403, fp);
+    run_d02_origin_case(0x0A0B, WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+                        NULL, 0, "https://example.com/path", 403, fp);
+    run_d02_origin_case(0x0A0C, WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+                        NULL, 0, NULL, 403, fp);
+    run_d02_origin_case(0x0A0D, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        exact, 1, "http://example.com:443", 403, fp);
+    run_d02_origin_case(0x0A0E, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                        exact, 1, "https://example.com.:443", 403, fp);
+
+    *fp += failures;
+}
+
+static void test_origin_policy_validation_and_capacity(int *fp)
+{
+    int failures = 0;
+    static const char *const one[] = { "https://example.com" };
+    static const char *const duplicate[] = {
+        "https://example.com", "https://example.com",
+    };
+    static const char *const list_value[] = {
+        "https://a.example https://b.example",
+    };
+    static const char *const outer_ows[] = { " https://example.com" };
+    static const char *const malformed[] = { "https://[2001:db8:::1]" };
+    static const char *const holes[] = { NULL };
+    static const char *const malformed_values[] = {
+        "1https://example.com", "https://", "https://:443",
+        "https://[2001:db8:::1]", "https://[2001:db8::1",
+        "https://[::ffff:192.168.001.1]",
+        "https://example.com:", "https://example.com:0",
+        "https://example.com:65536", "https://example.com:x",
+        "https://example.com:4294967297",
+        "https://user@example.com", "https://example.com/path",
+        "https://example.com?query", "https://example.com#fragment",
+        "https://exa\tmple.com", "https://a.example https://b.example",
+    };
+    static const char *const valid_values[] = {
+        "https://[::ffff:192.168.1.1]",
+        "https://[v1.a:b]",
+    };
+    const char *nine[WTQ_CONN_MAX_ORIGINS + 1];
+
+    WTQ_TEST_CHECK_EQ_INT(
+        wtq_conn_validate_origin_policy(WTQ_ORIGIN_POLICY_UNSET, NULL, 0),
+        WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE,
+                              NULL, 0),
+                          WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+                              NULL, 0),
+                          WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, one, 1),
+                          WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(99, NULL, 0),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, NULL, 0),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, holes, 1),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, duplicate, 2),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, list_value, 1),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, outer_ows, 1),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, malformed, 1),
+                          WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_UNSET, one, 1),
+                          WTQ_ERR_INVALID_ARG);
+    for (size_t i = 0;
+         i < sizeof(malformed_values) / sizeof(malformed_values[0]); i++) {
+        const char *const bad[] = { malformed_values[i] };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST, bad, 1),
+                              WTQ_ERR_INVALID_ARG);
+    }
+    for (size_t i = 0;
+         i < sizeof(valid_values) / sizeof(valid_values[0]); i++) {
+        const char *const valid[] = { valid_values[i] };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST, valid, 1),
+                              WTQ_OK);
+    }
+    for (size_t i = 0; i < sizeof(nine) / sizeof(nine[0]); i++)
+        nine[i] = "https://example.com";
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                              WTQ_ORIGIN_POLICY_ALLOWLIST, nine,
+                              sizeof(nine) / sizeof(nine[0])),
+                          WTQ_ERR_TOO_LARGE);
+
+    char o255a[256], o255b[256], o256[257], o320[321], o321[322];
+    WTQ_TEST_CHECK(make_origin_len(o255a, sizeof(o255a), 255, 'a'));
+    WTQ_TEST_CHECK(make_origin_len(o255b, sizeof(o255b), 255, 'b'));
+    WTQ_TEST_CHECK(make_origin_len(o256, sizeof(o256), 256, 'c'));
+    WTQ_TEST_CHECK(make_origin_len(o320, sizeof(o320), 320, 'd'));
+    WTQ_TEST_CHECK(make_origin_len(o321, sizeof(o321), 321, 'e'));
+
+    {
+        const char *const exact_path[] = { o255a, o255b };
+        const char *const over_path[] = { o255a, o256 };
+        const char *const at_limit[] = { o320 };
+        const char *const over_entry[] = { o321 };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST,
+                                  exact_path, 2),
+                              WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST,
+                                  over_path, 2),
+                              WTQ_ERR_TOO_LARGE);
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST,
+                                  at_limit, 1),
+                              WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST,
+                                  over_entry, 1),
+                              WTQ_ERR_TOO_LARGE);
+
+        /* A complete D02 request carrying the 320-byte implementation
+         * boundary fits the real 512-byte field-section buffer. */
+        run_d02_origin_case(0x0A20, WTQ_ORIGIN_POLICY_ALLOWLIST,
+                            at_limit, 1, o320, 200, fp);
+
+        /* Two exact 512-byte path tables consume the 1024-byte connection
+         * store exactly. A third path exceeds it without replacing the
+         * previously installed table. */
+        rig_t r;
+        rig_up(&r, WTQ_PERSPECTIVE_SERVER, fp);
+        wtq_server_path_cfg_t exact[2] = {
+            { "/a", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_ALLOWLIST,
+              exact_path, 2 },
+            { "/b", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_ALLOWLIST,
+              exact_path, 2 },
+        };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, exact, 2),
+                              WTQ_OK);
+
+        wtq_server_path_cfg_t old = {
+            "/old", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_UNSET, NULL, 0,
+        };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, &old, 1),
+                              WTQ_OK);
+        static const char *const tiny[] = { "https://x" };
+        wtq_server_path_cfg_t over[3] = {
+            { "/a", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_ALLOWLIST,
+              exact_path, 2 },
+            { "/b", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_ALLOWLIST,
+              exact_path, 2 },
+            { "/c", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_ALLOWLIST,
+              tiny, 1 },
+        };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, over, 3),
+                              WTQ_ERR_TOO_LARGE);
+        deliver_peer_settings(&r, fp);
+        uint8_t req[512];
+        size_t qlen = build_request(req, sizeof(req), "/old", OFFER, 2);
+        WTQ_TEST_CHECK(qlen > 0);
+        struct wtq_dstream *ds =
+            feed_request(&r, 0, req, qlen, 11, fp);
+        expect_response_status(ds, 200, fp);
+        rig_down(&r);
+    }
+
+    /* A practical maximum DNS host, with and without its trailing root dot,
+     * is accepted by the shared validator. */
+    {
+        char host[255];
+        size_t off = 0;
+        const size_t labels[] = { 63, 63, 63, 61 };
+        for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+            if (i != 0)
+                host[off++] = '.';
+            memset(host + off, (int)('a' + i), labels[i]);
+            off += labels[i];
+        }
+        host[off] = '\0';
+        WTQ_TEST_CHECK_EQ_SIZE(off, 253);
+        char origin[320];
+        int n = snprintf(origin, sizeof(origin), "https://%s:65535", host);
+        WTQ_TEST_CHECK(n > 0 && (size_t)n < sizeof(origin));
+        const char *const dns[] = { origin };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST, dns, 1),
+                              WTQ_OK);
+        host[off++] = '.';
+        host[off] = '\0';
+        n = snprintf(origin, sizeof(origin), "https://%s:65535", host);
+        WTQ_TEST_CHECK(n > 0 && (size_t)n < sizeof(origin));
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_validate_origin_policy(
+                                  WTQ_ORIGIN_POLICY_ALLOWLIST, dns, 1),
+                              WTQ_OK);
+    }
+
+    /* A D02-capable server cannot inherit the legacy no-policy default.
+     * Rejection is before effect, so the same engine accepts a valid policy
+     * immediately afterwards. */
+    {
+        rig_t r;
+        rig_up_profiles(&r, WTQ_PERSPECTIVE_SERVER,
+                        WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, fp);
+        wtq_server_path_cfg_t path = {
+            "/moq", SUPPORTED, 2, false, WTQ_ORIGIN_POLICY_UNSET, NULL, 0,
+        };
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, &path, 1),
+                              WTQ_ERR_INVALID_ARG);
+        path.origin_policy = WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+        WTQ_TEST_CHECK_EQ_INT(wtq_conn_server_set_paths(r.conn, &path, 1),
+                              WTQ_OK);
+        rig_down(&r);
+    }
+
     *fp += failures;
 }
 
@@ -3589,6 +4302,12 @@ int main(void)
     test_no_mutual_never_decodes(&failures);
 
     test_d02_request_marker_policy(&failures);
+    test_d02_response_marker_policy(&failures);
+    test_d02_second_success_response(&failures);
+    test_d02_selected_snapshot_bounds(&failures);
+    test_d02_outcome_snapshot_is_owned(&failures);
+    test_origin_policy_modes(&failures);
+    test_origin_policy_validation_and_capacity(&failures);
 
     WTQ_TEST_PASS("test_engine_connect");
     return failures;

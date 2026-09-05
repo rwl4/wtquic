@@ -537,7 +537,7 @@ wtq_connect_status_t wtq_connect_encode_request_d02(
         protocol_token = WTQ_CONNECT_PROTOCOL_TOKEN;
         protocol_token_len = sizeof(WTQ_CONNECT_PROTOCOL_TOKEN) - 1;
     }
-    if (!value_is_valid(protocol_token, protocol_token_len))
+    if (!value_is_token(protocol_token, protocol_token_len))
         return WTQ_CONNECT_MALFORMED;
     /* never generate what the decoder would reject */
     if (!value_is_valid(authority, authority_len) ||

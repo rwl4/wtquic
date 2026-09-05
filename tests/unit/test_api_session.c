@@ -473,6 +473,196 @@ static void test_connect_profile_abi(int *fp)
     *fp += failures;
 }
 
+/* Frozen public v1 layout, defined independently of the implementation. */
+typedef struct test_serve_cfg_v1 {
+    uint32_t struct_size;
+    const char *path;
+    const char *const *subprotocols;
+    size_t subprotocol_count;
+    bool require_subprotocol;
+} test_serve_cfg_v1_t;
+
+static void test_serve_origin_policy_abi(int *fp)
+{
+    int failures = 0;
+    const size_t v1sz = sizeof(test_serve_cfg_v1_t);
+    const size_t cur = sizeof(wtq_serve_config_t);
+    const size_t poff = offsetof(wtq_serve_config_t, origin_policy);
+    const size_t psz = sizeof(((wtq_serve_config_t *)0)->origin_policy);
+    const size_t aoff = offsetof(wtq_serve_config_t, allowed_origins);
+    const size_t asz = sizeof(((wtq_serve_config_t *)0)->allowed_origins);
+    const size_t coff = offsetof(wtq_serve_config_t, allowed_origin_count);
+    const size_t csz = sizeof(((wtq_serve_config_t *)0)->allowed_origin_count);
+    static const char *const protocols[] = { "moqt-18" };
+    static const char *const origins[] = { "https://example.com" };
+
+    WTQ_TEST_CHECK(poff >= v1sz);
+
+    wtq_serve_config_t cfg;
+    memset(&cfg, 0xA5, sizeof(cfg));
+    wtq_serve_config_init(&cfg);
+    WTQ_TEST_CHECK_EQ_SIZE(cfg.struct_size, sizeof(cfg));
+    WTQ_TEST_CHECK_EQ_INT((int)cfg.origin_policy,
+                          (int)WTQ_ORIGIN_POLICY_UNSET);
+    WTQ_TEST_CHECK(cfg.allowed_origins == NULL);
+    WTQ_TEST_CHECK_EQ_SIZE(cfg.allowed_origin_count, 0);
+
+    /* The bare symbol is frozen to v1 and cannot overwrite an old object. */
+    {
+        typedef void (*bare_init_fn)(wtq_serve_config_t *);
+        bare_init_fn bare = &wtq_serve_config_init;
+        unsigned char *buf = malloc(v1sz + 8);
+        WTQ_TEST_CHECK(buf != NULL);
+        if (buf != NULL) {
+            memset(buf, 0xA5, v1sz + 8);
+            bare((wtq_serve_config_t *)(void *)buf);
+            uint32_t ss = 0;
+            memcpy(&ss, buf, sizeof(ss));
+            WTQ_TEST_CHECK_EQ_SIZE(ss, v1sz);
+            for (size_t i = 0; i < 8; i++)
+                WTQ_TEST_CHECK(buf[v1sz + i] == 0xA5);
+            free(buf);
+        }
+    }
+
+    /* The sized path clamps to known fields and leaves a future tail alone. */
+    {
+        unsigned char *buf = malloc(cur + 16);
+        WTQ_TEST_CHECK(buf != NULL);
+        if (buf != NULL) {
+            memset(buf, 0xA5, cur + 16);
+            wtq_serve_config_init_ex((wtq_serve_config_t *)(void *)buf,
+                                     cur + 16);
+            uint32_t ss = 0;
+            memcpy(&ss, buf, sizeof(ss));
+            WTQ_TEST_CHECK_EQ_SIZE(ss, cur);
+            for (size_t i = cur; i < cur + 16; i++)
+                WTQ_TEST_CHECK(buf[i] == 0xA5);
+            free(buf);
+        }
+    }
+    wtq_serve_config_init(NULL);
+    wtq_serve_config_init_ex(NULL, 999);
+
+    rig_t r;
+    rig_up(&r, WTQ_PERSPECTIVE_SERVER, fp);
+    if (r.s != NULL) {
+        wtq_serve_config_t tmpl = WTQ_SERVE_CONFIG_INIT;
+        tmpl.path = "/app";
+        tmpl.subprotocols = protocols;
+        tmpl.subprotocol_count = 1;
+        tmpl.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+        tmpl.allowed_origins = origins;
+        tmpl.allowed_origin_count = 1;
+
+        /* The frozen bare entry point must walk an exact old-layout array
+         * with the old element stride. A one-element fixture cannot expose
+         * this ABI requirement. */
+        {
+            test_serve_cfg_v1_t *old = malloc(2 * v1sz);
+            WTQ_TEST_CHECK(old != NULL);
+            if (old != NULL) {
+                memset(old, 0, 2 * v1sz);
+                old[0].struct_size = (uint32_t)v1sz;
+                old[0].path = "/old-a";
+                old[0].subprotocols = protocols;
+                old[0].subprotocol_count = 1;
+                old[1].struct_size = (uint32_t)v1sz;
+                old[1].path = "/old-b";
+                old[1].subprotocols = protocols;
+                old[1].subprotocol_count = 1;
+                wtq_result_t (*bare_serve)(
+                    wtq_session_t *, const wtq_serve_config_t *, size_t) =
+                    &wtq_api_session_serve;
+                WTQ_TEST_CHECK_EQ_INT(
+                    bare_serve(r.s,
+                               (const wtq_serve_config_t *)(const void *)old,
+                               2),
+                    WTQ_OK);
+                free(old);
+            }
+        }
+
+        /* Current source supplies the current stride. A declared element
+         * larger than that stride is rejected before replacing the table. */
+        {
+            wtq_serve_config_t current[2] = { tmpl, tmpl };
+            current[0].path = "/new-a";
+            current[1].path = "/new-b";
+            WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(r.s, current, 2),
+                                  WTQ_OK);
+            current[1].struct_size = (uint32_t)(sizeof(current[1]) + 1);
+            WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve_ex(
+                                      r.s, current, 2, sizeof(current[0])),
+                                  WTQ_ERR_INVALID_ARG);
+        }
+
+        /* A straddled policy is wholly absent and defaults to UNSET. */
+        for (size_t n = 1; n < psz; n++) {
+            const size_t bytes = poff + n;
+            unsigned char *obj = malloc(bytes);
+            WTQ_TEST_CHECK(obj != NULL);
+            if (obj == NULL)
+                continue;
+            memcpy(obj, &tmpl, bytes);
+            const uint32_t declared = (uint32_t)bytes;
+            memcpy(obj, &declared, sizeof(declared));
+            WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(
+                                      r.s,
+                                      (const wtq_serve_config_t *)(void *)obj,
+                                      1),
+                                  WTQ_OK);
+            free(obj);
+        }
+
+        /* Pointer/count are one atomic block. Every straddled pointer or
+         * count is dropped before the poisoned fragment can be used. Since
+         * the complete policy says ALLOWLIST, the now-absent pair is an
+         * INVALID_ARG rather than a partial dereference. */
+        for (size_t n = 1; n < asz; n++) {
+            const size_t bytes = aoff + n;
+            unsigned char *obj = malloc(bytes);
+            WTQ_TEST_CHECK(obj != NULL);
+            if (obj == NULL)
+                continue;
+            memcpy(obj, &tmpl, bytes);
+            const uint32_t declared = (uint32_t)bytes;
+            memcpy(obj, &declared, sizeof(declared));
+            WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(
+                                      r.s,
+                                      (const wtq_serve_config_t *)(void *)obj,
+                                      1),
+                                  WTQ_ERR_INVALID_ARG);
+            free(obj);
+        }
+        for (size_t n = 1; n < csz; n++) {
+            const size_t bytes = coff + n;
+            unsigned char *obj = malloc(bytes);
+            WTQ_TEST_CHECK(obj != NULL);
+            if (obj == NULL)
+                continue;
+            memcpy(obj, &tmpl, bytes);
+            const uint32_t declared = (uint32_t)bytes;
+            memcpy(obj, &declared, sizeof(declared));
+            WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(
+                                      r.s,
+                                      (const wtq_serve_config_t *)(void *)obj,
+                                      1),
+                                  WTQ_ERR_INVALID_ARG);
+            free(obj);
+        }
+
+        WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(r.s, &tmpl, 1), WTQ_OK);
+        tmpl.origin_policy = 99;
+        WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(r.s, &tmpl, 1),
+                              WTQ_ERR_INVALID_ARG);
+        tmpl.origin_policy = WTQ_ORIGIN_POLICY_ALLOWLIST;
+        WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(r.s, &tmpl, 1), WTQ_OK);
+    }
+    rig_down(&r, fp);
+    *fp += failures;
+}
+
 /* A SHORTER (older-ABI) events struct works: trailing callbacks read
  * as absent, prefix callbacks still fire. */
 static void test_events_struct_size_compat(int *fp)
@@ -1290,6 +1480,7 @@ int main(void)
 
     test_config_init(&failures);
     test_connect_profile_abi(&failures);
+    test_serve_origin_policy_abi(&failures);
     test_events_struct_size_compat(&failures);
     test_events_partial_callback_zeroed(&failures);
     test_events_exact_size_heap(&failures);

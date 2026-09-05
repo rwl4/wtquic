@@ -114,11 +114,11 @@ static void test_default_roundtrip(int *fp)
      * selection (draft-16 s7.1 and draft-02 s6 both say so). The D07
      * codepoint 0xc671706a and the legacy datagram codepoint 0xffd277
      * still never appear. */
-    wtq_h3_settings_encode_cfg_t both = { true, WTQ_H3_WT_PROFILES_ALL };
-    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&both, buf, sizeof(buf),
+    wtq_h3_settings_encode_cfg_t all = { true, WTQ_H3_WT_PROFILES_ALL };
+    WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&all, buf, sizeof(buf),
                                                   &out_len) ==
                    WTQ_H3_SETTINGS_OK);
-    const uint8_t both_expect[] = {
+    const uint8_t all_expect[] = {
         0x01, 0x00,
         0x07, 0x00,
         0x08, 0x01,
@@ -127,12 +127,12 @@ static void test_default_roundtrip(int *fp)
         0xab, 0x60, 0x37, 0x42, 0x01, /* ENABLE_WEBTRANSPORT 0x2b603742 = 1 */
         0xac, 0x7c, 0xf0, 0x00, 0x01, /* WT_ENABLED          0x2c7cf000 = 1 */
     };
-    WTQ_TEST_CHECK_EQ_SIZE(out_len, sizeof(both_expect));
-    WTQ_TEST_CHECK(memcmp(buf, both_expect, out_len) == 0);
-    /* the union is the single-profile base plus BOTH signals: the shared
+    WTQ_TEST_CHECK_EQ_SIZE(out_len, sizeof(all_expect));
+    WTQ_TEST_CHECK(memcmp(buf, all_expect, out_len) == 0);
+    /* The union is the single-profile base plus all three signals. The shared
      * 8-byte prefix is byte-identical to each single-profile payload */
-    WTQ_TEST_CHECK(memcmp(both_expect, cur_expect, 8) == 0);
-    WTQ_TEST_CHECK(memcmp(both_expect, compat_expect, 8) == 0);
+    WTQ_TEST_CHECK(memcmp(all_expect, cur_expect, 8) == 0);
+    WTQ_TEST_CHECK(memcmp(all_expect, compat_expect, 8) == 0);
     WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, out_len, &s) ==
                    WTQ_H3_SETTINGS_OK);
     WTQ_TEST_CHECK(s.has_wt_enabled && s.wt_enabled == 1);
@@ -215,22 +215,39 @@ static void test_select_profile(int *fp)
           true, WTQ_H3_WT_PROFILE_CURRENT },
         { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
           true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
+        { WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          true, WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT },
         /* single vs single: cross-profile has NO intersection */
         { WTQ_H3_WT_PROFILES_CURRENT, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
           false, 0 },
         { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_CURRENT,
           false, 0 },
-        /* we offer both, peer offers one: the peer decides */
+        { WTQ_H3_WT_PROFILES_CURRENT,
+          WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, false, 0 },
+        { WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          WTQ_H3_WT_PROFILES_CURRENT, false, 0 },
+        { WTQ_H3_WT_PROFILES_D13_14_COMPAT,
+          WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT, false, 0 },
+        { WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          WTQ_H3_WT_PROFILES_D13_14_COMPAT, false, 0 },
+        /* we offer all profiles, peer offers one: the peer decides */
         { WTQ_H3_WT_PROFILES_CURRENT, WTQ_H3_WT_PROFILES_ALL,
           true, WTQ_H3_WT_PROFILE_CURRENT },
         { WTQ_H3_WT_PROFILES_D13_14_COMPAT, WTQ_H3_WT_PROFILES_ALL,
           true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
-        /* peer offers both, we offer one: we decide */
+        { WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          WTQ_H3_WT_PROFILES_ALL,
+          true, WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT },
+        /* peer offers all profiles, we offer one: we decide */
         { WTQ_H3_WT_PROFILES_ALL, WTQ_H3_WT_PROFILES_CURRENT,
           true, WTQ_H3_WT_PROFILE_CURRENT },
         { WTQ_H3_WT_PROFILES_ALL, WTQ_H3_WT_PROFILES_D13_14_COMPAT,
           true, WTQ_H3_WT_PROFILE_D13_14_COMPAT },
-        /* BOTH offer both: HIGHEST mutual wins — CURRENT. The winner is
+        { WTQ_H3_WT_PROFILES_ALL,
+          WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+          true, WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT },
+        /* Both offer all profiles: HIGHEST mutual wins — CURRENT. The winner is
          * fixed by the explicit newest-first PRECEDENCE TABLE, not by the
          * order the settings appear on the wire and not by any implicit
          * enum-iteration contract (the enum values carry no precedence
@@ -255,7 +272,39 @@ static void test_select_profile(int *fp)
             WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
     }
 
-    /* --- D02/RFC9297 negative selection rows (0014a negative 3) --- */
+    /* Exhaustive nonempty-set intersection: all 7 peer advertisements
+     * crossed with all 7 local sets. This catches omissions when a new
+     * profile is added to one side of the negotiation policy but not the
+     * other. Expected precedence is computed independently from the public
+     * mask constants, not by calling the production profile-bit helper. */
+    for (uint64_t peer_mask = 1; peer_mask <= WTQ_H3_WT_PROFILES_ALL;
+         peer_mask++) {
+        PEER_ADVERTISING(peer_mask);
+        for (uint64_t our_set = 1; our_set <= WTQ_H3_WT_PROFILES_ALL;
+             our_set++) {
+            const uint64_t mutual = peer_mask & our_set;
+            const bool expect = mutual != 0;
+            wtq_h3_wt_profile_t want = WTQ_H3_WT_PROFILE_CURRENT;
+
+            if (mutual & WTQ_H3_WT_PROFILES_CURRENT)
+                want = WTQ_H3_WT_PROFILE_CURRENT;
+            else if (mutual & WTQ_H3_WT_PROFILES_D13_14_COMPAT)
+                want = WTQ_H3_WT_PROFILE_D13_14_COMPAT;
+            else if (mutual & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT)
+                want = WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT;
+
+            sel = (wtq_h3_wt_profile_t)0x7f;
+            const bool got = wtq_h3_settings_select_profile(
+                &peer, true, our_set, &sel);
+            WTQ_TEST_CHECK_EQ_INT((int)got, (int)expect);
+            if (expect)
+                WTQ_TEST_CHECK_EQ_INT((int)sel, (int)want);
+            else
+                WTQ_TEST_CHECK_EQ_INT((int)sel, 0x7f);
+        }
+    }
+
+    /* --- D02/RFC9297 negative selection rows --- */
     {
         /* A peer advertising the D02 signal but NO RFC 9297 0x33 must not
          * select D02: 0xffd277 is never accepted as datagram capability,
@@ -291,7 +340,7 @@ static void test_select_profile(int *fp)
                               (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT);
     }
 
-    /* --- the profile-independent requirements gate every profile --- */
+    /* --- per-profile transport requirements --- */
     /* no ENABLE_CONNECT_PROTOCOL: fine for a server judging a client,
      * fatal for a client judging a server */
     {
@@ -509,6 +558,9 @@ static void test_legacy_receive(int *fp)
 #define SUPP_COMPAT(pp, srv) \
     wtq_h3_settings_peer_supports_wt((pp), (srv), \
                                      WTQ_H3_WT_PROFILE_D13_14_COMPAT)
+#define SUPP_D02(pp, srv) \
+    wtq_h3_settings_peer_supports_wt( \
+        (pp), (srv), WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT)
 
 static void test_supports_wt(int *fp)
 {
@@ -559,20 +611,43 @@ static void test_supports_wt(int *fp)
     WTQ_TEST_CHECK(!SUPP_CUR(&compat, true));
     compat.wt_max_sessions_d13 = 0; /* present but zero */
     WTQ_TEST_CHECK(!SUPP_COMPAT(&compat, true));
-    /* the Chrome/D07 legacy signals do NOT satisfy EITHER profile now:
-     * only WT_MAX_SESSIONS 0x14e9cd29 counts for compat. */
+    /* D07 contributes no support. With D13 zero, the exact
+     * ENABLE_WEBTRANSPORT + RFC 9297 H3_DATAGRAM pair selects D02. */
     compat.has_enable_webtransport_leg = true;
     compat.enable_webtransport_leg = 1;
     compat.has_wt_max_sessions_d07 = true;
     compat.wt_max_sessions_d07 = 1;
     WTQ_TEST_CHECK(!SUPP_COMPAT(&compat, true));
     WTQ_TEST_CHECK(!SUPP_CUR(&compat, true));
+    WTQ_TEST_CHECK(SUPP_D02(&compat, true));
+    /* Removing the D02 signal leaves D07 alone, which matches nothing. */
+    compat.has_enable_webtransport_leg = false;
+    WTQ_TEST_CHECK(!SUPP_D02(&compat, true));
+
+    /* D02/RFC9297: exact enable value 1 plus RFC 9297 H3_DATAGRAM=1.
+     * Unlike CURRENT and D13/14, peer servers need not send a separate
+     * ENABLE_CONNECT_PROTOCOL because draft-02 makes it implicit. */
+    wtq_h3_settings_t d02 = { 0 };
+    d02.has_enable_webtransport_leg = true;
+    d02.enable_webtransport_leg = 1;
+    d02.has_h3_datagram = true;
+    d02.h3_datagram = 1;
+    WTQ_TEST_CHECK(SUPP_D02(&d02, true));
+    WTQ_TEST_CHECK(SUPP_D02(&d02, false));
+    WTQ_TEST_CHECK(!SUPP_CUR(&d02, true));
+    WTQ_TEST_CHECK(!SUPP_COMPAT(&d02, true));
+    d02.enable_webtransport_leg = 0;
+    WTQ_TEST_CHECK(!SUPP_D02(&d02, true));
+    d02.enable_webtransport_leg = 1;
+    d02.h3_datagram = 0;
+    WTQ_TEST_CHECK(!SUPP_D02(&d02, true));
 
     /* nothing set */
     wtq_h3_settings_t empty = { 0 };
     WTQ_TEST_CHECK(!SUPP_CUR(&empty, true));
     WTQ_TEST_CHECK(!SUPP_CUR(&empty, false));
     WTQ_TEST_CHECK(!SUPP_COMPAT(&empty, true));
+    WTQ_TEST_CHECK(!SUPP_D02(&empty, true));
 
     *fp += failures;
 }
@@ -723,8 +798,8 @@ static void test_boolean_settings(int *fp)
                        WTQ_H3_SETTINGS_ERR_SETTING);
     }
 
-    /* NOT boolean: unknown ids, WT_ENABLED and legacy max-sessions keep
-     * arbitrary values */
+    /* Unknown ids and legacy max-sessions keep arbitrary values;
+     * WT_ENABLED remains a strict boolean. */
     {
         wtq_h3_settings_t s;
         /* unknown id 0x1f with a huge value */
@@ -756,6 +831,128 @@ static void test_boolean_settings(int *fp)
     *fp += failures;
 }
 
+
+/*
+ * All eight profile-set shapes (masks 0..7), parsed by an INDEPENDENT
+ * varint reader — not the production decoder and not the production
+ * selector.
+ */
+static bool hs_varint(const uint8_t *p, size_t len, size_t *off,
+                      uint64_t *out)
+{
+    if (*off >= len)
+        return false;
+    const uint8_t b = p[*off];
+    const unsigned n = 1u << (b >> 6);
+    if (*off + n > len)
+        return false;
+    uint64_t v = b & 0x3f;
+    for (unsigned i = 1; i < n; i++)
+        v = (v << 8) | p[*off + i];
+    *off += n;
+    *out = v;
+    return true;
+}
+
+struct hs_scan {
+    bool ok;
+    unsigned n_cur, n_d13, n_d02, n_d07, n_legacy_dgram, n_dgram;
+    uint64_t v_cur, v_d13, v_d02, v_dgram;
+    bool ascending;
+};
+
+static struct hs_scan hs_scan_payload(const uint8_t *p, size_t len)
+{
+    struct hs_scan s;
+    memset(&s, 0, sizeof(s));
+    s.ascending = true;
+    uint64_t prev = 0;
+    bool first = true;
+    size_t off = 0;
+    while (off < len) {
+        uint64_t id, val;
+        if (!hs_varint(p, len, &off, &id) ||
+            !hs_varint(p, len, &off, &val))
+            return s;                      /* s.ok stays false */
+        if (!first && id < prev)
+            s.ascending = false;
+        prev = id;
+        first = false;
+        switch (id) {
+        case 0x2c7cf000: s.n_cur++;          s.v_cur = val;   break;
+        case 0x14e9cd29: s.n_d13++;          s.v_d13 = val;   break;
+        case 0x2b603742: s.n_d02++;          s.v_d02 = val;   break;
+        case 0xc671706a: s.n_d07++;                            break;
+        case 0xffd277:   s.n_legacy_dgram++;                   break;
+        case 0x33:       s.n_dgram++;        s.v_dgram = val; break;
+        default: break;
+        }
+    }
+    s.ok = true;
+    return s;
+}
+
+static void test_all_eight_profile_set_shapes(int *fp)
+{
+    int failures = 0;
+    uint8_t buf[128];
+    size_t n = 0;
+
+    for (uint64_t mask = 0; mask <= 7; mask++) {
+        const bool want_cur = (mask & WTQ_H3_WT_PROFILES_CURRENT) != 0;
+        const bool want_d13 =
+            (mask & WTQ_H3_WT_PROFILES_D13_14_COMPAT) != 0;
+        const bool want_d02 =
+            (mask & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) != 0;
+        /* mask 0 normalises to CURRENT: the codec is total. */
+        const bool emit_cur = (mask == 0) ? true : want_cur;
+        const bool emit_d13 = (mask == 0) ? false : want_d13;
+        const bool emit_d02 = (mask == 0) ? false : want_d02;
+
+        wtq_h3_settings_encode_cfg_t cfg = { true, mask };
+        WTQ_TEST_CHECK(wtq_h3_settings_encode_payload(&cfg, buf, sizeof(buf),
+                                                      &n) ==
+                       WTQ_H3_SETTINGS_OK);
+        struct hs_scan s = hs_scan_payload(buf, n);
+        WTQ_TEST_CHECK(s.ok);
+        /* membership and cardinality: each signal at most once */
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_cur, emit_cur ? 1 : 0);
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_d13, emit_d13 ? 1 : 0);
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_d02, emit_d02 ? 1 : 0);
+        if (emit_cur) WTQ_TEST_CHECK_EQ_U64(s.v_cur, 1);
+        if (emit_d13) WTQ_TEST_CHECK_EQ_U64(s.v_d13, 1);
+        if (emit_d02) WTQ_TEST_CHECK_EQ_U64(s.v_d02, 1);
+        /* ascending setting-id order */
+        WTQ_TEST_CHECK(s.ascending);
+        /* local RFC 9297 datagram always present at 1 */
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_dgram, 1);
+        WTQ_TEST_CHECK_EQ_U64(s.v_dgram, 1);
+        /* D07 and the legacy datagram codepoint are NEVER emitted */
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_d07, 0);
+        WTQ_TEST_CHECK_EQ_INT((int)s.n_legacy_dgram, 0);
+
+        /* production decode round-trips the emitted shape */
+        wtq_h3_settings_t back;
+        WTQ_TEST_CHECK(wtq_h3_settings_decode(buf, n, &back) ==
+                       WTQ_H3_SETTINGS_OK);
+        WTQ_TEST_CHECK(back.has_wt_enabled == emit_cur);
+        WTQ_TEST_CHECK(back.has_wt_max_sessions_d13 == emit_d13);
+        WTQ_TEST_CHECK(back.has_enable_webtransport_leg == emit_d02);
+
+        /* precedence CURRENT > D13/14 > D02 for this shape */
+        wtq_h3_wt_profile_t sel = (wtq_h3_wt_profile_t)0x7f;
+        const uint64_t use = (mask == 0) ? WTQ_H3_WT_PROFILES_CURRENT : mask;
+        WTQ_TEST_CHECK(wtq_h3_settings_select_profile(&back, false, use,
+                                                      &sel));
+        const int want_sel =
+            emit_cur ? (int)WTQ_H3_WT_PROFILE_CURRENT
+                     : (emit_d13 ? (int)WTQ_H3_WT_PROFILE_D13_14_COMPAT
+                                 : (int)WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT);
+        WTQ_TEST_CHECK_EQ_INT((int)sel, want_sel);
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -773,6 +970,9 @@ int main(void)
     test_truncation(&failures);
     test_nonminimal(&failures);
     test_encode_bounds(&failures);
+
+    test_all_eight_profile_set_shapes(&failures);
+
 
     WTQ_TEST_PASS("test_h3_settings");
     return failures;

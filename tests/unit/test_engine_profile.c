@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <wtquic/session.h>
+
 #include "wt_driver.h"
 
 #include "proto/h3_settings.h"
@@ -45,7 +47,7 @@ static int run_pair(uint64_t seed, int c_prof, int s_prof, wtq_simpair_t *sp)
     int failures = 0;
 
     WTQ_TEST_CHECK(wtq_simpair_create_profiles(sp, seed, c_prof, s_prof) == 0);
-    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(sp, &path, 1) == WTQ_OK);
     /* The client re-states its requested profile here; it must match the
      * profile it was configured with so the CONNECT token matches its
@@ -69,7 +71,7 @@ static int run_multi(uint64_t seed, wtq_h3_wt_profile_set_t server_set,
 
     WTQ_TEST_CHECK(wtq_simpair_create_profile_set(sp, seed, c_prof,
                                                   server_set) == 0);
-    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true, 0, NULL, 0 };
     WTQ_TEST_CHECK(wtq_simpair_server_paths(sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", NULL, PROF_OFFER, 2, true, c_prof,
@@ -316,10 +318,18 @@ static void test_mismatched_profiles_reject(int *fp)
 }
 
 
-/* ---- D02/RFC9297 client symmetry (task 0014c phase 1) --------------- */
+/* ---- D02/RFC9297 client symmetry ------------------------------------ */
 
 #define D02 WTQ_H3_WT_PROFILE_D02_RFC9297_COMPAT
-static const char *const D02_ORIGIN = "https://example.com:443";
+#define D02_ORIGIN "https://example.com:443"
+
+static void configure_d02_origin_policy(
+    wtq_server_path_cfg_t *path, wtq_h3_wt_profile_set_t server_set)
+{
+    if ((server_set & WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) == 0)
+        return;
+    path->origin_policy = WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+}
 
 /* A D02 pairing needs an Origin (draft-02 s3.3), so it gets its own runner. */
 static int run_pair_d02(uint64_t seed, int c_prof,
@@ -329,7 +339,8 @@ static int run_pair_d02(uint64_t seed, int c_prof,
     int failures = 0;
     WTQ_TEST_CHECK(wtq_simpair_create_profile_set(sp, seed, c_prof,
                                                   server_set) == 0);
-    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true };
+    wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true, 0, NULL, 0 };
+    configure_d02_origin_policy(&path, server_set);
     WTQ_TEST_CHECK(wtq_simpair_server_paths(sp, &path, 1) == WTQ_OK);
     wtq_client_connect_cfg_t ccfg = {
         "example.com", "/moq", origin, PROF_OFFER, 2, true, c_prof,
@@ -416,19 +427,21 @@ static void test_d02_client_origin_preflight_zero_effect(int *fp)
 {
     int failures = 0;
     const char *bad[] = {
-        NULL, "", "example.com:443", "https://example.com",
+        NULL, "", "example.com:443",
         "https://example.com:0", "https://example.com:65536",
         "https://example.com:44a", "https://user@example.com:443",
         "https://example.com:443/p", "https://example.com:443?q",
-        "https://example.com:443#f", "https://a.com:1,https://b.com:2",
-        "https://exa mple.com:443", "null",
+        "https://example.com:443#f", "https://a.com:1 https://b.com:2",
+        "https://exa mple.com:443",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         wtq_simpair_t sp;
         WTQ_TEST_CHECK(wtq_simpair_create_profile_set(
             &sp, 0xD02D + i, D02,
             WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) == 0);
-        wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true };
+        wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true, 0, NULL, 0 };
+        configure_d02_origin_policy(
+            &path, WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT);
         WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
         wtq_client_connect_cfg_t ccfg = {
             "example.com", "/moq", bad[i], PROF_OFFER, 2, true, D02,
@@ -460,7 +473,7 @@ static void test_d02_client_origin_preflight_zero_effect(int *fp)
         WTQ_TEST_CHECK(wtq_simpair_create_profile_set(
             &sp, 0xD02CC, (int)WTQ_H3_WT_PROFILE_CURRENT,
             WTQ_H3_WT_PROFILES_CURRENT) == 0);
-        wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true };
+        wtq_server_path_cfg_t path = { "/moq", PROF_SUPPORTED, 2, true, 0, NULL, 0 };
         WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
         wtq_client_connect_cfg_t d02req = {
             "example.com", "/moq", D02_ORIGIN, PROF_OFFER, 2, true, D02,
@@ -488,6 +501,85 @@ static void test_d02_client_origin_preflight_zero_effect(int *fp)
     *fp += failures;
 }
 
+static bool make_d02_origin_len(char *dst, size_t cap, size_t total)
+{
+    static const char prefix[] = "https://";
+
+    if (total <= sizeof(prefix) - 1 || cap <= total)
+        return false;
+    memcpy(dst, prefix, sizeof(prefix) - 1);
+    memset(dst + sizeof(prefix) - 1, 'a', total - (sizeof(prefix) - 1));
+    dst[total] = '\0';
+    return true;
+}
+
+static void test_d02_client_origin_valid_forms_and_limit(int *fp)
+{
+    int failures = 0;
+    static const char *const valid[] = {
+        "https://example.com",
+        "https://[2001:db8::1]",
+        "https://[2001:db8::1]:8443",
+        "null",
+    };
+
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        wtq_simpair_t sp;
+        failures += run_pair_d02(0xD030 + i, D02,
+                                 WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+                                 valid[i], &sp);
+        WTQ_TEST_CHECK_EQ_INT(sp.c.established_events, 1);
+        WTQ_TEST_CHECK_EQ_INT(sp.s.established_events, 1);
+        wtq_simpair_destroy(&sp);
+    }
+
+    char max_origin[WTQ_CONN_ORIGIN_MAX_BYTES + 1];
+    WTQ_TEST_CHECK(make_d02_origin_len(max_origin, sizeof(max_origin),
+                                       WTQ_CONN_ORIGIN_MAX_BYTES));
+    {
+        wtq_simpair_t sp;
+        failures += run_pair_d02(0xD034, D02,
+                                 WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT,
+                                 max_origin, &sp);
+        WTQ_TEST_CHECK_EQ_INT(sp.c.established_events, 1);
+        WTQ_TEST_CHECK_EQ_INT(sp.s.established_events, 1);
+        wtq_simpair_destroy(&sp);
+    }
+
+    /* The next byte fails before opening a stream, and does not poison a
+     * valid retry on the same D02-configured engine. */
+    {
+        char too_long[WTQ_CONN_ORIGIN_MAX_BYTES + 2];
+        wtq_simpair_t sp;
+        WTQ_TEST_CHECK(make_d02_origin_len(too_long, sizeof(too_long),
+                                           WTQ_CONN_ORIGIN_MAX_BYTES + 1));
+        WTQ_TEST_CHECK(wtq_simpair_create_profile_set(
+            &sp, 0xD035, D02,
+            WTQ_H3_WT_PROFILES_D02_RFC9297_COMPAT) == 0);
+        wtq_server_path_cfg_t path = {
+            "/moq", PROF_SUPPORTED, 2, true,
+            WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE, NULL, 0,
+        };
+        WTQ_TEST_CHECK(wtq_simpair_server_paths(&sp, &path, 1) == WTQ_OK);
+        wtq_client_connect_cfg_t bad = {
+            "example.com", "/moq", too_long, PROF_OFFER, 2, true, D02,
+        };
+        const int opens_before = sp.c.drv.open_calls;
+        WTQ_TEST_CHECK(wtq_simpair_client_connect(&sp, &bad) ==
+                       WTQ_ERR_TOO_LARGE);
+        WTQ_TEST_CHECK_EQ_INT(sp.c.drv.open_calls, opens_before);
+        wtq_client_connect_cfg_t good = {
+            "example.com", "/moq", D02_ORIGIN, PROF_OFFER, 2, true, D02,
+        };
+        WTQ_TEST_CHECK(wtq_simpair_client_connect(&sp, &good) == WTQ_OK);
+        (void)wtq_simpair_run_until_quiescent(&sp, 64);
+        WTQ_TEST_CHECK_EQ_INT(sp.c.established_events, 1);
+        WTQ_TEST_CHECK_EQ_INT(sp.s.established_events, 1);
+        wtq_simpair_destroy(&sp);
+    }
+    *fp += failures;
+}
+
 /* Axis 6 both directions of the cap, on the SAME stream, mutation-free. */
 /* The newest local stream the fake driver has, i.e. the one just opened. */
 static struct wtq_dstream *newest_local(struct wtq_driver *drv)
@@ -503,7 +595,7 @@ static struct wtq_dstream *newest_local(struct wtq_driver *drv)
 }
 
 /*
- * Axis 6, proved CAUSALLY against the backend (0014e finding E). A
+ * Outbound error-range policy, proved causally against the backend. A
  * return code alone is not evidence: a rejected code must make NO backend
  * call and leave the halves untouched, and an accepted one must make
  * exactly one call with the exact halves and the exact mapped wire code.
@@ -550,6 +642,9 @@ static void test_d02_outbound_cap_mutation_free(int *fp)
         WTQ_TEST_CHECK(wtq_conn_wt_stop(sp.c.conn, es, 256) ==
                        WTQ_ERR_INVALID_ARG);
         WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
+        WTQ_TEST_CHECK(wtq_conn_wt_stop(sp.c.conn, es, UINT32_MAX) ==
+                       WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
         WTQ_TEST_CHECK(wtq_conn_wt_stop(sp.c.conn, es, 255) == WTQ_OK);
         WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before + 1);
         WTQ_TEST_CHECK_EQ_INT((int)ds->last_shutdown.mode,
@@ -567,6 +662,9 @@ static void test_d02_outbound_cap_mutation_free(int *fp)
         WTQ_TEST_CHECK(ds != NULL);
         const int before = ds->shutdown_count;
         WTQ_TEST_CHECK(wtq_conn_wt_abort(sp.c.conn, es, 256) ==
+                       WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
+        WTQ_TEST_CHECK(wtq_conn_wt_abort(sp.c.conn, es, UINT32_MAX) ==
                        WTQ_ERR_INVALID_ARG);
         WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, before);
         WTQ_TEST_CHECK(wtq_conn_wt_abort(sp.c.conn, es, 255) == WTQ_OK);
@@ -642,7 +740,7 @@ static void test_d02_outbound_cap_mutation_free(int *fp)
 }
 
 /*
- * CAUSAL zero-effect discriminator (0014d finding 4). A failed D02 preflight
+ * Causal zero-effect discriminator. A failed D02 preflight
  * on an UNSTARTED default engine must leave the profile untouched, proved by
  * the SETTINGS the engine then emits — not by a later call's return code.
  * The earlier version of this test ran on an engine already created AND
@@ -654,7 +752,7 @@ static void test_d02_failed_preflight_leaves_settings_current(int *fp)
     int failures = 0;
     const char *const bad_origins[] = {
         "not-an-origin",            /* malformed: no scheme */
-        "https://example.com",      /* malformed: no port */
+        "https://example.com/path", /* malformed: path present */
     };
     for (size_t i = 0; i < sizeof(bad_origins) / sizeof(bad_origins[0]); i++) {
         struct wtq_driver drv;
@@ -733,6 +831,7 @@ int main(void)
     test_d02_selected_from_union(&failures);
     test_d02_cross_profile_mismatches(&failures);
     test_d02_client_origin_preflight_zero_effect(&failures);
+    test_d02_client_origin_valid_forms_and_limit(&failures);
     test_d02_outbound_cap_mutation_free(&failures);
     test_d02_failed_preflight_leaves_settings_current(&failures);
     test_multi_server_union_and_latch(&failures);
