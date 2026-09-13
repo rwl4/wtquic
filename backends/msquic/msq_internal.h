@@ -67,6 +67,64 @@ extern "C" {
  * it lives in api/api_internal.h, included above. */
 
 /*
+ * MsQuic registers callbacks through a void * slot, so the handler has to
+ * reach it without a direct function-to-object pointer conversion, which ISO
+ * C forbids. Each helper stores its typed handler in a union and reads the
+ * object member back: that read is a target-dependent reinterpretation of the
+ * representation, not portable semantics guaranteed by the standard.
+ *
+ * It is valid for the MsQuic ABIs this backend supports because the void *
+ * passed to SetCallbackHandler is the storage slot the API later dispatches
+ * as that same handler, so the handler representation must fit that slot and
+ * round-trip through it. The size assertions below pin that fit, turning an
+ * unsupported representation into a compile error rather than a silent
+ * truncation.
+ *
+ * The parameter types keep each conversion call checked: passing a stream
+ * handler to the connection helper, or the reverse, does not compile. The
+ * void * registration boundary itself cannot encode which HQUIC handle kind
+ * the slot belongs to, so it cannot enforce that pairing.
+ */
+static inline void *wtq_msq_conn_cb_ptr(QUIC_CONNECTION_CALLBACK_HANDLER fn)
+{
+    union {
+        QUIC_CONNECTION_CALLBACK_HANDLER fn;
+        void *obj;
+    } u = { .fn = fn };
+
+    return u.obj;
+}
+
+static inline void *wtq_msq_stream_cb_ptr(QUIC_STREAM_CALLBACK_HANDLER fn)
+{
+    union {
+        QUIC_STREAM_CALLBACK_HANDLER fn;
+        void *obj;
+    } u = { .fn = fn };
+
+    return u.obj;
+}
+
+/* Each helper keeps its exact signature, the two handler types stay distinct,
+ * and each handler representation fits the void * slot it is registered in. */
+_Static_assert(_Generic(&wtq_msq_conn_cb_ptr,
+                        void *(*)(QUIC_CONNECTION_CALLBACK_HANDLER): 1,
+                        default: 0),
+               "wtq_msq_conn_cb_ptr takes QUIC_CONNECTION_CALLBACK_HANDLER");
+_Static_assert(_Generic(&wtq_msq_stream_cb_ptr,
+                        void *(*)(QUIC_STREAM_CALLBACK_HANDLER): 1,
+                        default: 0),
+               "wtq_msq_stream_cb_ptr takes QUIC_STREAM_CALLBACK_HANDLER");
+_Static_assert(_Generic((QUIC_CONNECTION_CALLBACK_HANDLER)0,
+                        QUIC_STREAM_CALLBACK_HANDLER: 0,
+                        default: 1),
+               "connection and stream handler types must stay distinct");
+_Static_assert(sizeof(QUIC_CONNECTION_CALLBACK_HANDLER) == sizeof(void *),
+               "connection handler must fit the void * callback slot");
+_Static_assert(sizeof(QUIC_STREAM_CALLBACK_HANDLER) == sizeof(void *),
+               "stream handler must fit the void * callback slot");
+
+/*
  * FROZEN v1 (07570ae) config layouts. These mirror EXACTLY the fields the
  * client/listener configs had before the managed-domain tail was added. The
  * bare *_cfg_init symbols write sizeof(one of these); the connect /

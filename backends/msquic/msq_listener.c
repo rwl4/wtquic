@@ -346,7 +346,8 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
         return QUIC_STATUS_ABORTED;
     }
     l->env->api->SetCallbackHandler(ev->NEW_CONNECTION.Connection,
-                                    (void *)wtq_msq_conn_callback, drv);
+                                    wtq_msq_conn_cb_ptr(
+                                        wtq_msq_conn_callback), drv);
     QUIC_STATUS status = QUIC_STATUS_SUCCESS;
 #ifdef WTQ_MSQ_TESTING
     if (atomic_load(&wtq_msq_test_fail_set_configuration) > 0) {

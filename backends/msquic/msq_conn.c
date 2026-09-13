@@ -805,7 +805,8 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
          * open call (StreamShutdown), which must never happen on a
          * stream with no callback handler set. */
         drv->api->SetCallbackHandler(ev->PEER_STREAM_STARTED.Stream,
-                                     (void *)wtq_msq_stream_callback, ds);
+                                     wtq_msq_stream_cb_ptr(
+                                         wtq_msq_stream_callback), ds);
 
         wtq_conn_t *ec = wtq_api_session_conn(drv->session);
         wtq_estream_t *es = NULL;

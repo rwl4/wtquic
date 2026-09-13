@@ -509,7 +509,7 @@ static int test_peer_stream_started_handler_before_shutdown(void)
         WTQ_TEST_CHECK(g_ord.call[0].is_handler);
         WTQ_TEST_CHECK(g_ord.call[0].stream == peer);
         WTQ_TEST_CHECK(g_ord.call[0].handler ==
-                       (void *)wtq_msq_stream_callback);
+                       wtq_msq_stream_cb_ptr(wtq_msq_stream_callback));
 
         /* the handler context is the backend stream for THIS stream */
         struct wtq_dstream *ds = g_ord.call[0].ctx;
