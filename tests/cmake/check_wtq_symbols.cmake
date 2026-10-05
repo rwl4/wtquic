@@ -26,6 +26,8 @@ set(ALLOWED_SYMBOLS
     wtq_serve_config_init_ex
     wtq_session_add_ref
     wtq_session_release
+    wtq_session_receive_contract
+    wtq_session_service_stream_admission
     wtq_session_close
     wtq_session_drain
     wtq_session_open_uni
@@ -57,6 +59,14 @@ set(ALLOWED_SYMBOLS
     # link against the core across the shared-library boundary. NOT
     # public API — the declaring headers are never installed.
     wtq_api_session_create
+    wtq_api_session_create_accounted
+    wtq_api_session_create_admission
+    wtq_api_session_admission_root
+    wtq_api_session_admission_detach
+    wtq_api_session_admit
+    wtq_conn_peer_admission_init
+    wtq_conn_peer_admission_bytes
+    wtq_conn_peer_admission_forget
     wtq_api_session_start
     wtq_api_session_connect
     wtq_api_session_serve
@@ -68,6 +78,7 @@ set(ALLOWED_SYMBOLS
     wtq_conn_on_peer_uni_opened
     wtq_conn_on_peer_bidi_opened
     wtq_conn_on_stream_bytes
+    wtq_conn_on_stream_bytes_accounted
     wtq_conn_on_stream_reset
     wtq_conn_on_stream_terminal
     wtq_conn_on_stop_sending

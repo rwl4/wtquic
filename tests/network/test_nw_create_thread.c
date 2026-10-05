@@ -50,6 +50,9 @@ struct obs {
     pthread_cond_t cv;
     int established, failed, closed, stopped;
     int after_stopped; /* ANY application event after on_stopped (must stay 0) */
+    wtq_result_t contract_rc;
+    size_t quantum;
+    wtq_receive_pause_mode_t pause_mode;
 };
 static void obs_init(struct obs *o)
 {
@@ -95,7 +98,14 @@ static void obs_app_event(struct obs *o, int *field)
     pthread_mutex_unlock(&o->mu);
 }
 static void ev_established(wtq_session_t *s, wtq_str_t sub, void *user)
-{ (void)s; (void)sub; obs_app_event(user, &((struct obs *)user)->established); }
+{
+    (void)sub;
+    struct obs *o = user;
+    pthread_mutex_lock(&o->mu);
+    o->contract_rc = wtq_session_receive_contract(s, &o->quantum, &o->pause_mode);
+    pthread_mutex_unlock(&o->mu);
+    obs_app_event(o, &o->established);
+}
 static void ev_failed(wtq_session_t *s, wtq_connect_failure_t why, void *user)
 { (void)s; (void)why; obs_app_event(user, &((struct obs *)user)->failed); }
 static void ev_closed(wtq_session_t *s, uint32_t code, const uint8_t *r,
@@ -245,6 +255,11 @@ static int attempt(bool spawned, int *fail_out)
     wtq_result_t jr = wtq_nw_conn_join(c);
     WTQ_TEST_CHECK_EQ_INT((int)jr, (int)WTQ_OK);
     wtq_nw_conn_release(c);
+    if (established) {
+        WTQ_TEST_CHECK_EQ_INT(o.contract_rc, WTQ_ERR_UNSUPPORTED);
+        WTQ_TEST_CHECK(o.quantum == 0);
+        WTQ_TEST_CHECK_EQ_INT(o.pause_mode, WTQ_RECEIVE_PAUSE_UNSUPPORTED);
+    }
     bool gone = wait_root_gone(WAIT_MS);
     WTQ_TEST_CHECK(gone);
     *fail_out += failures;

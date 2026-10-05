@@ -434,6 +434,32 @@ WTQ_API void wtq_serve_config_init_ex(wtq_serve_config_t *cfg,
 WTQ_API void wtq_session_add_ref(wtq_session_t *session);
 WTQ_API void wtq_session_release(wtq_session_t *session);
 
+/* Immutable receive contract of the actual provider, queried in the session's
+ * serialized domain. Requires both outputs; valid outputs are reset to
+ * zero/UNSUPPORTED on failure. NULL arguments return INVALID_ARG. Legacy or
+ * unknown or accounted-only providers return UNSUPPORTED even if they pause.
+ * OK certifies bounded admission as well as 65535-byte callback quantum,
+ * FLOW_CONTROLLED pause and exact bytes/FIN continuation. Initially only
+ * MsQuic with fixed effective peer uni/bidi credit 8/7 qualifies. It reserves
+ * three critical parsers plus one client CONNECT/twelve WT entries, or seven
+ * server requests/six WT entries. Six/twelve count local and peer WT together.
+ * Extra valid WT streams wait without resource-pressure rejection. Native
+ * peer stream credit remains charged through retained terminal handles.
+ * Network.framework remains unqualified (delivery-only stream pause).
+ * No allocation, callbacks or I/O. Facts remain available on a retained terminal
+ * session. The quantum is not a total provider-memory bound. */
+WTQ_API wtq_result_t wtq_session_receive_contract(const wtq_session_t *session,
+    size_t *max_callback_bytes, wtq_receive_pause_mode_t *pause_mode);
+
+/* Service bounded stream admission in the session's serialization domain,
+ * after enclosing application/bridge work has returned. Nested calls defer.
+ * OK means processed or deferred, not that all waiting streams were admitted.
+ * A native resume failure returns BACKEND and retains a retry obligation for
+ * a later safe pass, without repeating stream-opened. Automatic dispatch also
+ * retains that obligation; it does not spin or override an application pause.
+ * NULL is INVALID_ARG, unqualified providers UNSUPPORTED, terminal CLOSED. */
+WTQ_API wtq_result_t wtq_session_service_stream_admission(wtq_session_t *session);
+
 /* --- session lifecycle --------------------------------------------------- */
 
 /*

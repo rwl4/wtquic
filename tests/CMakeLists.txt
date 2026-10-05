@@ -7,6 +7,44 @@
 
 include(CheckLanguage)
 
+add_executable(test_accounted_generation unit/test_accounted_generation.c
+    ../src/types.c $<TARGET_OBJECTS:wtq_proto>)
+target_include_directories(test_accounted_generation PRIVATE
+    ../src ../include ${PROJECT_BINARY_DIR}/include unit)
+target_compile_options(test_accounted_generation PRIVATE ${WTQ_WARN_FLAGS})
+add_test(NAME accounted_generation COMMAND test_accounted_generation)
+
+add_executable(test_admission_capacity unit/test_admission_capacity.c
+    support/fake_driver.c ../src/types.c $<TARGET_OBJECTS:wtq_proto>)
+target_include_directories(test_admission_capacity PRIVATE
+    ../src ../src/engine ../include ${PROJECT_BINARY_DIR}/include unit support)
+target_compile_options(test_admission_capacity PRIVATE ${WTQ_WARN_FLAGS})
+add_test(NAME admission_capacity COMMAND test_admission_capacity)
+
+add_executable(test_admission_requests unit/test_admission_requests.c
+    support/fake_driver.c ../src/types.c $<TARGET_OBJECTS:wtq_proto>)
+target_include_directories(test_admission_requests PRIVATE
+    ../src ../src/engine ../include ${PROJECT_BINARY_DIR}/include unit support)
+target_compile_options(test_admission_requests PRIVATE ${WTQ_WARN_FLAGS})
+add_test(NAME admission_requests COMMAND test_admission_requests)
+
+if(WTQ_BUILD_NETWORK)
+    set_source_files_properties(../backends/network/nw_send_holder.m
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    add_executable(test_nw_receive_accounted
+        network/test_nw_receive_accounted.c
+        ../src/api/session.c ../src/types.c
+        ../backends/network/nw_send_holder.m
+        $<TARGET_OBJECTS:wtq_proto>)
+    target_include_directories(test_nw_receive_accounted PRIVATE
+        ../src ../include ${PROJECT_BINARY_DIR}/include unit)
+    target_compile_options(test_nw_receive_accounted PRIVATE ${WTQ_WARN_FLAGS}
+        -Wno-nullability-extension -Wno-nullability-completeness)
+    target_link_libraries(test_nw_receive_accounted PRIVATE
+        "-framework Network" "-framework Security" "-framework Foundation")
+    add_test(NAME nw_receive_accounted COMMAND test_nw_receive_accounted)
+endif()
+
 function(wtq_add_unit_test name)
     add_executable(test_${name} unit/test_${name}.c)
     target_link_libraries(test_${name} PRIVATE wtq::wtquic)
@@ -126,6 +164,7 @@ wtq_add_engine_test(api_transport_error)
 wtq_add_engine_test(api_stream)
 wtq_add_engine_test(api_pair support/wtq_fault_alloc.c)
 wtq_add_engine_test(api_pause)
+wtq_add_engine_test(receive_contract)
 wtq_add_engine_test(simpair_bootstrap support/wtq_simpair.c)
 wtq_add_engine_test(engine_profile support/wtq_simpair.c)
 
@@ -276,6 +315,36 @@ if(WTQ_MSQUIC_ENABLED)
             QUIC_API_ENABLE_PREVIEW_FEATURES)
     endif()
     add_test(NAME msquic_ops COMMAND test_msquic_ops)
+    add_test(NAME admission_resume_failure COMMAND test_msquic_ops --admission-resume-failure)
+    add_test(NAME admission_fifo COMMAND test_msquic_ops --admission-fifo)
+    add_test(NAME admission_bidi_reset COMMAND test_msquic_ops --admission-bidi-reset)
+    add_executable(test_accounted_link msquic/accounted_link.c)
+    target_include_directories(test_accounted_link PRIVATE ../src)
+    target_compile_options(test_accounted_link PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_accounted_link PRIVATE wtq::msquic)
+    add_test(NAME accounted_link COMMAND test_accounted_link)
+    add_executable(test_admission_link msquic/admission_link.c)
+    target_include_directories(test_admission_link PRIVATE ../src)
+    target_compile_options(test_admission_link PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_admission_link PRIVATE wtq::wtquic)
+    add_test(NAME admission_link COMMAND test_admission_link)
+    add_executable(test_msquic_receive_contract msquic/receive_contract.c)
+    target_compile_options(test_msquic_receive_contract PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_msquic_receive_contract PRIVATE wtq::msquic)
+    add_test(NAME msquic_receive_contract COMMAND test_msquic_receive_contract)
+    add_executable(test_admission_native msquic/admission_native.c)
+    target_include_directories(test_admission_native PRIVATE ../src ../backends/msquic unit)
+    target_compile_options(test_admission_native PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_admission_native PRIVATE wtq::msquic msquic::msquic)
+    add_test(NAME admission_native COMMAND test_admission_native ${CMAKE_CURRENT_BINARY_DIR}/certs)
+    set_tests_properties(admission_native PROPERTIES FIXTURES_REQUIRED certs LABELS "msquic;admission")
+    if(BUILD_SHARED_LIBS AND UNIX)
+        add_executable(test_backend_load msquic/backend_load.c)
+        target_compile_options(test_backend_load PRIVATE ${WTQ_WARN_FLAGS})
+        target_link_libraries(test_backend_load PRIVATE ${CMAKE_DL_LIBS})
+        add_test(NAME msquic_backend_load COMMAND test_backend_load
+            $<TARGET_FILE:wtquic-msquic>)
+    endif()
     set_tests_properties(msquic_ops PROPERTIES LABELS msquic)
 
     # White-box managed-domain contract (guard bracket, quiescence hook,
@@ -539,6 +608,10 @@ if(WTQ_MSQUIC_ENABLED)
                 -Wno-nullability-completeness)
             set_target_properties(wtquic-network-shared PROPERTIES
                 C_VISIBILITY_PRESET hidden)
+            target_link_libraries(test_accounted_link PRIVATE wtquic-network-shared)
+            target_compile_definitions(test_accounted_link PRIVATE WTQ_LINK_NETWORK)
+            add_test(NAME network_backend_load COMMAND test_backend_load
+                $<TARGET_FILE:wtquic-network-shared>)
             add_test(NAME network_symbol_policy
                 COMMAND ${CMAKE_COMMAND}
                     -DDYLIB=$<TARGET_FILE:wtquic-network-shared>

@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * wtq_msquic_env_close contract over real MsQuic on localhost: the
  * close must actively terminate every child connection (borrowed

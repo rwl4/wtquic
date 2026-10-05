@@ -1092,41 +1092,70 @@ static void ds_drop_pending_sends(struct wtq_dstream *ds)
 static void ds_arm_receive(struct wtq_dstream *ds);
 static void ds_stamped_cancel(struct wtq_dstream *ds, uint64_t code);
 
-static void ds_deliver_bytes(struct wtq_dstream *ds, dispatch_data_t content,
-                             bool fin)
+static void ds_drop_deferred(struct wtq_dstream *ds);
+
+static void ds_deliver_bytes(struct wtq_dstream *ds)
 {
     struct wtq_driver *drv = ds->drv;
-
+    if (ds->recv_delivering || !ds->recv_deferred)
+        return;
+    dispatch_data_t content = ds->recv_deferred_data;
+    bool fin = ds->recv_deferred_fin;
     if (drv->session == NULL || ds->ectx == NULL) {
-        if (fin)
-            ds->fin_delivered = true;
+        ds_drop_deferred(ds);
         return;
     }
+    /* Detach/reset may drop the slot during an application callback. The
+     * current dispatch_data_apply borrow needs its own lifetime bracket. */
+    if (content != NULL)
+        dispatch_retain(content);
+    ds->recv_delivering = true;
     wtq_api_session_enter(drv->session);
     wtq_conn_t *ec = wtq_api_session_conn(drv->session);
-    if (content != NULL && dispatch_data_get_size(content) > 0) {
+    wtq_estream_t *key = ds->ectx;
+    __block bool blocked = false;
+    if (content != NULL &&
+        dispatch_data_get_size(content) > ds->recv_deferred_offset) {
         size_t total = dispatch_data_get_size(content);
-        size_t seen = 0;
         dispatch_data_apply(
             content, ^bool(dispatch_data_t region, size_t off,
                            const void *buf, size_t len) {
               (void)region;
-              (void)off;
+              if (!ds->recv_deferred || ds->ectx != key || ds->terminal ||
+                  ds->cancel_issued || ds->cancel_deferred || ds->failed_seen)
+                  return false;
+              if (!ds->recv_enabled) {
+                  blocked = true;
+                  return false;
+              }
+              if (off + len <= ds->recv_deferred_offset)
+                  return true;
+              size_t skip = ds->recv_deferred_offset > off
+                                ? ds->recv_deferred_offset - off : 0;
               bool last = off + len == total;
-              if (ds->ectx != NULL)
-                  (void)wtq_conn_on_stream_bytes(ec, ds->ectx, buf, len,
-                                                 fin && last, nw_now_us());
-              return true;
+              size_t consumed = 0;
+              wtq_result_t rc = wtq_conn_on_stream_bytes_accounted(
+                  ec, key, (const uint8_t *)buf + skip, len - skip,
+                  fin && last, nw_now_us(), &consumed);
+              if (ds->recv_deferred && ds->ectx == key)
+                  ds->recv_deferred_offset = off + skip + consumed;
+              blocked = rc == WTQ_ERR_WOULD_BLOCK;
+              if (last && fin && rc == WTQ_OK)
+                  ds->fin_delivered = true;
+              return rc == WTQ_OK;
             });
-        (void)seen;
-        if (fin)
-            ds->fin_delivered = true;
     } else if (fin && !ds->fin_delivered) {
-        ds->fin_delivered = true;
-        if (ds->ectx != NULL)
-            (void)wtq_conn_on_stream_bytes(ec, ds->ectx, NULL, 0, true,
-                                           nw_now_us());
+        size_t consumed = 0;
+        wtq_result_t rc = wtq_conn_on_stream_bytes_accounted(
+            ec, key, NULL, 0, true, nw_now_us(), &consumed);
+        blocked = rc == WTQ_ERR_WOULD_BLOCK;
+        ds->fin_delivered = rc == WTQ_OK;
     }
+    if (!blocked)
+        ds_drop_deferred(ds);
+    ds->recv_delivering = false;
+    if (content != NULL)
+        dispatch_release(content);
     nw_leave_and_poll(drv);
 }
 
@@ -1140,6 +1169,7 @@ static void ds_drop_deferred(struct wtq_dstream *ds)
         ds->recv_deferred_data = NULL;
     }
     ds->recv_deferred = false;
+    ds->recv_deferred_offset = 0;
     ds->recv_deferred_fin = false;
     ds->recv_deferred_errored = false;
 }
@@ -1176,7 +1206,7 @@ static void ds_receive_completed(struct wtq_dstream *ds,
      * receive on a finished stream. ds_arm_receive re-checks this latch. */
     if (fin || errored)
         ds->recv_ended = true;
-    if (!ds->recv_enabled && (content != NULL || fin)) {
+    if (content != NULL || fin) {
         /* PAUSED: hold this one completion. Network.framework may deliver
          * data received BEFORE an error in the same completion (see
          * connection.h), so a data-bearing errored completion is held too,
@@ -1209,7 +1239,7 @@ static void ds_receive_completed(struct wtq_dstream *ds,
             dispatch_retain(content); /* zero-copy: retain, never copy */
             ds->recv_deferred_data = content;
         }
-        WTQ_NW_TEST(if (wtq_nw_test_defer_hook != NULL)
+        WTQ_NW_TEST(if (!ds->recv_enabled && wtq_nw_test_defer_hook != NULL)
                         wtq_nw_test_defer_hook(ds));
         /* no engine delivery and no re-arm while paused: the app sees
          * nothing until resume. This arrests APPLICATION delivery only —
@@ -1217,10 +1247,11 @@ static void ds_receive_completed(struct wtq_dstream *ds,
          * buffering and ACKing received data past the advertised window,
          * so a paused peer is not flow-control-bounded here (see
          * COMPATIBILITY.md). */
-        return;
+        if (!ds->recv_enabled)
+            return;
     }
     if (content != NULL || fin)
-        ds_deliver_bytes(ds, content, fin);
+        ds_deliver_bytes(ds);
     /* errors surface through the state handler (failed), which owns reset
      * attribution — never double-report here */
     if (!errored && !fin)
@@ -1238,7 +1269,8 @@ static void ds_arm_receive(struct wtq_dstream *ds)
      * / cancel_deferred / failed_seen without necessarily setting `terminal`.
      * Arming after any of these would issue nw_connection_receive on a stream
      * that is finished or being torn down. */
-    if (ds->recv_pending || ds->terminal || ds->conn == NULL ||
+    if (ds->recv_pending || ds->recv_deferred || ds->recv_delivering ||
+        ds->terminal || ds->conn == NULL ||
         !ds->recv_enabled || ds->fin_delivered || ds->recv_ended ||
         ds->cancel_issued || ds->cancel_deferred || ds->failed_seen)
         return;
@@ -1909,14 +1941,18 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
      * directions WITHOUT mutating recv_enabled — recv_ended is latched on
      * the ending completion before any failed-state callback, so this also
      * covers the window after an error-only completion but before
-     * failed_seen. A HELD terminal completion (recv_deferred) stays
-     * pausable/replayable exactly once, so reject only when nothing is
-     * held. */
-    if (ds->recv_ended && !ds->recv_deferred)
+     * failed_seen. Accounted delivery retains its slot across callbacks for
+     * lifetime and partial-suffix ownership, not recursive replay permission.
+     * Pause during delivery must still work (including stream-open); a held
+     * suffix may be resumed after the current delivery returns. */
+    if (ds->recv_ended &&
+        (!ds->recv_deferred || (enabled && ds->recv_delivering)))
         return WTQ_ERR_STATE;
     ds->recv_enabled = enabled;
     if (!enabled)
         return WTQ_OK; /* disabling stops FUTURE arms only */
+    if (ds->recv_delivering)
+        return WTQ_OK;
 
     /*
      * Resume. A completion held while paused is replayed to the engine
@@ -1929,18 +1965,10 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
      * after its terminal (reaping is deferred across queue turns).
      */
     if (ds->recv_deferred) {
-        dispatch_data_t d = ds->recv_deferred_data;
         bool fin = ds->recv_deferred_fin;
         bool errored = ds->recv_deferred_errored;
-
-        ds->recv_deferred = false;
-        ds->recv_deferred_data = NULL;
-        ds->recv_deferred_fin = false;
-        ds->recv_deferred_errored = false;
         if (!ds->terminal && ds->ectx != NULL)
-            ds_deliver_bytes(ds, d, fin);
-        if (d != NULL)
-            dispatch_release(d);
+            ds_deliver_bytes(ds);
         if (errored || fin)
             return WTQ_OK; /* the receive side ended with that completion —
                               deliver its content once, but never re-arm */
@@ -3050,7 +3078,7 @@ static wtq_result_t nw_conn_build(const wtq_alloc_t *alloc,
         .ops = &nw_driver_ops,
     };
     wtq_session_t *session = NULL;
-    wtq_result_t rc = wtq_api_session_create(&scfg, &session);
+    wtq_result_t rc = wtq_api_session_create_accounted(&scfg, &session);
     if (rc == WTQ_OK)
         rc = wtq_api_session_connect(session, connect);
     if (rc != WTQ_OK) {

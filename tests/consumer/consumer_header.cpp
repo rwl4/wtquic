@@ -3,10 +3,16 @@
  * guards + no compound-literal leakage) and links.
  */
 
+#include <wtquic/session.h>
 #include <wtquic/wtquic.h>
 
 int main()
 {
+    if (wtq_session_service_stream_admission(nullptr) != WTQ_ERR_INVALID_ARG) return 1;
+    size_t quantum = 99;
+    wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
+    if (wtq_session_receive_contract(nullptr, &quantum, &mode) != WTQ_ERR_INVALID_ARG ||
+        quantum != 0 || mode != WTQ_RECEIVE_PAUSE_UNSUPPORTED) return 1;
     wtq_session_t *session = nullptr;
     wtq_stream_t *stream = nullptr;
     (void)session;
@@ -77,7 +83,7 @@ int main()
             WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_13_14_COMPAT |
             WTQ_WEBTRANSPORT_PROFILES_H3_DRAFT_02_RFC9297_COMPAT;
         wtq_webtransport_profile_t prof =
-            static_cast<wtq_webtransport_profile_t>(0x7f);
+            WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT;
         static_assert(
             WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT !=
                 WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
@@ -100,7 +106,7 @@ int main()
         if (wtq_session_webtransport_profile(nullptr, &prof) !=
             WTQ_ERR_INVALID_ARG)
             return 1;
-        if (prof != static_cast<wtq_webtransport_profile_t>(0x7f))
+        if (prof != WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT)
             return 1;
     }
 

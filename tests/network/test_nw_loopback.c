@@ -1538,9 +1538,14 @@ struct nw_setup_outcome {
      * release the session and the caller must NOT destroy its `side` --
      * doing either would expose caller-owned callback state to a late
      * callback. `retained` says the objects were deliberately kept alive
-     * (leaked) instead, mirroring the production contract.
+     * instead. The forced-false fixture owns a pinned attempt until its
+     * explicit completion below; an unexpected timeout stops the test.
      */
     bool retained;
+    struct wtq_driver *retained_drv;
+    wtq_nw_conn_t *retained_conn;
+    wtq_session_t *retained_session;
+    dispatch_queue_t retained_queue;
 };
 
 static bool nw_client_up_ready_ex(struct side *cl, uint16_t port,
@@ -1611,6 +1616,16 @@ static bool nw_client_up_ready_ex(struct side *cl, uint16_t port,
         memset(&cl->closed_err, 0, sizeof(cl->closed_err));
         pthread_mutex_unlock(&cl->mu);
         {
+            if (wtq_nw_test_force_rundown_false && out != NULL) {
+                /* Capture the create reference BEFORE stop can detach/free
+                 * drv. The one-shot false branch does not release it. */
+                out->retained_conn = drv->pub;
+                out->retained_session = cs;
+                out->retained_drv = drv;
+                out->retained_queue = drv->queue;
+                dispatch_retain(out->retained_queue);
+                dispatch_sync(out->retained_queue, ^{ wtq_nw_test_pin(drv); });
+            }
             const bool rok = wtq_nw_conn_rundown_internal(drv, WAIT_MS);
             if (out != NULL) {
                 out->cleanup_ran = true;
@@ -1619,12 +1634,15 @@ static bool nw_client_up_ready_ex(struct side *cl, uint16_t port,
             }
             if (rok) {
                 wtq_session_release(cs);
+            } else {
+                /* Never return into a stack callback owner or another
+                 * allocator epoch without an explicit retained owner. */
+                if (out == NULL || out->retained_conn == NULL) {
+                    fprintf(stderr, "FAIL: setup rundown did not quiesce\n");
+                    exit(1);
+                }
+                more = false;
             }
-            /* else: the domain has NOT quiesced. Release nothing and let
-             * the caller see `retained` so it keeps its callback state
-             * alive. No timeout is widened and no late callback is
-             * reclassified; the objects are deliberately leaked, exactly
-             * as the rundown contract itself does. */
         }
         /* the caller's handles must be unusable after helper cleanup */
         if (drv_out != NULL)
@@ -3471,6 +3489,46 @@ static int t_deferred_shutdown_convergence(wtq_msquic_env_t *env)
  * Non-default SENTINELS are seeded into every scoped global before entry so
  * restoration is proved against real prior values, not assumed zeros.
  */
+static void setup_retained_finish(struct nw_setup_outcome *out)
+{
+    if (!out->retained || !out->cleanup_ran || out->rundown_ok ||
+        out->retained_conn == NULL || out->retained_session == NULL ||
+        out->retained_drv == NULL || out->retained_queue == NULL) {
+        fprintf(stderr, "FAIL: retained setup lost its cleanup owner\n");
+        exit(1);
+    }
+    struct wtq_driver *drv = out->retained_drv;
+    dispatch_sync(out->retained_queue, ^{ wtq_nw_test_unpin(drv); });
+    out->retained_drv = NULL; /* unpin may have freed it */
+    dispatch_release(out->retained_queue);
+    out->retained_queue = NULL;
+
+    /* Same internal-retirement bound as rundown_internal, now that the
+     * deliberately held pin is returned. No new attempt or wider wait. */
+    bool gone = false;
+    for (int spin = 0; spin < WAIT_MS / 25 && !gone; spin++) {
+        gone = atomic_load(&wtq_nw_test_live_drivers) == 0;
+        if (!gone) {
+            struct timespec ts = { 0, 25 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    if (!gone) {
+        fprintf(stderr, "FAIL: retained setup retirement did not quiesce\n");
+        exit(1); /* callback owner stays live until process termination */
+    }
+    /* A root cannot retire until its lifecycle pin is returned after
+     * stopped_done. This join cannot wait for an outstanding callback. */
+    if (wtq_nw_conn_join(out->retained_conn) != WTQ_OK) {
+        fprintf(stderr, "FAIL: retained setup join failed\n");
+        exit(1);
+    }
+    wtq_nw_conn_release(out->retained_conn);
+    wtq_session_release(out->retained_session);
+    out->retained_conn = NULL;
+    out->retained_session = NULL;
+}
+
 static int t_setup_failure_restores_seams(wtq_msquic_env_t *env)
 {
     int failures = 0;
@@ -3568,16 +3626,41 @@ static int t_setup_failure_restores_seams(wtq_msquic_env_t *env)
         /*
          * THE SAFETY PROPERTY: rundown did not complete, so the helper
          * must report retention and must NOT have released the session.
-         * The caller therefore keeps `bad2` alive -- it is deliberately
-         * NOT destroyed below -- so no late callback can reach freed
-         * caller-owned state. The seam is consumed one-shot, so the
-         * ordinary rows are unaffected.
+         * The caller keeps `bad2` and the retained owners alive through
+         * actual retirement, before any counter reset or scope exit.
+         * The seam is consumed one-shot, so ordinary rows are unaffected.
          */
         WTQ_TEST_CHECK(!oc2.rundown_ok);
         WTQ_TEST_CHECK(oc2.retained);
         WTQ_TEST_CHECK_EQ_INT((int)wtq_nw_test_force_rundown_false, 0);
+        WTQ_TEST_CHECK(b2drv == NULL && b2cs == NULL);
+        WTQ_TEST_CHECK(oc2.retained_drv != NULL && oc2.retained_conn != NULL &&
+                       oc2.retained_session != NULL && oc2.retained_queue != NULL);
+        WTQ_TEST_CHECK(atomic_load(&wtq_nw_test_live_drivers) > 0);
+        /* The exact attempt's root is still pinned and charged. This is a
+         * live-owner boundary, not a lucky cleanup that finished already. */
+        int retained_live;
+        size_t retained_bytes;
+        int retained_errors;
+        pthread_mutex_lock(&g_cnt.mu);
+        retained_live = g_cnt.live;
+        retained_bytes = g_cnt.live_bytes;
+        retained_errors = g_cnt.errors;
+        pthread_mutex_unlock(&g_cnt.mu);
+        WTQ_TEST_CHECK(retained_live > 0);
+        WTQ_TEST_CHECK(retained_bytes >= sizeof(struct wtq_driver));
+        WTQ_TEST_CHECK_EQ_INT(retained_errors, 0);
+        fprintf(stderr, "[setup-retained] pinned owner live: allocations=%d "
+                        "bytes=%zu errors=%d\n",
+                retained_live, retained_bytes, retained_errors);
+        setup_retained_finish(&oc2);
+        WTQ_TEST_CHECK(oc2.retained_drv == NULL && oc2.retained_conn == NULL &&
+                       oc2.retained_session == NULL && oc2.retained_queue == NULL);
+        if (cnt_assert_balanced("setup-retained lifetime") != 0)
+            exit(1); /* never erase evidence by starting another epoch */
+        fprintf(stderr, "[setup-retained] owners retired before reset; accounting balanced\n");
         seam_restore(&sc2);
-        /* deliberately NOT side_destroy(&bad2): retained by contract */
+        side_destroy(&bad2);
     }
 
     /* every scoped seam is restored to the SENTINELS by that branch */
@@ -6721,6 +6804,12 @@ int main(int argc, char **argv)
                           (int)WTQ_OK);
     if (env == NULL)
         return failures + 1;
+
+    if (getenv("WTQ_NW_SETUP_FAILURE_ONLY") != NULL) {
+        failures += t_setup_failure_restores_seams(env);
+        wtq_msquic_env_close(env);
+        return failures;
+    }
 
     side_init(&g_sv);
     g_sv.echo_streams = true;

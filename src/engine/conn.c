@@ -36,6 +36,7 @@ enum {
     ES_CONNECT,  /* client: our CONNECT stream (reads the response) */
     ES_REQUEST,  /* server: a peer request stream */
     ES_WT,       /* an associated WebTransport stream (either side) */
+    ES_RESERVED, /* qualified local open: driver call has not returned */
 };
 
 /* Control-frame payload handling classes. */
@@ -48,6 +49,8 @@ enum {
 };
 
 struct wtq_estream {
+    uint64_t generation;
+    bool recv_paused;
     uint8_t kind;
     uint8_t qpack_type;         /* 0x02 or 0x03 for ES_QPACK */
     /* stream classification: uni routes H3 stream types out of the
@@ -93,6 +96,9 @@ struct wtq_estream {
 #define SS_FAILED WTQ_SESSION_FAILED
 
 struct wtq_conn {
+    uint64_t stream_generation;
+    bool admission_enabled;
+    wtq_peer_admission_t *admission_peers[15];
     wtq_alloc_t alloc;
     wtq_perspective_t persp;
     wtq_driver_t *drv;
@@ -751,7 +757,9 @@ static void client_send_connect(wtq_conn_t *conn)
 {
     struct wtq_estream *es = NULL;
 
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++)
+    size_t first = conn->admission_enabled ? 3u : 0u;
+    size_t end = conn->admission_enabled ? 4u : WTQ_CONN_MAX_PEER_UNI;
+    for (size_t i = first; i < end; i++)
         if (conn->peer[i].kind == ES_FREE) {
             es = &conn->peer[i];
             break;
@@ -761,6 +769,7 @@ static void client_send_connect(wtq_conn_t *conn)
         return;
     }
     memset(es, 0, sizeof(*es));
+    es->generation = ++conn->stream_generation;
     es->kind = ES_CONNECT;
     es->id = WTQ_STREAM_ID_UNKNOWN; /* explicit: 0 is a real stream id */
     wtq_h3_frame_dec_init(&es->frame_dec);
@@ -1071,6 +1080,7 @@ wtq_result_t wtq_conn_on_peer_uni_opened(wtq_conn_t *conn,
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind == ES_FREE) {
             memset(es, 0, sizeof(*es));
+            es->generation = ++conn->stream_generation;
             es->kind = ES_TYPE;
             es->ds = ds;
             es->id = id;
@@ -1390,6 +1400,15 @@ static void estream_release(wtq_conn_t *conn, struct wtq_estream *es)
 {
     if (es->ds != NULL)
         conn->ops.detach(conn->drv, es->ds, es);
+    if (conn->admission_enabled) {
+        for (size_t i = 0; i < 15; ++i) {
+            wtq_peer_admission_t *p = conn->admission_peers[i];
+            if (p != NULL && p->es == es) {
+                p->es = NULL;
+                p->state = 3;
+            }
+        }
+    }
     es->kind = ES_FREE;
     /* a released slot never has a report due: a buggy backend passing a
      * cached pointer must hit the fatal path, not mutate the free slot */
@@ -1414,6 +1433,7 @@ static void wt_release_if_done(wtq_conn_t *conn, struct wtq_estream *es)
 static void wt_deliver(wtq_conn_t *conn, struct wtq_estream *es,
                        const uint8_t *data, size_t len, bool fin)
 {
+    uint64_t generation = es->generation;
     if (es->wt_recv_drain) {
         /* locally stopped: bytes are absorbed, never delivered */
         if (fin) {
@@ -1425,7 +1445,7 @@ static void wt_deliver(wtq_conn_t *conn, struct wtq_estream *es,
     if (conn->cb.on_wt_stream_data != NULL && (len > 0 || fin))
         conn->cb.on_wt_stream_data(conn, es, data, len, fin,
                                    conn->cb.ctx);
-    if (fin) {
+    if (fin && es->generation == generation && es->kind == ES_WT) {
         es->wt_recv_open = false;
         /* a drain requested from INSIDE that callback (wt_stop or
          * session_close during a fin=true delivery) is satisfied by
@@ -1488,19 +1508,30 @@ static bool bidi_classify_bytes(wtq_conn_t *conn, struct wtq_estream *es,
     return !conn->closed;
 }
 
-wtq_result_t wtq_conn_on_stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
+static wtq_result_t stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
                                       const uint8_t *data, size_t len,
-                                      bool fin, uint64_t now_us)
+                                      bool fin, uint64_t now_us,
+                                      size_t *consumed)
 {
     (void)now_us;
+    if (consumed != NULL)
+        *consumed = 0;
+    if (conn == NULL || (len != 0 && data == NULL))
+        return WTQ_ERR_INVALID_ARG;
     if (conn->closed || es == NULL || es->kind == ES_FREE)
         return conn->closed ? WTQ_ERR_CLOSED : WTQ_ERR_INVALID_ARG;
+    if (consumed != NULL)
+        *consumed = len;
+    uint64_t generation = es->generation;
 
     size_t off = 0;
 
     if (es->kind == ES_BTYPE) {
         if (!bidi_classify_bytes(conn, es, data, len, &off))
             return WTQ_ERR_PROTO;
+        if (consumed != NULL &&
+            (es->generation != generation || es->kind == ES_FREE))
+            return WTQ_OK;
         if (es->kind == ES_BTYPE) {
             /* still classifying */
             if (fin) {
@@ -1575,6 +1606,32 @@ wtq_result_t wtq_conn_on_stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
         /* NEED_MORE: wait for the rest */
     }
 
+    if (consumed != NULL &&
+        (conn->closed || es->generation != generation || es->kind == ES_FREE))
+        return WTQ_OK; /* the callback retired this input's stream */
+
+    if (es->kind == ES_WT && consumed != NULL) {
+        do {
+            if (!es->wt_recv_open && !es->wt_recv_drain)
+                break; /* a receive-only reset may leave the send half live */
+            if (es->recv_paused && !es->wt_recv_drain) {
+                *consumed = off;
+                return WTQ_ERR_WOULD_BLOCK;
+            }
+            size_t n = len - off;
+            if (n > 65535)
+                n = 65535;
+            bool last = off + n == len;
+            wt_deliver(conn, es, n != 0 ? data + off : NULL, n,
+                       fin && last);
+            off += n;
+            if (last || conn->closed || es->generation != generation ||
+                es->kind != ES_WT)
+                break;
+        } while (off < len);
+        return WTQ_OK;
+    }
+
     if (es->kind == ES_WT) {
         /* off == len on a bare FIN, where data may be NULL (never
          * compute NULL + 0) */
@@ -1604,6 +1661,22 @@ wtq_result_t wtq_conn_on_stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
         estream_release(conn, es);
     }
     return WTQ_OK;
+}
+
+wtq_result_t wtq_conn_on_stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
+                                      const uint8_t *data, size_t len,
+                                      bool fin, uint64_t now_us)
+{
+    return stream_bytes(conn, es, data, len, fin, now_us, NULL);
+}
+
+wtq_result_t wtq_conn_on_stream_bytes_accounted(
+    wtq_conn_t *conn, wtq_estream_t *es, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed)
+{
+    if (consumed == NULL)
+        return WTQ_ERR_INVALID_ARG;
+    return stream_bytes(conn, es, data, len, fin, now_us, consumed);
 }
 
 /*
@@ -2785,6 +2858,7 @@ wtq_result_t wtq_conn_on_peer_bidi_opened(wtq_conn_t *conn,
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind == ES_FREE) {
             memset(es, 0, sizeof(*es));
+            es->generation = ++conn->stream_generation;
             es->kind = ES_BTYPE;
             es->ds = ds;
             es->id = id;
@@ -2886,22 +2960,38 @@ static wtq_result_t wt_open(wtq_conn_t *conn, bool bidi,
         return WTQ_ERR_STATE;
 
     struct wtq_estream *es = NULL;
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++)
+    size_t first = conn->admission_enabled
+        ? (conn->persp == WTQ_PERSPECTIVE_CLIENT ? 4u : 10u) : 0u;
+    if (conn->admission_enabled) {
+        for (size_t i = 0; i < 15; ++i)
+            if (conn->admission_peers[i] != NULL &&
+                conn->admission_peers[i]->state == 1)
+                return WTQ_ERR_WOULD_BLOCK;
+    }
+    for (size_t i = first; i < WTQ_CONN_MAX_PEER_UNI; i++)
         if (conn->peer[i].kind == ES_FREE) {
             es = &conn->peer[i];
             break;
         }
     if (es == NULL)
-        return WTQ_ERR_STREAM_LIMIT;
+        return conn->admission_enabled ? WTQ_ERR_WOULD_BLOCK : WTQ_ERR_STREAM_LIMIT;
     memset(es, 0, sizeof(*es));
+    es->generation = ++conn->stream_generation;
     es->id = WTQ_STREAM_ID_UNKNOWN; /* explicit: 0 is a real stream id */
 
     uint64_t id = WTQ_STREAM_ID_UNKNOWN;
+    if (conn->admission_enabled) es->kind = ES_RESERVED;
     wtq_result_t rc =
         bidi ? conn->ops.open_bidi(conn->drv, es, &es->ds, &id)
              : conn->ops.open_uni(conn->drv, es, &es->ds, &id);
-    if (rc != WTQ_OK)
+    if (rc != WTQ_OK) {
+        if (conn->admission_enabled) es->kind = ES_FREE;
         return rc;
+    }
+    if (conn->admission_enabled && (conn->closed || !session_active(conn))) {
+        estream_release(conn, es);
+        return WTQ_ERR_CLOSED;
+    }
     es->id = id;
     es->native_id_pending = (id == WTQ_STREAM_ID_UNKNOWN);
     es->kind = ES_WT;
@@ -3141,7 +3231,15 @@ wtq_result_t wtq_conn_wt_recv_enable(wtq_conn_t *conn, wtq_estream_t *es,
         return WTQ_ERR_STATE; /* send-only, already FIN/reset, dead */
     if (conn->ops.recv_enable == NULL)
         return WTQ_ERR_UNSUPPORTED; /* the backend cannot pause reads */
-    return conn->ops.recv_enable(conn->drv, es->ds, enabled);
+    bool previous = es->recv_paused;
+    uint64_t generation = es->generation;
+    /* Resume can synchronously replay a held completion. Publish before
+     * entering the driver, and never overwrite a nested successful pause. */
+    es->recv_paused = !enabled;
+    wtq_result_t rc = conn->ops.recv_enable(conn->drv, es->ds, enabled);
+    if (rc != WTQ_OK && es->generation == generation)
+        es->recv_paused = previous;
+    return rc;
 }
 
 int wtq_conn_recv_pause_mode(const wtq_conn_t *conn)
@@ -3430,4 +3528,161 @@ const char *wtq_conn_request_authority(const wtq_conn_t *conn,
 {
     *len_out = conn->req_auth_len;
     return conn->req_auth_len > 0 ? conn->req_auth : "";
+}
+
+/* Prefix state is provider-owned; full HTTP parsers never leave peer[]. */
+void wtq_conn_enable_admission(wtq_conn_t *conn)
+{
+    conn->admission_enabled = true;
+}
+
+wtq_dstream_t *wtq_estream_driver_stream(const wtq_estream_t *es)
+{
+    return es->ds;
+}
+
+wtq_result_t wtq_conn_peer_admission_init(wtq_conn_t *conn,
+    wtq_peer_admission_t *p, wtq_dstream_t *ds, uint64_t id,
+    bool bidi, unsigned reservation)
+{
+    if (!conn || !p || !ds || !conn->admission_enabled ||
+        reservation >= 15 || (bidi ? reservation < 8 : reservation >= 8) ||
+        conn->admission_peers[reservation] != NULL)
+        return WTQ_ERR_INVALID_ARG;
+    if (conn->closed) return WTQ_ERR_CLOSED;
+    wtq_result_t rc = conn_open_locals_if_deferred(conn);
+    if (rc != WTQ_OK) return rc;
+    memset(p, 0, sizeof(*p));
+    p->ds = ds;
+    p->id = id;
+    p->bidi = bidi;
+    p->reservation = (uint8_t)reservation;
+    conn->admission_peers[reservation] = p;
+    return WTQ_OK;
+}
+
+void wtq_conn_peer_admission_forget(wtq_conn_t *conn, wtq_peer_admission_t *p)
+{
+    if (conn && p && p->reservation < 15 &&
+        conn->admission_peers[p->reservation] == p)
+        conn->admission_peers[p->reservation] = NULL;
+}
+
+static wtq_estream_t *admission_entry(wtq_conn_t *conn,
+    wtq_peer_admission_t *p, size_t index, uint8_t kind)
+{
+    wtq_estream_t *es = &conn->peer[index];
+    if (es->kind != ES_FREE) return NULL;
+    memset(es, 0, sizeof(*es));
+    es->generation = ++conn->stream_generation;
+    es->kind = kind;
+    es->ds = p->ds;
+    es->id = p->id;
+    p->es = es;
+    p->state = 2;
+    return es;
+}
+
+wtq_result_t wtq_conn_peer_admit(wtq_conn_t *conn, wtq_peer_admission_t *p)
+{
+    if (!conn || !p || p->state != 1) return WTQ_ERR_INVALID_ARG;
+    if (conn->closed) return WTQ_ERR_CLOSED;
+    size_t first = conn->persp == WTQ_PERSPECTIVE_CLIENT ? 4u : 10u;
+    for (size_t i = first; i < WTQ_CONN_MAX_PEER_UNI; ++i) {
+        wtq_estream_t *es = admission_entry(conn, p, i, ES_WT);
+        if (!es) continue;
+        (void)wt_associate(conn, es, p->session_id, p->bidi);
+        return conn->closed ? WTQ_ERR_PROTO : WTQ_OK;
+    }
+    return WTQ_ERR_WOULD_BLOCK;
+}
+
+wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
+    wtq_peer_admission_t *p, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed)
+{
+    if (consumed) *consumed = 0;
+    if (!conn || !p || !consumed || (len && !data)) return WTQ_ERR_INVALID_ARG;
+    if (conn->closed) return WTQ_ERR_CLOSED;
+    if (p->es)
+        return stream_bytes(conn, p->es, data, len, fin, now_us, consumed);
+    if (p->state == 1) return WTQ_ERR_WOULD_BLOCK;
+    if (p->state == 3) { *consumed = len; return WTQ_OK; }
+    wtq_preamble_t pre;
+    size_t used = 0;
+    wtq_preamble_status_t st = wtq_preamble_dec_feed(&p->decoder,
+        p->bidi ? WTQ_PREAMBLE_KIND_BIDI : WTQ_PREAMBLE_KIND_UNI,
+        data, len, &pre, &used);
+    if (used) memcpy(p->prefix + p->fill, data, used);
+    p->fill = (uint8_t)(p->fill + used);
+    *consumed = used;
+    if (st == WTQ_PREAMBLE_NEED_MORE) {
+        if (fin) {
+            if (p->bidi) {
+                conn_fatal(conn, p->decoder.state == 1 ? WTQ_H3_FRAME_ERROR :
+                    conn->persp == WTQ_PERSPECTIVE_SERVER ?
+                    WTQ_H3_REQUEST_INCOMPLETE : WTQ_H3_STREAM_CREATION_ERROR);
+                return WTQ_ERR_PROTO;
+            }
+            p->state = 3;
+        }
+        return WTQ_OK;
+    }
+    if (st == WTQ_PREAMBLE_OK) {
+        if (pre.session_id % 4 != 0) {
+            conn_fatal(conn, WTQ_H3_ID_ERROR);
+            return WTQ_ERR_PROTO;
+        }
+        if (!session_active(conn) || !conn->session_established ||
+            pre.session_id != conn->session_id) {
+            shutdown_raw(conn, p->ds, p->bidi, true,
+                conn->session_established && pre.session_id == conn->session_id
+                    ? WTQ_WT_SESSION_GONE : WTQ_WT_BUFFERED_STREAM_REJECTED);
+            p->state = 3;
+            *consumed = len;
+            return WTQ_OK;
+        }
+        p->session_id = pre.session_id;
+        p->state = 1;
+        return WTQ_ERR_WOULD_BLOCK;
+    }
+    wtq_estream_t *es;
+    if (p->bidi) {
+        if (conn->persp == WTQ_PERSPECTIVE_CLIENT) {
+            conn_fatal(conn, WTQ_H3_STREAM_CREATION_ERROR);
+            return WTQ_ERR_PROTO;
+        }
+        es = admission_entry(conn, p, 3u + p->reservation - 8u, ES_REQUEST);
+        if (!es) return WTQ_ERR_STATE; /* resident record owns this reservation */
+        wtq_h3_frame_dec_init(&es->frame_dec);
+        request_stream_bytes(conn, es, p->prefix, p->fill);
+    } else {
+        uint64_t type = pre.wire_type;
+        if (type == 1) {
+            conn_fatal(conn, conn->persp == WTQ_PERSPECTIVE_SERVER
+                ? WTQ_H3_STREAM_CREATION_ERROR : WTQ_H3_ID_ERROR);
+            return WTQ_ERR_PROTO;
+        }
+        if (type != 0 && type != 2 && type != 3) {
+            p->state = 3;
+            *consumed = len;
+            return WTQ_OK;
+        }
+        bool seen = type == 0 ? conn->peer_control_seen :
+            type == 2 ? conn->qpack_enc_seen : conn->qpack_dec_seen;
+        if (seen) {
+            conn_fatal(conn, WTQ_H3_STREAM_CREATION_ERROR);
+            return WTQ_ERR_PROTO;
+        }
+        es = admission_entry(conn, p, type == 0 ? 0u : (size_t)type - 1u, ES_TYPE);
+        if (!es) return WTQ_ERR_STATE;
+        if (!classify_uni(conn, es, type)) return WTQ_ERR_PROTO;
+    }
+    if (conn->closed) return WTQ_ERR_PROTO;
+    if (p->es == NULL) { *consumed = len; return WTQ_OK; }
+    size_t tail = 0;
+    wtq_result_t rc = stream_bytes(conn, es, used < len ? data + used : NULL,
+        len - used, fin, now_us, &tail);
+    *consumed += tail;
+    return rc;
 }

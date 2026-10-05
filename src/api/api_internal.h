@@ -97,6 +97,11 @@ typedef struct wtq_api_session_cfg {
 WTQ_SPI wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
                                     wtq_session_t **out);
 
+/* Preserved accounted-only registration. It does not certify the strengthened
+ * receive/admission contract; existing binaries remain link-compatible. */
+WTQ_SPI wtq_result_t wtq_api_session_create_accounted(
+    const wtq_api_session_cfg_t *cfg, wtq_session_t **out);
+
 /* Transport ready: brings up the engine's control plane. ONE-SHOT — a
  * session gets exactly one start attempt. CLIENTS open their control/
  * QPACK streams here and a failure returns the driver's error; SERVERS
@@ -144,6 +149,21 @@ WTQ_SPI wtq_conn_t *wtq_api_session_conn(wtq_session_t *session);
  */
 WTQ_SPI void wtq_api_session_enter(wtq_session_t *session);
 WTQ_SPI bool wtq_api_session_leave(wtq_session_t *session);
+
+typedef struct wtq_api_admission_ops {
+    unsigned peer_uni;
+    unsigned peer_bidi;
+    wtq_result_t (*service)(wtq_driver_t *drv);
+    void (*lease)(wtq_driver_t *drv, wtq_dstream_t *ds, bool held);
+} wtq_api_admission_ops_t;
+
+WTQ_SPI wtq_result_t wtq_api_session_create_admission(
+    const wtq_api_session_cfg_t *cfg, const wtq_api_admission_ops_t *ops,
+    wtq_session_t **out);
+WTQ_SPI bool wtq_api_session_admission_root(const wtq_session_t *session);
+WTQ_SPI wtq_result_t wtq_api_session_admit(wtq_session_t *session,
+    wtq_peer_admission_t *peer);
+WTQ_SPI void wtq_api_session_admission_detach(wtq_session_t *session);
 
 #ifdef __cplusplus
 }

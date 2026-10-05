@@ -25,6 +25,21 @@ extern "C" {
  */
 typedef int wtq_result_t;
 
+typedef enum wtq_receive_pause_mode {
+    /* Pause cannot suppress delivery at all — do not rely on it. */
+    WTQ_RECEIVE_PAUSE_UNSUPPORTED = 0,
+    /* Pause suppresses application delivery, but the transport may keep
+     * consuming, ACKing, and expanding receive credit while paused: no
+     * hard flow-control bound on the peer, bytes may buffer below
+     * wtquic. (Apple Network.framework.) */
+    WTQ_RECEIVE_PAUSE_DELIVERY_ONLY = 1,
+    /* Pause suppresses delivery AND stops transport consumption without
+     * extending receive credit, so the peer is eventually blocked by
+     * QUIC flow control — real backpressure, nothing buffered by
+     * wtquic. */
+    WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED = 2,
+} wtq_receive_pause_mode_t;
+
 /*
  * Transport-error record (dual-fidelity, ABI-sized).
  *

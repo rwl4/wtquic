@@ -29,6 +29,7 @@
 #include <wtquic/types.h>
 
 #include "../proto/h3_settings.h"
+#include "../proto/preamble.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,34 @@ typedef struct wtq_conn wtq_conn_t;
 typedef struct wtq_estream wtq_estream_t; /* engine per-stream state */
 typedef struct wtq_driver wtq_driver_t;   /* backend connection ctx */
 typedef struct wtq_dstream wtq_dstream_t; /* backend stream ctx */
+
+/* Additive admission SPI. Old driver/config tables retain their exact layout.
+ * Storage belongs to one of the provider's fifteen resident credit records. */
+typedef struct wtq_peer_admission {
+    wtq_preamble_dec_t decoder;
+    uint8_t prefix[16];
+    uint8_t fill;
+    uint8_t state; /* 0 prefix, 1 waiting WT, 2 attached parser, 3 drain */
+    uint8_t reservation;
+    bool bidi;
+    uint64_t id;
+    uint64_t session_id;
+    wtq_dstream_t *ds;
+    wtq_estream_t *es;
+} wtq_peer_admission_t;
+
+void wtq_conn_enable_admission(wtq_conn_t *conn);
+WTQ_SPI wtq_result_t wtq_conn_peer_admission_init(wtq_conn_t *conn,
+    wtq_peer_admission_t *peer, wtq_dstream_t *ds, uint64_t id,
+    bool bidi, unsigned reservation);
+WTQ_SPI wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
+    wtq_peer_admission_t *peer, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed);
+wtq_result_t wtq_conn_peer_admit(wtq_conn_t *conn,
+    wtq_peer_admission_t *peer);
+WTQ_SPI void wtq_conn_peer_admission_forget(wtq_conn_t *conn,
+    wtq_peer_admission_t *peer);
+wtq_dstream_t *wtq_estream_driver_stream(const wtq_estream_t *es);
 
 /*
  * STORAGE capacity for the negotiated subprotocol, in bytes.
@@ -229,8 +258,8 @@ typedef struct wtq_driver_ops {
 
     /*
      * Enable/disable delivery of received data on a stream. Disabling
-     * stops FUTURE indications only — bytes already being delivered
-     * still arrive and the engine consumes them as always; the
+     * stops future indications; the legacy input consumes its current
+     * offer, while accounted input stops before the next callback. The
      * transport buffers what keeps arriving and its flow control
      * eventually pushes back on the peer. OPTIONAL — NULL when the
      * backend cannot pause reads (the engine reports UNSUPPORTED).
@@ -456,6 +485,19 @@ WTQ_SPI wtq_result_t wtq_conn_on_stream_bytes(wtq_conn_t *conn,
                                       wtq_estream_t *es,
                                       const uint8_t *data, size_t len,
                                       bool fin, uint64_t now_us);
+
+/* Accounted input for built-in backends. consumed is required and always
+ * written in [0,len]. OK accepts all input and FIN (including a bare FIN).
+ * WOULD_BLOCK accepts only *consumed bytes, never FIN; retain/reoffer the
+ * suffix and FIN after resume. Each WT data callback is at most 65535 bytes.
+ * INVALID_ARG/CLOSED on entry consume zero. Other errors retire the whole
+ * input after the engine's terminal action; do not replay it. A stream
+ * retired by application callbacks also discards the rest of this input.
+ * The legacy consume-all entry above deliberately ignores logical pause
+ * and retains its original callback chunking. Neither entry owns data. */
+WTQ_SPI wtq_result_t wtq_conn_on_stream_bytes_accounted(
+    wtq_conn_t *conn, wtq_estream_t *es, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed);
 
 /* Peer reset one of its uni streams. */
 WTQ_SPI wtq_result_t wtq_conn_on_stream_reset(wtq_conn_t *conn,

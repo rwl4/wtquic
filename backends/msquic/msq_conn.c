@@ -38,6 +38,7 @@ struct wtq_driver *wtq_msq_conn_new(const wtq_alloc_t *alloc,
      * callback loads `abandon`, so it must be initialized on this path too. */
     atomic_init(&drv->env_close_req, false);
     atomic_init(&drv->abandon, false);
+    atomic_init(&drv->sweeping, false);
     drv->alloc = *alloc;
     drv->api = api;
     drv->is_client = is_client;
@@ -47,13 +48,15 @@ struct wtq_driver *wtq_msq_conn_new(const wtq_alloc_t *alloc,
 void wtq_msq_conn_free(struct wtq_driver *drv)
 {
     wtq_alloc_t alloc = drv->alloc;
+    atomic_store_explicit(&drv->sweeping, true, memory_order_release);
+    if (drv->session) wtq_api_session_admission_detach(drv->session);
 
     while (drv->streams != NULL) {
         struct wtq_dstream *ds = drv->streams;
         drv->streams = ds->next;
         if (ds->stream != NULL)
             drv->api->StreamClose(ds->stream);
-        alloc.free(ds, sizeof(*ds), alloc.ctx);
+        if (!ds->pooled) alloc.free(ds, sizeof(*ds), alloc.ctx);
     }
     /* every send record is back by now (each SEND_COMPLETE precedes the
      * connection's SHUTDOWN_COMPLETE); only the pool storage remains */
@@ -274,13 +277,16 @@ static wtq_result_t op_send(wtq_driver_t *drv, wtq_dstream_t *ds,
     rec->buf.Buffer = (uint8_t *)(rec + 1);
     memcpy(rec->buf.Buffer, data, len);
 
+    ds->send_refs++;
+    drv->pending_sends++;
     if (QUIC_FAILED(drv->api->StreamSend(
             ds->stream, &rec->buf, 1,
             fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec))) {
+        ds->send_refs--;
+        drv->pending_sends--;
         drv->alloc.free(rec, rec_size, drv->alloc.ctx);
         return WTQ_ERR_BACKEND;
     }
-    drv->pending_sends++;
     return WTQ_OK;
 }
 
@@ -396,14 +402,18 @@ static wtq_result_t op_send_gather(wtq_driver_t *drv, wtq_dstream_t *ds,
         rec->bufs[i].Buffer = (uint8_t *)spans[i].data;
     }
 
+    ds->send_refs++;
+    ds->inflight_bytes += total;
+    drv->pending_sends++;
     if (QUIC_FAILED(drv->api->StreamSend(
             ds->stream, rec->bufs, (uint32_t)count,
             fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec))) {
+        ds->send_refs--;
+        ds->inflight_bytes -= total;
+        drv->pending_sends--;
         wtq_msq_gather_put(drv, rec);
         return WTQ_ERR_BACKEND; /* not accepted: no completion */
     }
-    ds->inflight_bytes += total;
-    drv->pending_sends++;
     /* an accepted send disarms the writable edge: the app already
      * found its own way through (typically a retry from inside
      * on_send_complete, which runs before this stream's writable
@@ -528,10 +538,13 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
 {
     if (drv->shutdown_started || ds->stream == NULL)
         return WTQ_ERR_CLOSED;
-    if (QUIC_FAILED(drv->api->StreamReceiveSetEnabled(
+    /* A queued prefix-only FIN can already be native-terminal. Its retained
+     * credit handle needs logical resume/replay, not another native enable. */
+    if (!ds->shutdown_complete && QUIC_FAILED(drv->api->StreamReceiveSetEnabled(
             ds->stream, enabled ? TRUE : FALSE)))
         return WTQ_ERR_BACKEND;
     ds->recv_disabled = !enabled; /* published after success only */
+    ds->admission_resume_pending = false;
     if (enabled) {
         /* Resume: MsQuic will redeliver any bytes held during the pause,
          * with their FIN riding the final buffer. A FIN observed while
@@ -542,11 +555,17 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
         if (ds->fin_pending && !ds->fin_delivered && ds->ectx != NULL &&
             drv->session != NULL) {
             ds->fin_pending = false;
-            ds->fin_delivered = true;
             wtq_api_session_enter(drv->session);
-            (void)wtq_conn_on_stream_bytes(
-                wtq_api_session_conn(drv->session), ds->ectx, NULL, 0,
-                true, wtq_msq_now_us());
+            size_t consumed = 0;
+            wtq_result_t rc = wtq_msq_stream_input(ds, NULL, 0, true, &consumed);
+            ds->fin_delivered = rc == WTQ_OK;
+            ds->fin_pending = rc == WTQ_ERR_WOULD_BLOCK;
+            wtq_msq_conn_leave_and_poll(drv);
+        }
+        if (ds->shutdown_complete && ds->ectx && !ds->fin_pending &&
+            !ds->recv_held_data && !drv->shutdown_started && drv->session) {
+            wtq_api_session_enter(drv->session);
+            (void)wtq_conn_on_stream_terminal(wtq_api_session_conn(drv->session), ds->ectx);
             wtq_msq_conn_leave_and_poll(drv);
         }
     }
@@ -576,11 +595,46 @@ static void op_detach(wtq_driver_t *drv, wtq_dstream_t *ds,
         ds->ectx = NULL;
 }
 
+/* Driver calls can synchronously enter provider callbacks (notably close
+ * paths and test tables). Do not collect on exit: the enclosing engine/API
+ * frame may still borrow a stream. The next top-level callback is the fence. */
+#define MSQ_BORROW_OP(name, params, args) \
+    static wtq_result_t borrow_##name params \
+    { \
+        drv->api_depth++; \
+        wtq_result_t rc = name args; \
+        drv->api_depth--; \
+        return rc; \
+    }
+
+MSQ_BORROW_OP(op_open_uni,
+    (wtq_driver_t *drv, wtq_estream_t *es, wtq_dstream_t **out, uint64_t *id),
+    (drv, es, out, id))
+MSQ_BORROW_OP(op_open_bidi,
+    (wtq_driver_t *drv, wtq_estream_t *es, wtq_dstream_t **out, uint64_t *id),
+    (drv, es, out, id))
+MSQ_BORROW_OP(op_send,
+    (wtq_driver_t *drv, wtq_dstream_t *ds, const uint8_t *p, size_t n, bool fin),
+    (drv, ds, p, n, fin))
+MSQ_BORROW_OP(op_send_gather,
+    (wtq_driver_t *drv, wtq_dstream_t *ds, const wtq_span_t *spans, size_t n,
+     bool fin, void *cookie), (drv, ds, spans, n, fin, cookie))
+MSQ_BORROW_OP(op_shutdown_stream,
+    (wtq_driver_t *drv, wtq_dstream_t *ds, const wtq_shutdown_t *req),
+    (drv, ds, req))
+MSQ_BORROW_OP(op_recv_enable,
+    (wtq_driver_t *drv, wtq_dstream_t *ds, bool enabled), (drv, ds, enabled))
+MSQ_BORROW_OP(op_conn_close,
+    (wtq_driver_t *drv, uint64_t code), (drv, code))
+MSQ_BORROW_OP(op_dgram_send,
+    (wtq_driver_t *drv, const wtq_span_t *spans, size_t n), (drv, spans, n))
+#undef MSQ_BORROW_OP
+
 const wtq_driver_ops_t *wtq_msq_driver_ops(void)
 {
     static const wtq_driver_ops_t ops = {
-        .open_uni = op_open_uni,
-        .send = op_send,
+        .open_uni = borrow_op_open_uni,
+        .send = borrow_op_send,
         /* RECV_FLOW_CONTROLLED: pause keeps per-stream logical state and a
          * RECEIVE already queued behind it is arrested synchronously
          * (accepted with zero bytes — MsQuic holds the bytes for in-order
@@ -589,13 +643,13 @@ const wtq_driver_ops_t *wtq_msq_driver_ops(void)
          * control, not merely unpumped. */
         .caps = WTQ_DCAP_SHUT_BIDI_SEND | WTQ_DCAP_SHUT_BIDI_RECV |
                 WTQ_DCAP_SHUT_SPLIT_CODES | WTQ_DCAP_RECV_FLOW_CONTROLLED,
-        .shutdown_stream = op_shutdown_stream,
-        .conn_close = op_conn_close,
-        .open_bidi = op_open_bidi,
-        .dgram_send = op_dgram_send,
+        .shutdown_stream = borrow_op_shutdown_stream,
+        .conn_close = borrow_op_conn_close,
+        .open_bidi = borrow_op_open_bidi,
+        .dgram_send = borrow_op_dgram_send,
         .dgram_max_size = op_dgram_max_size,
-        .send_gather = op_send_gather,
-        .recv_enable = op_recv_enable,
+        .send_gather = borrow_op_send_gather,
+        .recv_enable = borrow_op_recv_enable,
         .detach = op_detach,
     };
     return &ops;
@@ -723,6 +777,7 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
              * a callback). */
             if (drv->on_transport_quiesced != NULL)
                 drv->on_transport_quiesced(drv->session, drv->quiesced_user);
+            wtq_api_session_admission_detach(drv->session);
             /* drop the backend's reference INSIDE the bracket so a
              * resulting destroy runs here, on the worker, with nothing
              * else in flight */
@@ -811,9 +866,15 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
         wtq_conn_t *ec = wtq_api_session_conn(drv->session);
         wtq_estream_t *es = NULL;
         wtq_api_session_enter(drv->session);
-        wtq_result_t rc =
-            bidi ? wtq_conn_on_peer_bidi_opened(ec, ds, id, &es)
-                 : wtq_conn_on_peer_uni_opened(ec, ds, id, &es);
+        wtq_result_t rc;
+        if (drv->bounded_admission) {
+            ev->PEER_STREAM_STARTED.Flags |= QUIC_STREAM_OPEN_FLAG_DELAY_ID_FC_UPDATES;
+            rc = wtq_conn_peer_admission_init(ec, &ds->admission, ds, id,
+                bidi, (unsigned)(ds - drv->peers));
+        } else {
+            rc = bidi ? wtq_conn_on_peer_bidi_opened(ec, ds, id, &es)
+                      : wtq_conn_on_peer_uni_opened(ec, ds, id, &es);
+        }
         wtq_msq_conn_leave_and_poll(drv);
         /* Engine refusal (pool exhausted / closed): es stays NULL. The
          * engine has ALREADY rejected the stream on the wire
@@ -845,7 +906,8 @@ QUIC_STATUS QUIC_API wtq_msq_conn_callback(HQUIC conn, void *ctx,
      * WITHOUT entering the guard — a caller holding the guard across the
      * connect must not deadlock against this cleanup, and there is no session
      * state to serialize. */
-    if (atomic_load_explicit(&drv->abandon, memory_order_acquire))
+    if (atomic_load_explicit(&drv->abandon, memory_order_acquire) ||
+        atomic_load_explicit(&drv->sweeping, memory_order_acquire))
         return QUIC_STATUS_SUCCESS;
     /* Bracket the whole dispatch with the caller's guard, making its lane
      * lock this session's serialization domain. Copy {leave, ctx} BEFORE
@@ -856,7 +918,18 @@ QUIC_STATUS QUIC_API wtq_msq_conn_callback(HQUIC conn, void *ctx,
     void *g_ctx = drv->guard.ctx;
     if (drv->guard.enter != NULL)
         drv->guard.enter(g_ctx);
+    bool admission_root = ev->Type != QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE &&
+        drv->callback_depth == 0 && drv->api_depth == 0 &&
+        wtq_api_session_admission_root(drv->session);
+    wtq_msq_stream_collect(drv, NULL);
+    drv->callback_depth++;
     QUIC_STATUS st = conn_dispatch(conn, drv, ev);
+    /* The final event performs the quiescent connection sweep and frees drv. */
+    if (ev->Type != QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) {
+        drv->callback_depth--;
+        if (admission_root && !drv->shutdown_started && drv->session != NULL)
+            (void)wtq_session_service_stream_admission(drv->session);
+    }
     if (g_leave != NULL)
         g_leave(g_ctx);
     return st;

@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * Real-transport loopback: a wtquic server and client over MsQuic on
  * localhost, self-signed certs, ephemeral ports.

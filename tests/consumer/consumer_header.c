@@ -3,10 +3,16 @@
  * pedantic C11 and links against the library.
  */
 
+#include <wtquic/session.h>
 #include <wtquic/wtquic.h>
 
 int main(void)
 {
+    if (wtq_session_service_stream_admission(NULL) != WTQ_ERR_INVALID_ARG) return 1;
+    size_t quantum = 99;
+    wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
+    if (wtq_session_receive_contract(NULL, &quantum, &mode) != WTQ_ERR_INVALID_ARG ||
+        quantum != 0 || mode != WTQ_RECEIVE_PAUSE_UNSUPPORTED) return 1;
     wtq_session_t *session = 0; /* opaque handles are declarable */
     wtq_stream_t *stream = 0;
     (void)session;

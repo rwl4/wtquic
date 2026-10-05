@@ -24,13 +24,13 @@
  *      engine calls NO driver ops (every engine input checks its closed
  *      flag first), so backend stream state may die safely afterwards.
  *   2. Stream SHUTDOWN_COMPLETE closes the HQUIC stream (StreamClose)
- *      and marks the backend stream transport-dead; the struct itself
- *      stays allocated because engine stream slots may still hold the
- *      wtq_dstream_t pointer (driver ops on it become no-ops).
+ *      and marks the backend stream transport-dead. A later top-level
+ *      callback collects its record only after engine detachment and zero
+ *      send references. Nested callback/driver frames prohibit collection.
  *   3. Connection SHUTDOWN_COMPLETE: feed wtq_conn_on_conn_closed once
  *      more (idempotent — covers locally-initiated shutdowns that get
  *      no INITIATED event), drop the backend's session reference inside
- *      the enter/leave bracket, then free every backend stream struct,
+ *      the enter/leave bracket, then free remaining backend stream structs,
  *      ConnectionClose exactly once, and free the backend connection.
  *
  * SESSION LINKAGE (two owners, resolved by ordering)
@@ -470,14 +470,24 @@ struct wtq_msq_dgram_rec {
     /* copied prefix + payload bytes follow */
 };
 
-/* Backend stream context (the driver SPI's wtq_dstream_t). Freed only
- * in the connection sweep — engine stream slots may hold the pointer
- * past the stream's transport death. */
+/* A retired record is collected at a later top-level callback boundary,
+ * after transport shutdown, engine detach and all send completions. */
 struct wtq_dstream {
     struct wtq_driver *drv;
     HQUIC stream;            /* NULL once the stream shut down */
     wtq_estream_t *ectx;     /* engine ctx; NULL = engine refused it */
     struct wtq_dstream *next;
+    size_t send_refs;        /* cold and gather records, including empty sends */
+    bool shutdown_complete;
+    bool pooled;
+    bool occupied;
+    bool credit_held;
+    uint64_t generation;
+    wtq_peer_admission_t admission;
+    struct wtq_dstream *admission_next;
+    bool admission_resume_pending;
+    uint64_t admission_reset_error, admission_stop_error;
+    bool admission_reset_pending, admission_stop_pending, admission_stop_first;
     uint64_t id;
     uint64_t inflight_bytes; /* accepted gather bytes awaiting completion */
     uint64_t ideal_send;     /* last IDEAL_SEND_BUFFER_SIZE (0 = none) */
@@ -513,6 +523,14 @@ struct wtq_driver {
     HQUIC conn;
     wtq_session_t *session;  /* backend-held reference; NULL once dropped */
     struct wtq_dstream *streams;
+    struct wtq_dstream peers[15];
+    struct wtq_dstream *admission_head, *admission_tail;
+    uint64_t peer_generation;
+    bool bounded_admission;
+    struct wtq_dstream *admission_borrowed;
+    unsigned callback_depth;
+    unsigned api_depth;
+    atomic_bool sweeping;
     struct wtq_msq_gather_rec *gather_free;
     struct wtq_msq_gather_chunk *gather_chunks;
     int pending_sends;       /* send records awaiting SEND_COMPLETE
@@ -689,6 +707,10 @@ void wtq_msq_gather_put(struct wtq_driver *drv,
                         struct wtq_msq_gather_rec *rec);
 
 /* msq_stream.c */
+/* Called only at callback entry under the serialization guard. Never frees
+ * the entering callback's borrowed record, or anything in nested frames. */
+void wtq_msq_stream_collect(struct wtq_driver *drv,
+                            const struct wtq_dstream *borrowed);
 /* Deliver the writable edge for a budget-blocked stream: called where
  * budget frees (SEND_COMPLETE) or the ceiling grows (ideal-size
  * advice). No-op unless armed and the stream still has engine + session
@@ -701,6 +723,11 @@ QUIC_STATUS QUIC_API wtq_msq_stream_callback(HQUIC stream, void *ctx,
 struct wtq_dstream *wtq_msq_stream_new(struct wtq_driver *drv,
                                        bool is_local, bool is_bidi,
                                        uint64_t id);
+wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
+    const wtq_api_session_cfg_t *cfg, const wtq_msquic_tuning_t *tuning,
+    wtq_session_t **out);
+wtq_result_t wtq_msq_stream_input(struct wtq_dstream *ds,
+    const uint8_t *data, size_t len, bool fin, size_t *consumed);
 
 #ifdef __cplusplus
 }

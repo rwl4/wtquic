@@ -1,5 +1,73 @@
 # Compatibility note
 
+## Accounted receive input (unreleased)
+
+The built-in MsQuic and Network backends now use the additive, uninstalled
+`wtq_conn_on_stream_bytes_accounted` SPI. Its consumed prefix is authoritative;
+`WOULD_BLOCK` never accepts FIN, even when the consumed count equals the input
+length. Resume replays the suffix, then FIN. Individual application data
+callbacks are at most 65535 bytes. Pause from opened or data callbacks arrests
+the current transport completion before another data callback.
+
+The old `wtq_conn_on_stream_bytes` symbol remains consume-all, with its original
+chunking and no new intra-input pause guarantee. New backends need a core that
+exports the additive symbol; old provider binaries are not qualified by this
+change. Public callback signatures and pause-mode classifications are unchanged:
+MsQuic remains flow-controlled and Network remains delivery-only. The quantum
+does not bound aggregate memory.
+
+Retired MsQuic stream records are collected at a later top-level provider
+callback, after SHUTDOWN_COMPLETE, engine detachment, and all copied/gather
+send completions (zero-byte sends count). Collection never runs inside a
+nested callback or driver operation. An idle connection may retain the last
+retired records until another callback or the final connection sweep; completed
+sequential churn no longer accumulates lifetime stream history. Live streams,
+concurrently closing streams, pending sends, and provider-internal allocations
+remain separate from this reclaimed metadata. This is not a total memory bound.
+
+Consumers requiring lossless bounded admission must qualify their provider
+before endpoint/bridge creation. A stream-time pause-mode query cannot justify
+late mutation of a capability that the bridge requires for its lifetime.
+
+`wtq_session_receive_contract(session, &quantum, &mode)` is the public,
+allocation-free qualification query in the session's serialized domain. Both
+outputs are required and initialized to zero/UNSUPPORTED on failure. The
+unreleased query now certifies bounded admission as well as accounted input.
+Both legacy and accounted-only constructors/layouts remain compatible and
+unqualified. The additive private `wtq_api_session_create_admission` registration
+certifies fixed effective MsQuic peer limits of eight uni/seven bidi streams;
+other settings and Network.framework return UNSUPPORTED. Network stream pause
+remains DELIVERY_ONLY, not flow-controlled. Cached qualification facts survive
+terminal driver teardown.
+
+The existing sixteen engine entries are partitioned as three peer critical,
+one client CONNECT and twelve WT, or three critical, seven server request
+reservations and six WT. WT counts local/peer and uni/bidi together. Incomplete
+prefixes and unknown uni drains occupy only preallocated native credit records;
+full HTTP request parsers keep their existing storage and semantics. Valid WT
+streams wait for engine and API capacity without pressure rejection. Locals
+reserve capacity before transport open. Delayed native stream-ID credit follows
+retained terminal API handles independently of engine detachment. Peer record
+count is at most fifteen, including sparse implicit opens and terminal leases.
+These are not bounds on all provider/OS memory or on autotuned byte windows.
+
+`wtq_session_service_stream_admission` runs a bounded admission pass in the
+serialized domain after enclosing bridge/application work returns. Nested calls
+defer; OK does not mean every stream was admitted. Transport callback tails may
+also service only when entry proved no enclosing API/engine/driver/callback
+borrow. Handle release and arbitrary API/driver exits never publish waiters.
+Ready WT prefixes join one fixed-record FIFO across both directions; recycled
+pool slots cannot bypass older ready streams. Each pass snapshots at most
+fifteen generations, so new callback-created work waits for a later pass.
+A native resume failure retains its published stream's retry obligation and
+returns BACKEND to an explicit caller. Automatic roots retain the same work for
+later safe service, without repeated opened callbacks or an immediate retry
+loop. A successful explicit receive operation or terminal retires that
+obligation; an application pause is never overridden by admission service.
+A new backend with an old core fails linkage on the additive private
+registration; old backends remain usable but unqualified. No exported test seam
+is introduced.
+
 For consumers pinning wtquic as a dependency (e.g. libmoq's setup
 script). The durable revision is the annotated tag below — pin the tag
 or its exact commit SHA; both stay fetchable regardless of later

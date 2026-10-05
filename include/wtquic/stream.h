@@ -104,6 +104,11 @@ WTQ_API wtq_result_t wtq_stream_stop_sending(wtq_stream_t *stream,
  * still arrives (the borrowed-during-callback contract is unchanged).
  * Resume re-opens the tap and delivery continues in order, FIN
  * included.
+ * The built-in MsQuic and Network backends cap each data callback at
+ * 65535 bytes and stop before the next callback even within one transport
+ * completion (including pause from on_stream_opened). This delivery quantum
+ * is not a bound on total provider memory. Older providers using the legacy
+ * engine input contract do not provide these stronger guarantees.
  *
  * The GUARANTEED, portable effect is delivery suppression: while paused
  * the application sees no further on_stream_data. Whether that also
@@ -131,20 +136,7 @@ WTQ_API wtq_result_t wtq_stream_resume_receive(wtq_stream_t *stream);
  * delivery reports WTQ_RECEIVE_PAUSE_UNSUPPORTED; a NULL handle also
  * reports it, for lack of a backend to name.
  */
-typedef enum wtq_receive_pause_mode {
-    /* Pause cannot suppress delivery at all — do not rely on it. */
-    WTQ_RECEIVE_PAUSE_UNSUPPORTED = 0,
-    /* Pause suppresses application delivery, but the transport may keep
-     * consuming, ACKing, and expanding receive credit while paused: no
-     * hard flow-control bound on the peer, bytes may buffer below
-     * wtquic. (Apple Network.framework.) */
-    WTQ_RECEIVE_PAUSE_DELIVERY_ONLY = 1,
-    /* Pause suppresses delivery AND stops transport consumption without
-     * extending receive credit, so the peer is eventually blocked by
-     * QUIC flow control — real backpressure, nothing buffered by
-     * wtquic. */
-    WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED = 2,
-} wtq_receive_pause_mode_t;
+
 
 WTQ_API wtq_receive_pause_mode_t
 wtq_stream_receive_pause_mode(const wtq_stream_t *stream);

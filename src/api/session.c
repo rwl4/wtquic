@@ -41,6 +41,7 @@ struct wtq_stream {
     uint64_t id;
     wtq_estream_t *es;  /* NULL once terminal */
     wtq_session_t *session;
+    wtq_dstream_t *credit_stream;
     void *user;
 };
 
@@ -48,6 +49,11 @@ struct wtq_session {
     uint32_t refs;
     wtq_alloc_t alloc;
     wtq_conn_t *conn;
+    size_t receive_quantum;
+    wtq_receive_pause_mode_t receive_mode;
+    wtq_driver_t *admission_driver;
+    wtq_api_admission_ops_t admission_ops;
+    bool admission_running;
     wtq_session_events_t ev; /* normalized (size-checked) copy */
     void *user;
 
@@ -299,6 +305,10 @@ static struct wtq_stream *stream_acquire(wtq_session_t *s,
             st->id = id;
             st->es = es;
             st->session = s;
+            if (es != NULL && s->admission_driver != NULL) {
+                st->credit_stream = wtq_estream_driver_stream(es);
+                s->admission_ops.lease(s->admission_driver, st->credit_stream, true);
+            }
             /* NOTE: the library's baseline ref does not pin the
              * session — only app-held refs do (wtq_stream_add_ref).
              * Slot memory lives inside the session allocation, and a
@@ -311,10 +321,22 @@ static struct wtq_stream *stream_acquire(wtq_session_t *s,
 }
 
 /* Drop the LIBRARY's baseline ref (no session pin attached). */
+static void stream_credit_release(struct wtq_stream *st)
+{
+    wtq_session_t *s = st->session;
+    if (st->refs == 0 && st->credit_stream != NULL) {
+        wtq_dstream_t *ds = st->credit_stream;
+        st->credit_stream = NULL;
+        if (s->admission_driver != NULL)
+            s->admission_ops.lease(s->admission_driver, ds, false);
+    }
+}
+
 static void stream_slot_release(struct wtq_stream *st)
 {
     if (st->refs > 0)
         st->refs--;
+    stream_credit_release(st);
 }
 
 /* A transient internal ref (no session pin) held across a callback so
@@ -329,6 +351,7 @@ static void stream_drop(struct wtq_stream *st)
 {
     if (st->refs > 0)
         st->refs--;
+    stream_credit_release(st);
 }
 
 /* Terminal: both directions done (or the session/connection ended).
@@ -741,6 +764,85 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
     return WTQ_OK;
 }
 
+wtq_result_t wtq_api_session_create_accounted(const wtq_api_session_cfg_t *cfg,
+                                             wtq_session_t **out)
+{
+    return wtq_api_session_create(cfg, out);
+}
+
+wtq_result_t wtq_api_session_create_admission(const wtq_api_session_cfg_t *cfg,
+    const wtq_api_admission_ops_t *ops, wtq_session_t **out)
+{
+    if (out) *out = NULL;
+    if (!cfg || !cfg->drv || !ops || !out) return WTQ_ERR_INVALID_ARG;
+    if (ops->peer_uni != 8 || ops->peer_bidi != 7 || !ops->service || !ops->lease ||
+        !cfg->ops || !cfg->ops->recv_enable ||
+        !(cfg->ops->caps & WTQ_DCAP_RECV_FLOW_CONTROLLED))
+        return WTQ_ERR_UNSUPPORTED;
+    wtq_result_t rc = wtq_api_session_create(cfg, out);
+    if (rc != WTQ_OK) return rc;
+    wtq_session_t *s = *out;
+    s->admission_driver = cfg->drv;
+    s->admission_ops = *ops;
+    s->receive_mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
+    s->receive_quantum = 65535;
+    wtq_conn_enable_admission(s->conn);
+    return rc;
+}
+
+bool wtq_api_session_admission_root(const wtq_session_t *s)
+{
+    return s && s->cb_depth == 0 && !s->admission_running &&
+        !s->terminal_fired && s->admission_driver != NULL;
+}
+
+void wtq_api_session_admission_detach(wtq_session_t *s)
+{
+    if (!s) return;
+    s->admission_driver = NULL;
+    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; ++i)
+        s->streams[i].credit_stream = NULL;
+}
+
+wtq_result_t wtq_api_session_admit(wtq_session_t *s, wtq_peer_admission_t *peer)
+{
+    if (!s || !peer) return WTQ_ERR_INVALID_ARG;
+    if (!s->admission_running) return WTQ_ERR_STATE;
+    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; ++i) {
+        if (s->streams[i].refs == 0)
+            return wtq_conn_peer_admit(s->conn, peer);
+    }
+    return WTQ_ERR_WOULD_BLOCK;
+}
+
+wtq_result_t wtq_session_service_stream_admission(wtq_session_t *s)
+{
+    if (!s) return WTQ_ERR_INVALID_ARG;
+    if (!s->receive_quantum) return WTQ_ERR_UNSUPPORTED;
+    if (s->terminal_fired || !s->admission_driver) return WTQ_ERR_CLOSED;
+    if (s->cb_depth || s->admission_running) return WTQ_OK;
+    session_ref(s);
+    session_enter(s);
+    s->admission_running = true;
+    wtq_result_t rc = s->admission_ops.service(s->admission_driver);
+    s->admission_running = false;
+    session_exit(s);
+    session_unref(s);
+    return rc;
+}
+
+wtq_result_t wtq_session_receive_contract(const wtq_session_t *s,
+    size_t *max_callback_bytes, wtq_receive_pause_mode_t *pause_mode)
+{
+    if (max_callback_bytes) *max_callback_bytes = 0;
+    if (pause_mode) *pause_mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
+    if (!s || !max_callback_bytes || !pause_mode) return WTQ_ERR_INVALID_ARG;
+    if (!s->receive_quantum) return WTQ_ERR_UNSUPPORTED;
+    *max_callback_bytes = s->receive_quantum;
+    *pause_mode = s->receive_mode;
+    return WTQ_OK;
+}
+
 wtq_result_t wtq_api_session_start(wtq_session_t *s, uint64_t now_us)
 {
     if (s == NULL)
@@ -958,16 +1060,32 @@ static wtq_result_t session_open(wtq_session_t *s, bool bidi,
         return WTQ_ERR_CLOSED;
 
     session_enter(s);
+    struct wtq_stream *reserved = NULL;
+    if (s->admission_driver != NULL) {
+        reserved = stream_acquire(s, NULL, bidi, true, WTQ_STREAM_ID_UNKNOWN);
+        if (!reserved) {
+            session_exit(s);
+            return WTQ_ERR_WOULD_BLOCK;
+        }
+    }
     wtq_estream_t *es = NULL;
     wtq_result_t rc = bidi ? wtq_conn_wt_open_bidi(s->conn, &es)
                            : wtq_conn_wt_open_uni(s->conn, &es);
     if (rc != WTQ_OK) {
+        if (reserved) stream_slot_release(reserved);
+        bool terminal = s->terminal_fired;
         session_exit(s);
-        return rc == WTQ_ERR_STATE && s->terminal_fired ? WTQ_ERR_CLOSED
+        return rc == WTQ_ERR_STATE && terminal ? WTQ_ERR_CLOSED
                                                         : rc;
     }
     struct wtq_stream *st =
-        stream_acquire(s, es, bidi, true, wtq_estream_id(es));
+        reserved ? reserved : stream_acquire(s, es, bidi, true, wtq_estream_id(es));
+    if (reserved) {
+        st->es = es;
+        st->id = wtq_estream_id(es);
+        st->credit_stream = wtq_estream_driver_stream(es);
+        s->admission_ops.lease(s->admission_driver, st->credit_stream, true);
+    }
     if (st == NULL) {
         /* the engine opened both directions; with no public handle,
          * tear DOWN both — reset the send side and stop the receive
@@ -1118,6 +1236,7 @@ void wtq_stream_release(wtq_stream_t *st)
     wtq_session_t *s = st->session;
     st->app_refs--;
     st->refs--;
+    stream_credit_release(st);
     session_unref(s); /* may free the session (and this slot) */
 }
 

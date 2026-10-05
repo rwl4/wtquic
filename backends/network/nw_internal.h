@@ -149,6 +149,8 @@ struct wtq_dstream {
                                 reentrant from a replay callback — can arm a
                                 receive on a finished stream. */
     bool recv_deferred;      /* a completion is held (paused)            */
+    bool recv_delivering;    /* guards synchronous resume from callbacks */
+    size_t recv_deferred_offset;
 #ifdef WTQ_NW_TESTING
     unsigned recv_arm_count; /* TEST: nw_connection_receive arms on THIS
                                 stream (per-stream attribution — no global

@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 /*
  * Accept-registration contract for the MsQuic backend, white-box (this
  * binary compiles the backend sources with WTQ_MSQ_TESTING so it can

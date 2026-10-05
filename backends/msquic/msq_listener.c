@@ -303,7 +303,7 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
         .webtransport_profiles = l->webtransport_profiles,
     };
     wtq_session_t *session = NULL;
-    if (wtq_api_session_create(&scfg, &session) != WTQ_OK || fail_stage == 2) {
+    if (wtq_msq_session_create_bounded(drv, &scfg, &l->env->tuning, &session) != WTQ_OK || fail_stage == 2) {
         if (session != NULL)
             wtq_session_release(session); /* simulated stage-2 failure */
         wtq_msq_conn_free(drv); /* drv->conn unset: no ConnectionClose */

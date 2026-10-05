@@ -147,7 +147,7 @@ wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *env,
         .ops = wtq_msq_driver_ops(),
     };
     wtq_session_t *session = NULL;
-    wtq_result_t rc = wtq_api_session_create(&scfg, &session);
+    wtq_result_t rc = wtq_msq_session_create_bounded(drv, &scfg, &env->tuning, &session);
     if (rc == WTQ_OK)
         rc = wtq_api_session_connect(session, cfg.connect);
     if (rc != WTQ_OK) {
