@@ -38,8 +38,7 @@ if(WTQ_BUILD_NETWORK)
         $<TARGET_OBJECTS:wtq_proto>)
     target_include_directories(test_nw_receive_accounted PRIVATE
         ../src ../include ${PROJECT_BINARY_DIR}/include unit)
-    target_compile_options(test_nw_receive_accounted PRIVATE ${WTQ_WARN_FLAGS}
-        -Wno-nullability-extension -Wno-nullability-completeness)
+    target_compile_options(test_nw_receive_accounted PRIVATE ${WTQ_WARN_FLAGS})
     target_link_libraries(test_nw_receive_accounted PRIVATE
         "-framework Network" "-framework Security" "-framework Foundation")
     add_test(NAME nw_receive_accounted COMMAND test_nw_receive_accounted)
@@ -542,8 +541,7 @@ if(WTQ_MSQUIC_ENABLED)
             ${CMAKE_CURRENT_SOURCE_DIR}/unit
             ${PROJECT_SOURCE_DIR}/backends/network
             ${PROJECT_SOURCE_DIR}/src)
-        target_compile_options(test_nw_loopback PRIVATE ${WTQ_WARN_FLAGS}
-            -Wno-nullability-extension -Wno-nullability-completeness)
+        target_compile_options(test_nw_loopback PRIVATE ${WTQ_WARN_FLAGS})
         add_test(NAME nw_loopback COMMAND test_nw_loopback)
         set_tests_properties(nw_loopback PROPERTIES
             FIXTURES_REQUIRED certs
@@ -564,8 +562,7 @@ if(WTQ_MSQUIC_ENABLED)
         target_include_directories(test_nw_send_matrix PRIVATE
             ${PROJECT_SOURCE_DIR}/backends/network
             ${PROJECT_SOURCE_DIR}/src)
-        target_compile_options(test_nw_send_matrix PRIVATE ${WTQ_WARN_FLAGS}
-            -Wno-nullability-extension -Wno-nullability-completeness)
+        target_compile_options(test_nw_send_matrix PRIVATE ${WTQ_WARN_FLAGS})
         add_test(NAME nw_send_matrix COMMAND test_nw_send_matrix)
         set_tests_properties(nw_send_matrix PROPERTIES
             FIXTURES_REQUIRED certs
@@ -583,8 +580,7 @@ if(WTQ_MSQUIC_ENABLED)
             ${PROJECT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/support
             ${CMAKE_CURRENT_SOURCE_DIR}/unit)
-        target_compile_options(test_nw_lifecycle PRIVATE ${WTQ_WARN_FLAGS}
-            -Wno-nullability-extension -Wno-nullability-completeness)
+        target_compile_options(test_nw_lifecycle PRIVATE ${WTQ_WARN_FLAGS})
         add_test(NAME nw_lifecycle COMMAND test_nw_lifecycle)
         set_tests_properties(nw_lifecycle PROPERTIES
             FIXTURES_REQUIRED certs
@@ -601,8 +597,7 @@ if(WTQ_MSQUIC_ENABLED)
             ${PROJECT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/support
             ${CMAKE_CURRENT_SOURCE_DIR}/unit)
-        target_compile_options(test_nw_create_thread PRIVATE ${WTQ_WARN_FLAGS}
-            -Wno-nullability-extension -Wno-nullability-completeness)
+        target_compile_options(test_nw_create_thread PRIVATE ${WTQ_WARN_FLAGS})
         add_test(NAME nw_create_thread COMMAND test_nw_create_thread)
         set_tests_properties(nw_create_thread PROPERTIES
             FIXTURES_REQUIRED certs
@@ -651,9 +646,7 @@ if(WTQ_MSQUIC_ENABLED)
             set_source_files_properties(
                 ${PROJECT_SOURCE_DIR}/backends/network/nw_send_holder.m
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-            target_compile_options(wtquic-network-shared PRIVATE
-                ${WTQ_WARN_FLAGS} -Wno-nullability-extension
-                -Wno-nullability-completeness)
+            target_compile_options(wtquic-network-shared PRIVATE ${WTQ_WARN_FLAGS})
             set_target_properties(wtquic-network-shared PROPERTIES
                 C_VISIBILITY_PRESET hidden)
             target_link_libraries(test_accounted_link PRIVATE wtquic-network-shared)
@@ -708,8 +701,7 @@ if(WTQ_MSQUIC_ENABLED)
         target_link_libraries(nw_apple_repro PRIVATE
             msquic::msquic Threads::Threads
             "-framework Network" "-framework Security")
-        target_compile_options(nw_apple_repro PRIVATE ${WTQ_WARN_FLAGS}
-            -Wno-nullability-extension -Wno-nullability-completeness)
+        target_compile_options(nw_apple_repro PRIVATE ${WTQ_WARN_FLAGS})
 
         add_test(NAME nw_loopback_gate20 COMMAND test_nw_loopback)
         set_tests_properties(nw_loopback_gate20 PROPERTIES

@@ -55,11 +55,7 @@ target_include_directories(wtquic-network PRIVATE
 )
 set_source_files_properties(nw_send_holder.m PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
-# Blocks are a clang extension on Darwin; the framework headers use
-# nullability annotations the strict-prototype lanes would reject.
-target_compile_options(wtquic-network PRIVATE
-    ${WTQ_WARN_FLAGS} -Wno-nullability-extension
-    -Wno-nullability-completeness)
+target_compile_options(wtquic-network PRIVATE ${WTQ_WARN_FLAGS})
 set_target_properties(wtquic-network PROPERTIES
     C_VISIBILITY_PRESET hidden
     POSITION_INDEPENDENT_CODE ON
@@ -90,9 +86,7 @@ if(WTQ_BUILD_TESTS)
     target_include_directories(wtquic-network-testing PRIVATE
         ${PROJECT_SOURCE_DIR}/src
     )
-    target_compile_options(wtquic-network-testing PRIVATE
-        ${WTQ_WARN_FLAGS} -Wno-nullability-extension
-        -Wno-nullability-completeness)
+    target_compile_options(wtquic-network-testing PRIVATE ${WTQ_WARN_FLAGS})
     set_target_properties(wtquic-network-testing PROPERTIES
         C_VISIBILITY_PRESET hidden
         POSITION_INDEPENDENT_CODE ON
