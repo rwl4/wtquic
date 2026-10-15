@@ -1,5 +1,59 @@
 # Compatibility note
 
+## Passive local reliable flush (unreleased)
+
+`wtq_session_local_flush_mode` qualifies the evidence available to
+`wtq_session_local_flush`. Both queries run in the existing session
+serialization domain and perform no allocation, transport call, protocol work,
+callback dispatch or wait. The observation covers presently required accepted reliable
+bytes and FIN, including stream prefaces and this connection's CONNECT,
+capsules and H3/QPACK output. Datagrams are excluded. The engine supports one
+WT session per connection; this is not a multi-session connection-wide fence.
+
+The default MsQuic tuning disables send buffering. In that mode the capability
+is ACKNOWLEDGED: successful byte completion provides ACK evidence, and FIN
+remains pending separately until graceful send shutdown completes. This may
+wait longer than local transmission and does not prove application consumption.
+An explicit `send_buffering=true` override remains supported for transport use,
+but the flush capability is UNSUPPORTED: returning a provider buffer alone
+cannot prove transmission of an open stream. No tuning is silently changed.
+Network.framework is also UNSUPPORTED: its send completion may mean only
+enqueued content, and its public QUIC API exposes no equivalent byte/FIN
+transmission frontier. Queue accounting alone is not a qualified substitute.
+
+An explicitly accepted application send cancellation, or lawful peer STOP of
+an ordinary WT data stream, may supersede that generation's remaining payload
+and FIN intent. Its retained borrows, deferred submissions and abort-completion
+ownership must settle before OK. An in-flight shutdown decision stays pending,
+including reentrant callbacks before its return. Refused cancellation withdraws
+nothing; partial failure cannot become successful settlement. Receive-only
+abort cannot settle outgoing work. Internal error/teardown and critical
+CONNECT/H3/QPACK loss are not authorized by an abort flag alone.
+
+This is cancellation settlement, not delivery of the withdrawn bytes, FIN or
+RESET packet. ACK evidence applies to non-superseded output. Unexpected loss,
+unexplained cancellation and retirement without evidence remain sticky;
+intentional reset cannot clear loss recorded earlier or on another stream.
+No loss-clear operation is introduced, and canceled output never earns N23's
+send-commit event.
+
+The result is BACKEND after unexpected accepted-output loss, including
+on a retained terminal handle, otherwise CLOSED at terminal, STATE before
+establishment, UNSUPPORTED without capability, WOULD_BLOCK while output remains,
+or OK. Loss is stored in the session at the event, before callbacks, independently
+of whether any consumer queried it. Retirement and zero pending work never
+erase it, and retained terminal queries never consult the provider. Rejected
+submissions add no obligation, and receive-only cancellation does not discard
+outgoing work. This query is distinct from the opt-in per-stream send-commit
+event and from session draining or closing; it does not change either contract.
+
+A managed caller outside callbacks must try its own lane guard without waiting
+and read no WT state if entry fails. Inside callbacks that domain is already
+held; do not relock a nonrecursive guard. Compose upper-layer queues under the
+same fence, stop or serialize further submissions, and retain the session
+through entry/query/leave. A later accepted submission immediately invalidates
+an earlier OK. No new wire behavior is introduced.
+
 ## Accounted receive input (unreleased)
 
 The built-in MsQuic and Network backends now use the additive, uninstalled

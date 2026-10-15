@@ -34,6 +34,13 @@ for SLICE in device sim; do
 
     echo "== $PRESET: archive architecture + symbol surface"
     LIB="$PREFIX/lib/libwtquic-network.a"
+    CORE_NM="$(nm -gU "$PREFIX/lib/libwtquic.a")"
+    grep -q 'T _wtq_session_local_flush$' <<< "$CORE_NM" || {
+        echo "FAIL: $SLICE core archive missing local flush query"; exit 1; }
+    grep -q 'T _wtq_session_local_flush_mode$' <<< "$CORE_NM" || {
+        echo "FAIL: $SLICE core archive missing local flush capability"; exit 1; }
+    grep -q 'T _wtq_session_connect_request_metadata$' <<< "$CORE_NM" || {
+        echo "FAIL: $SLICE core archive missing CONNECT metadata query"; exit 1; }
     test -f "$LIB"
     lipo -archs "$LIB" | grep -q arm64
     NM="$(nm -gU "$LIB")"

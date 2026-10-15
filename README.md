@@ -30,6 +30,18 @@ faults, fuzzing, allocation-failure sweeps, real-loopback tests). The
 Network.framework client backend carries its own lifecycle, loopback
 (against a real MsQuic server), send-matrix, and sanitizer suites.
 
+Unreleased passive reliable-output queries are declared in `session.h`:
+`wtq_session_local_flush_mode` and `wtq_session_local_flush`. They observe
+presently required accepted reliable bytes and FIN without pumping, allocating or
+waiting. Default unbuffered MsQuic provides conservative ACK evidence;
+buffered MsQuic and Network.framework report UNSUPPORTED. Pending output,
+unexpected output loss and terminal closure are distinct results. Deliberate
+ordinary-stream cancellation may supersede payload intent only after ownership
+settles; it does not prove delivery and cannot clear earlier loss. Use the
+existing serialization domain and compose application queues under the same
+fence; an OK result does not prove peer application consumption. See the
+unreleased compatibility note for the complete contract and backend limits.
+
 ## WebTransport profiles
 
 wtquic speaks three WebTransport-over-HTTP/3 wire profiles. A **client**

@@ -12,6 +12,7 @@
 #include "../proto/h3_err.h"
 #include "../proto/h3_frame.h"
 #include "../proto/preamble.h"
+#include "../proto/qpack_static.h"
 #include "../proto/varint.h"
 
 /*
@@ -31,7 +32,7 @@ enum {
     ES_TYPE,     /* uni: reading the stream-type varint / WT preamble */
     ES_BTYPE,    /* bidi: WT preamble vs H3 request classification */
     ES_CONTROL,  /* the peer's H3 control stream */
-    ES_QPACK,    /* peer QPACK encoder/decoder stream: bytes ignored */
+    ES_QPACK,    /* peer QPACK stream: validate zero-capacity instructions */
     ES_DRAIN,    /* unknown type or rejected WT stream: bytes discarded */
     ES_CONNECT,  /* client: our CONNECT stream (reads the response) */
     ES_REQUEST,  /* server: a peer request stream */
@@ -74,6 +75,9 @@ struct wtq_estream {
     bool wt_bidi;      /* ES_WT: has both directions */
     bool wt_local;     /* ES_WT: we opened it */
     bool wt_send_open; /* ES_WT: our send side still usable */
+    bool wt_send_commit;
+    bool wt_fin_pending;
+    bool wt_application_sent;
     bool wt_recv_open; /* ES_WT: peer's send side still open */
     bool wt_recv_drain; /* ES_WT: locally stopped — absorb late bytes
                            quietly until the peer's FIN/RESET lands */
@@ -143,6 +147,8 @@ struct wtq_conn {
     bool wt_supported;
     bool max_push_id_seen;      /* server: MAX_PUSH_ID monotonicity */
     uint64_t max_push_id;
+    bool goaway_received;
+    uint64_t goaway_id;
     wtq_h3_settings_t peer_settings;
 
     bool closed;
@@ -190,7 +196,7 @@ struct wtq_conn {
     size_t path_count;
     char req_path[256];
     size_t req_path_len;
-    char req_auth[256];
+    char req_auth[WTQ_CONN_SETTINGS_CAP];
     size_t req_auth_len;
 
     /* server: one completed CONNECT parked until the client's SETTINGS
@@ -669,6 +675,18 @@ static void session_failed(wtq_conn_t *conn,
         conn->cb.on_session_failed(conn, reason, conn->cb.ctx);
 }
 
+static void session_draining(wtq_conn_t *conn)
+{
+    if (conn->closed || conn->drain_rx ||
+        (conn->sess_state != SS_ESTABLISHED && conn->sess_state != SS_DRAINING))
+        return;
+    conn->drain_rx = true;
+    if (conn->sess_state == SS_ESTABLISHED)
+        conn->sess_state = SS_DRAINING;
+    if (conn->cb.on_session_draining != NULL)
+        conn->cb.on_session_draining(conn, conn->cb.ctx);
+}
+
 static void session_established(wtq_conn_t *conn, struct wtq_estream *es,
                                 const char *sel, size_t sel_len)
 {
@@ -706,6 +724,8 @@ static void session_established(wtq_conn_t *conn, struct wtq_estream *es,
         conn->cb.on_session_established(conn, conn->selected,
                                         conn->selected_len, conn->wt_profile,
                                         conn->cb.ctx);
+    if (conn->goaway_received)
+        session_draining(conn);
 }
 
 /*
@@ -728,8 +748,8 @@ static void session_closed(wtq_conn_t *conn, uint32_t code,
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind != ES_WT)
             continue;
-        if (!conn->closed && (es->wt_send_open || es->wt_recv_open))
-            shutdown_raw(conn, es->ds, es->wt_send_open,
+        if (!conn->closed && (es->wt_send_open || es->wt_fin_pending || es->wt_recv_open))
+            shutdown_raw(conn, es->ds, es->wt_send_open || es->wt_fin_pending,
                          es->wt_recv_open, WTQ_WT_SESSION_GONE);
         /* Never force-free: the backend may still deliver in-flight
          * bytes against this ectx, and the slot must not be reused
@@ -737,6 +757,7 @@ static void session_closed(wtq_conn_t *conn, uint32_t code,
          * sides draining until the peer's FIN/RESET lands (the same
          * discipline as wt_stop). */
         es->wt_send_open = false;
+        es->wt_fin_pending = false;
         if (es->wt_recv_open) {
             es->wt_recv_open = false;
             es->wt_recv_drain = true;
@@ -756,6 +777,11 @@ static void session_closed(wtq_conn_t *conn, uint32_t code,
 static void client_send_connect(wtq_conn_t *conn)
 {
     struct wtq_estream *es = NULL;
+
+    if (conn->goaway_received) {
+        session_failed(conn, WTQ_SESSION_FAIL_CONNECTION);
+        return;
+    }
 
     size_t first = conn->admission_enabled ? 3u : 0u;
     size_t end = conn->admission_enabled ? 4u : WTQ_CONN_MAX_PEER_UNI;
@@ -1267,8 +1293,33 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                     conn->max_push_id_seen = true;
                     conn->max_push_id = v;
                 }
-                /* GOAWAY: layout validated; semantics deferred to the
-                 * session layer. */
+                if (es->frame_type == WTQ_H3_FRAME_GOAWAY) {
+                    /* RFC 9114 ss5.2,7.2.6: the server sends a request
+                     * stream ID; either peer can only lower its limit. */
+                    if ((conn->persp == WTQ_PERSPECTIVE_CLIENT && (v & 3)) ||
+                        (conn->goaway_received && v > conn->goaway_id)) {
+                        conn_fatal(conn, WTQ_H3_ID_ERROR);
+                        return;
+                    }
+                    conn->goaway_received = true;
+                    conn->goaway_id = v;
+                    if (conn->persp == WTQ_PERSPECTIVE_CLIENT &&
+                        conn->sess_state == SS_SENT) {
+                        for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+                            struct wtq_estream *req = &conn->peer[i];
+                            if (req->kind == ES_CONNECT &&
+                                !req->native_id_pending && req->id >= v) {
+                                req->request_dead = true;
+                                session_failed(conn, WTQ_SESSION_FAIL_CONNECTION);
+                                if (!conn->closed)
+                                    shutdown_raw(conn, req->ds, true, true,
+                                                 WTQ_H3_REQUEST_REJECTED);
+                                break;
+                            }
+                        }
+                    }
+                    session_draining(conn);
+                }
             } else if (es->frame_kind == CF_SETTINGS) {
                 wtq_h3_settings_t s;
                 wtq_h3_settings_status_t st = wtq_h3_settings_decode(
@@ -1341,6 +1392,38 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                     }
                 }
             }
+        }
+    }
+}
+
+/* RFC 9204 s3.2.3 forbids encoder instructions when maximum capacity is zero.
+ * Reject them with the encoder-stream error as this receiver's policy.
+ * Our encoder never inserts/references dynamic entries,
+ * so decoder acknowledgments/increments are errors; cancellations are
+ * harmless but their prefixed integer must be parsed across deliveries. */
+static void qpack_bytes(wtq_conn_t *conn, struct wtq_estream *es,
+                        const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (es->qpack_type == 0x02) {
+            conn_fatal(conn, WTQ_QPACK_ENCODER_STREAM_ERROR);
+            return;
+        }
+        if ((es->set_fill == 0 && (data[i] & 0xc0) != 0x40) ||
+            es->set_fill == 11) {
+            conn_fatal(conn, WTQ_QPACK_DECODER_STREAM_ERROR);
+            return;
+        }
+        es->set_buf[es->set_fill++] = data[i];
+        uint64_t id = 0;
+        size_t consumed = 0;
+        wtq_qpack_status_t st = wtq_qpack_int_decode(
+            es->set_buf, es->set_fill, 6, &id, &consumed);
+        if (st == WTQ_QPACK_OK) {
+            es->set_fill = 0;
+        } else if (st != WTQ_QPACK_NEED_MORE) {
+            conn_fatal(conn, WTQ_QPACK_DECODER_STREAM_ERROR);
+            return;
         }
     }
 }
@@ -1423,7 +1506,7 @@ static void estream_release(wtq_conn_t *conn, struct wtq_estream *es)
  * answered. */
 static void wt_release_if_done(wtq_conn_t *conn, struct wtq_estream *es)
 {
-    if (es->kind == ES_WT && !es->wt_send_open && !es->wt_recv_open &&
+    if (es->kind == ES_WT && !es->wt_send_open && !es->wt_fin_pending && !es->wt_recv_open &&
         !es->wt_recv_drain)
         estream_release(conn, es);
 }
@@ -1642,7 +1725,9 @@ static wtq_result_t stream_bytes(wtq_conn_t *conn, wtq_estream_t *es,
 
     if (!conn->closed && es->kind == ES_CONTROL && off < len)
         control_bytes(conn, es, data + off, len - off);
-    /* ES_QPACK / ES_DRAIN / still-ES_TYPE: bytes consumed and ignored */
+    if (!conn->closed && es->kind == ES_QPACK && off < len)
+        qpack_bytes(conn, es, data + off, len - off);
+    /* ES_DRAIN / still-ES_TYPE: bytes consumed and ignored */
 
     if (conn->closed)
         return WTQ_ERR_PROTO;
@@ -1721,9 +1806,10 @@ wtq_result_t wtq_conn_on_stream_terminal(wtq_conn_t *conn,
          * (never a forged reset/stop). A stream whose halves all
          * closed through normal events (a local abort, delivered
          * FIN/reset) sees no callback: only the drain resolves. */
-        bool live = es->wt_send_open || es->wt_recv_open;
+        bool live = es->wt_send_open || es->wt_fin_pending || es->wt_recv_open;
         es->wt_recv_drain = false;
         es->wt_send_open = false;
+        es->wt_fin_pending = false;
         es->wt_recv_open = false;
         if (live && conn->cb.on_wt_stream_terminal != NULL)
             conn->cb.on_wt_stream_terminal(conn, es, conn->cb.ctx);
@@ -1934,7 +2020,7 @@ static void server_send_response(wtq_conn_t *conn, wtq_dstream_t *ds,
     (void)wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, slen, hdr,
                                      sizeof(hdr), &hl);
     if (conn->ops.send(conn->drv, ds, hdr, hl, false) != WTQ_OK ||
-        conn->ops.send(conn->drv, ds, section, slen, false) != WTQ_OK)
+        conn->ops.send(conn->drv, ds, section, slen, status >= 300) != WTQ_OK)
         conn_fatal(conn, WTQ_H3_INTERNAL_ERROR);
 }
 
@@ -1950,6 +2036,13 @@ static void client_maybe_establish(wtq_conn_t *conn, struct wtq_estream *es)
     if (conn->sess_state != SS_SENT || !conn->client_response_ok ||
         es->native_id_pending)
         return;
+    if (conn->goaway_received && es->id >= conn->goaway_id) {
+        es->request_dead = true;
+        session_failed(conn, WTQ_SESSION_FAIL_CONNECTION);
+        if (!conn->closed)
+            shutdown_raw(conn, es->ds, true, true, WTQ_H3_REQUEST_REJECTED);
+        return;
+    }
     const char *sel = "";
     size_t sel_len = 0;
     if (conn->client_selected_offer >= 0) {
@@ -1970,7 +2063,21 @@ static void client_response_done(wtq_conn_t *conn, struct wtq_estream *es)
 
     if (st != WTQ_CONNECT_OK) {
         session_failed(conn, WTQ_SESSION_FAIL_BAD_RESPONSE);
-        conn_fatal(conn, WTQ_H3_MESSAGE_ERROR);
+        conn_fatal(conn, st == WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED
+                             ? WTQ_QPACK_DECOMPRESSION_FAILED
+                             : WTQ_H3_MESSAGE_ERROR);
+        return;
+    }
+
+    if (resp.status < 200) {
+        if (resp.status == 101) {
+            session_failed(conn, WTQ_SESSION_FAIL_BAD_RESPONSE);
+            conn_fatal(conn, WTQ_H3_MESSAGE_ERROR);
+        } else {
+            /* Informational HEADERS do not consume the final response
+             * slot. DATA remains forbidden until a final HEADERS. */
+            es->headers_done = false;
+        }
         return;
     }
 
@@ -2092,7 +2199,9 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
     wtq_connect_req_t req;
     wtq_sf_str_t offered[WTQ_CONN_MAX_OFFERED];
     size_t offered_count = 0;
-    char scratch[512];
+    /* The decoded (including Huffman) bound, not just the HEADERS bound,
+     * guarantees a successful nonempty authority fits req_auth. */
+    char scratch[WTQ_CONN_SETTINGS_CAP];
 
     /*
      * RAW PARK GATE — ahead of every profile-specific decode or token
@@ -2156,6 +2265,10 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
          * limit (field count or scratch). Same stream-local treatment
          * as an oversized HEADERS frame. */
         request_stream_refuse_err(conn, es, WTQ_H3_EXCESSIVE_LOAD);
+        return;
+    }
+    if (st == WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED) {
+        conn_fatal(conn, WTQ_QPACK_DECOMPRESSION_FAILED);
         return;
     }
     if (st != WTQ_CONNECT_OK) {
@@ -2252,15 +2365,16 @@ static void server_request_done(wtq_conn_t *conn, struct wtq_estream *es)
         return;
     }
 
-    /* Accept. */
-    if (req.path_len <= sizeof(conn->req_path)) {
-        memcpy(conn->req_path, req.path, req.path_len);
-        conn->req_path_len = req.path_len;
+    /* Publish the exact accepted request before any 200 or callback. */
+    if (req.path_len > sizeof(conn->req_path) ||
+        req.authority_len > sizeof(conn->req_auth)) {
+        conn_fatal(conn, WTQ_H3_INTERNAL_ERROR);
+        return;
     }
-    if (req.authority_len <= sizeof(conn->req_auth)) {
-        memcpy(conn->req_auth, req.authority, req.authority_len);
-        conn->req_auth_len = req.authority_len;
-    }
+    memcpy(conn->req_path, req.path, req.path_len);
+    conn->req_path_len = req.path_len;
+    memcpy(conn->req_auth, req.authority, req.authority_len);
+    conn->req_auth_len = req.authority_len;
     server_send_response(conn, es->ds, 200, selected);
     if (!conn->closed)
         session_established(conn, es, selected ? selected->data : "",
@@ -2350,13 +2464,7 @@ static void session_capsule_bytes(wtq_conn_t *conn,
             }
             break;
         case WTQ_CAPSULE_KIND_DRAIN:
-            if (!conn->drain_rx) {
-                conn->drain_rx = true;
-                if (conn->sess_state == SS_ESTABLISHED)
-                    conn->sess_state = SS_DRAINING;
-                if (conn->cb.on_session_draining != NULL)
-                    conn->cb.on_session_draining(conn, conn->cb.ctx);
-            }
+            session_draining(conn);
             break;
         default:
             break; /* unknown capsules: payload already skipped */
@@ -2489,6 +2597,10 @@ static void request_stream_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                                                       scratch,
                                                       sizeof(scratch));
                     es->set_fill = 0;
+                    if (tst == WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED) {
+                        conn_fatal(conn, WTQ_QPACK_DECOMPRESSION_FAILED);
+                        return;
+                    }
                     if (tst == WTQ_CONNECT_BUFFER) {
                         request_stream_fail(conn, es,
                                             WTQ_H3_EXCESSIVE_LOAD);
@@ -2596,7 +2708,7 @@ wtq_result_t wtq_conn_client_connect(wtq_conn_t *conn,
             return WTQ_ERR_INVALID_ARG;
     if (conn->persp != WTQ_PERSPECTIVE_CLIENT)
         return WTQ_ERR_STATE;
-    if (conn->closed || conn->sess_state != SS_IDLE)
+    if (conn->closed || conn->sess_state != SS_IDLE || conn->goaway_received)
         return WTQ_ERR_STATE;
     if (cfg->webtransport_profile != WTQ_H3_WT_PROFILE_CURRENT &&
         cfg->webtransport_profile != WTQ_H3_WT_PROFILE_D13_14_COMPAT &&
@@ -3026,6 +3138,19 @@ wtq_result_t wtq_conn_wt_open_bidi(wtq_conn_t *conn,
     return wt_open(conn, true, es_out);
 }
 
+wtq_result_t wtq_conn_wt_enable_send_commit(wtq_conn_t *conn, wtq_estream_t *es)
+{
+    if (conn == NULL || es == NULL)
+        return WTQ_ERR_INVALID_ARG;
+    if (conn->closed || !session_active(conn) || es->kind != ES_WT ||
+        !es->wt_local || es->wt_bidi || !es->wt_send_open || es->wt_application_sent)
+        return WTQ_ERR_STATE;
+    if (!(conn->ops.caps & WTQ_DCAP_SEND_COMMIT_ACK_FIN))
+        return WTQ_ERR_UNSUPPORTED;
+    es->wt_send_commit = true;
+    return WTQ_OK;
+}
+
 wtq_result_t wtq_conn_wt_send(wtq_conn_t *conn, wtq_estream_t *es,
                               const wtq_span_t *spans, size_t count,
                               bool fin, void *cookie)
@@ -3052,17 +3177,24 @@ wtq_result_t wtq_conn_wt_send(wtq_conn_t *conn, wtq_estream_t *es,
             return WTQ_ERR_TOO_LARGE;
         total += spans[i].len;
     }
-    wtq_result_t rc = conn->ops.send_gather(conn->drv, es->ds, spans,
+    uint64_t generation = es->generation;
+    wtq_dstream_t *ds = es->ds;
+    wtq_result_t rc = conn->ops.send_gather(conn->drv, ds, spans,
                                             count, fin, cookie);
-    if (rc == WTQ_OK && fin) {
-        es->wt_send_open = false;
-        wt_release_if_done(conn, es);
+    if (rc == WTQ_OK && es->generation == generation &&
+        es->ds == ds && es->kind == ES_WT) {
+        es->wt_application_sent = true;
+        if (fin) {
+            es->wt_send_open = false;
+            es->wt_fin_pending = es->wt_send_commit;
+            wt_release_if_done(conn, es);
+        }
     }
     return rc;
 }
 
-wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
-                                  const wtq_shutdown_t *req)
+static wtq_result_t wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
+                                const wtq_shutdown_t *req, bool app_intent)
 {
     if (conn == NULL || es == NULL || req == NULL)
         return WTQ_ERR_INVALID_ARG;
@@ -3078,14 +3210,14 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
     if (req->mode == WTQ_SHUTDOWN_WHOLE_STREAM) {
         if (req->send_err != req->recv_err)
             return WTQ_ERR_INVALID_ARG; /* whole means ONE code */
-        eff.abort_send = es->wt_send_open;
+        eff.abort_send = es->wt_send_open || es->wt_fin_pending;
         eff.abort_recv = es->wt_recv_open;
         if (!eff.abort_send && !eff.abort_recv)
             return WTQ_ERR_STATE; /* nothing open to abort */
     } else {
         if (!req->abort_send && !req->abort_recv)
             return WTQ_ERR_INVALID_ARG;
-        if (req->abort_send && !es->wt_send_open)
+        if (req->abort_send && !es->wt_send_open && !es->wt_fin_pending)
             return WTQ_ERR_STATE;
         if (req->abort_recv && !es->wt_recv_open)
             return WTQ_ERR_STATE;
@@ -3125,7 +3257,10 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
         }
     }
 
-    wtq_result_t rc = conn->ops.shutdown_stream(conn->drv, es->ds, &eff);
+    eff.app_send_cancel = app_intent && eff.abort_send;
+    uint64_t generation = es->generation;
+    wtq_dstream_t *ds = es->ds;
+    wtq_result_t rc = conn->ops.shutdown_stream(conn->drv, ds, &eff);
     if (rc == WTQ_ERR_CLOSED)
         return rc; /* transport already dead; no state change (as before) */
     if (rc != WTQ_OK) {
@@ -3134,8 +3269,13 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
         conn_fatal(conn, WTQ_H3_INTERNAL_ERROR);
         return WTQ_ERR_BACKEND;
     }
-    if (eff.abort_send)
+    /* Inline application callbacks may release and reuse this engine slot. */
+    if (es->generation != generation || es->ds != ds || es->kind != ES_WT)
+        return WTQ_OK;
+    if (eff.abort_send) {
         es->wt_send_open = false;
+        es->wt_fin_pending = false;
+    }
     if (eff.abort_recv) {
         /* the receive side closes exactly once; the estream survives
          * (in drain) to absorb in-flight bytes until the peer's
@@ -3145,6 +3285,12 @@ wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
     }
     wt_release_if_done(conn, es);
     return WTQ_OK;
+}
+
+wtq_result_t wtq_conn_wt_shutdown(wtq_conn_t *conn, wtq_estream_t *es,
+                                  const wtq_shutdown_t *req)
+{
+    return wt_shutdown(conn, es, req, true);
 }
 
 /*
@@ -3217,7 +3363,7 @@ void wtq_conn_wt_reject(wtq_conn_t *conn, wtq_estream_t *es)
                            .send_err = WTQ_WT_BUFFERED_STREAM_REJECTED,
                            .recv_err = WTQ_WT_BUFFERED_STREAM_REJECTED };
     es->user = NULL;
-    (void)wtq_conn_wt_shutdown(conn, es, &req);
+    (void)wt_shutdown(conn, es, &req, false);
 }
 
 wtq_result_t wtq_conn_wt_recv_enable(wtq_conn_t *conn, wtq_estream_t *es,
@@ -3338,6 +3484,40 @@ void wtq_conn_on_stream_native_id(wtq_conn_t *conn, wtq_estream_t *es,
         client_maybe_establish(conn, es);
 }
 
+uint64_t wtq_estream_generation_v1(const wtq_estream_t *es)
+{
+    return es != NULL ? es->generation : 0;
+}
+
+bool wtq_estream_is_wt_data_v1(const wtq_estream_t *es,
+                              const wtq_dstream_t *ds)
+{
+    return es != NULL && ds != NULL && es->kind == ES_WT && es->ds == ds;
+}
+
+void wtq_conn_on_stream_send_shutdown_v1(wtq_conn_t *conn,
+    wtq_estream_t *es, wtq_dstream_t *ds, uint64_t generation, bool graceful)
+{
+    if (conn == NULL || conn->closed || !session_active(conn) ||
+        es == NULL || ds == NULL || generation == 0)
+        return;
+    bool owned = false;
+    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; ++i)
+        if (es == &conn->peer[i]) owned = true;
+    if (!owned || es->kind != ES_WT || es->ds != ds ||
+        es->generation != generation || !es->wt_send_commit ||
+        !es->wt_local || es->wt_bidi || (graceful && !es->wt_fin_pending))
+        return;
+    es->wt_fin_pending = false; /* resolve before reentrant application code */
+    es->wt_send_open = false;
+    if (graceful && conn->cb.on_wt_stream_send_committed != NULL)
+        conn->cb.on_wt_stream_send_committed(conn, es, conn->cb.ctx);
+    else if (!graceful && conn->cb.on_wt_stream_terminal != NULL)
+        conn->cb.on_wt_stream_terminal(conn, es, conn->cb.ctx);
+    if (es->generation == generation)
+        wt_release_if_done(conn, es);
+}
+
 void wtq_conn_on_send_complete(wtq_conn_t *conn, void *cookie,
                                bool canceled)
 {
@@ -3383,10 +3563,18 @@ wtq_result_t wtq_conn_on_stop_sending(wtq_conn_t *conn, wtq_estream_t *es,
     }
     if (es->kind == ES_WT) {
         uint32_t app = 0;
+        uint64_t generation = es->generation;
+        bool commit_mode = es->wt_send_commit;
         (void)wtq_h3_error_to_app(quic_err, &app);
-        /* the stream stays usable until FIN/reset */
+        /* Legacy streams stay usable; opted-in streams resolve without commit. */
+        if (commit_mode) {
+            es->wt_send_open = false;
+            es->wt_fin_pending = false;
+        }
         if (conn->cb.on_wt_stream_stop != NULL)
             conn->cb.on_wt_stream_stop(conn, es, app, conn->cb.ctx);
+        if (commit_mode && es->generation == generation)
+            wt_release_if_done(conn, es);
     }
     /* non-WT streams: nothing to surface in this layer yet */
     return WTQ_OK;
@@ -3470,13 +3658,13 @@ wtq_result_t wtq_conn_on_datagram(wtq_conn_t *conn, const uint8_t *data,
     /* Slow path: decode the varint (non-minimal encodings of our qsid
      * are still ours; RFC 9000 varints don't require minimal form). A
      * payload too short to carry the quarter-stream-id varint is a
-     * connection error (RFC 9297 s2.1). Note any decoded qsid maps to
-     * qsid*4 — always a client-initiated bidi id, so the s4 session-id
-     * validity rule cannot trip on datagrams. */
+     * connection error (RFC 9297 s2.1). The decoded quarter ID must fit
+     * a 62-bit QUIC stream ID after multiplication by four. */
     uint64_t qsid = 0;
     size_t c = 0;
     if (len == 0 ||
-        wtq_varint_decode(data, len, &qsid, &c) != WTQ_VARINT_OK) {
+        wtq_varint_decode(data, len, &qsid, &c) != WTQ_VARINT_OK ||
+        qsid > ((UINT64_C(1) << 60) - 1)) {
         conn_fatal(conn, WTQ_H3_DATAGRAM_ERROR);
         return WTQ_ERR_PROTO;
     }

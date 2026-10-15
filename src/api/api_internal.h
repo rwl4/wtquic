@@ -165,6 +165,17 @@ WTQ_SPI wtq_result_t wtq_api_session_admit(wtq_session_t *session,
     wtq_peer_admission_t *peer);
 WTQ_SPI void wtq_api_session_admission_detach(wtq_session_t *session);
 
+/* Register once before establishment. The backend's probe only reads state
+ * already serialized with this session; it must not allocate, call provider
+ * APIs, dispatch callbacks or advance work. ctx outlives all nonterminal
+ * observations. Retained terminal handles never invoke it. */
+WTQ_SPI wtq_result_t wtq_api_session_set_local_flush(wtq_session_t *session,
+    wtq_local_flush_mode_t mode, wtq_result_t (*probe)(const void *ctx),
+    const void *ctx);
+/* Event-side loss notification, before application callbacks/retirement.
+ * Sticky in session-owned storage; never requires an earlier consumer query. */
+WTQ_SPI void wtq_api_session_local_flush_failed(wtq_session_t *session);
+
 #ifdef __cplusplus
 }
 #endif

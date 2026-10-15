@@ -67,7 +67,9 @@ static int requests_and_wt(unsigned row)
     len = build_headers(request, sizeof(request), fields, 4);
     uint64_t refusal = 0;
     if (row == 1) {
-        static const uint8_t malformed[] = { 1, 3, 0, 0, 0x81 };
+        /* Valid static QPACK, invalid request (:status): keep this a
+         * stream-local HTTP error so later admissions remain meaningful. */
+        static const uint8_t malformed[] = { 1, 3, 0, 0, 0xd9 };
         memcpy(request, malformed, sizeof(malformed));
         len = sizeof(malformed);
         refusal = WTQ_H3_MESSAGE_ERROR;

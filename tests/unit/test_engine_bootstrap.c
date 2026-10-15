@@ -730,9 +730,76 @@ static void test_qpack_critical_streams(int *fp)
     *fp += failures;
 }
 
+static void test_qpack_instruction_validation(int *fp)
+{
+    int failures = 0;
+    static const struct {
+        uint8_t data[14];
+        size_t len;
+        uint64_t error;
+    } cases[] = {
+        { { 2 }, 1, 0 },           /* empty encoder stream */
+        { { 2, 0x20 }, 2, 0x201 }, /* no instructions at capacity zero */
+        { { 2, 0x21 }, 2, 0x201 },  /* capacity exceeds SETTINGS */
+        { { 2, 0x40 }, 2, 0x201 },  /* insert cannot fit capacity zero */
+        { { 2, 0xc0 }, 2, 0x201 },
+        { { 2, 0x00 }, 2, 0x201 },  /* duplicate: table is empty */
+        { { 3, 0x40, 0x7f, 0x81, 0x00, 0x40 }, 6, 0 }, /* cancels */
+        { { 3, 0x80 }, 2, 0x202 },  /* ack: no dynamic references */
+        { { 3, 0x00 }, 2, 0x202 },  /* increment zero */
+        { { 3, 0x01 }, 2, 0x202 },  /* increment beyond sent entries */
+        { { 3, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff,
+                      0xff, 0xff, 0xff, 0xff, 0x7f }, 12, 0x202 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (size_t chunk = 1; chunk <= cases[i].len; chunk++) {
+            rig_t r;
+            rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+            wtq_estream_t *es = open_peer(&r, 3, fp);
+            feed(&r, es, cases[i].data, cases[i].len, chunk, false);
+            WTQ_TEST_CHECK(wtq_conn_is_closed(r.conn) == (cases[i].error != 0));
+            if (cases[i].error)
+                WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), cases[i].error);
+            rig_down(&r);
+        }
+    }
+    *fp += failures;
+}
+
+static void test_goaway_validation(int *fp)
+{
+    int failures = 0;
+    static const uint8_t bad_ids[] = { 1, 2, 3 };
+    for (size_t i = 0; i < sizeof(bad_ids); i++) {
+        rig_t r;
+        uint8_t peer[128];
+        rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+        size_t n = build_peer_control(peer, sizeof(peer), true, false);
+        peer[n++] = 7; peer[n++] = 1; peer[n++] = bad_ids[i];
+        feed(&r, open_peer(&r, 3, fp), peer, n, 1, false);
+        WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), WTQ_H3_ID_ERROR);
+        rig_down(&r);
+    }
+    for (int client = 0; client < 2; client++) {
+        rig_t r;
+        uint8_t peer[128];
+        rig_up(&r, client ? WTQ_PERSPECTIVE_CLIENT : WTQ_PERSPECTIVE_SERVER, fp);
+        size_t n = build_peer_control(peer, sizeof(peer), true, false);
+        peer[n++] = 7; peer[n++] = 1; peer[n++] = 0;
+        peer[n++] = 7; peer[n++] = 1; peer[n++] = 4;
+        feed(&r, open_peer(&r, client ? 3 : 2, fp), peer, n, 1, false);
+        WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), WTQ_H3_ID_ERROR);
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
+
+    test_qpack_instruction_validation(&failures);
+    test_goaway_validation(&failures);
 
     test_bootstrap_happy(&failures);
     test_split_settings(&failures);

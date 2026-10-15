@@ -326,14 +326,14 @@ static void test_request_rejects(int *fp)
                                                   sizeof(scratch)) ==
                        WTQ_CONNECT_MALFORMED);
     }
-    /* qpack-level malformed propagates */
+    /* QPACK failure is distinct from HTTP message syntax errors. */
     {
         const uint8_t bad[] = { 0x00, 0x00, 0x81 };
         WTQ_TEST_CHECK(wtq_connect_decode_request(bad, sizeof(bad),
                                                   &STRICT, &req, protos, 4,
                                                   &nproto, scratch,
                                                   sizeof(scratch)) ==
-                       WTQ_CONNECT_MALFORMED);
+                       WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED);
     }
 
     *fp += failures;
@@ -1099,6 +1099,169 @@ static void test_encode_protocol_token(int *fp)
     *fp += failures;
 }
 
+static void test_qpack_error_boundary(int *fp)
+{
+    int failures = 0;
+    char scratch[256];
+    wtq_connect_req_t req = { 0 };
+    wtq_connect_resp_t resp = { 0 };
+    wtq_sf_str_t protos[4];
+    size_t nproto = 0;
+    /* Each failure is an encoding error, independent of HTTP context. */
+    const struct {
+        uint8_t bytes[12];
+        size_t len;
+    } bad[] = {
+        { { 0 }, 0 },                           /* absent prefix */
+        { { 0x00 }, 1 },                        /* truncated prefix */
+        { { 0x01, 0x00 }, 2 },                  /* nonzero RIC */
+        { { 0x00, 0x80, 0xd9 }, 3 },            /* negative Base */
+        { { 0x00, 0x7f, 0x80 }, 3 },            /* truncated Delta */
+        { { 0x00, 0x7f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x3f }, 11 },           /* Delta overflow */
+        { { 0x00, 0x01, 0x80 }, 3 },            /* dynamic indexed */
+        { { 0x00, 0x01, 0x40, 0x00 }, 4 },      /* dynamic name */
+        { { 0x00, 0x01, 0x10 }, 3 },            /* post-base indexed */
+        { { 0x00, 0x01, 0x00, 0x00 }, 4 },      /* post-base name */
+        { { 0x00, 0x01, 0xff, 0x24 }, 4 },      /* static index 99 */
+        { { 0x00, 0x01, 0x51, 0x04, '/' }, 5 }, /* truncated literal */
+        { { 0x00, 0x01, 0x51, 0x81, 0x00 }, 5 }, /* bad Huffman */
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        WTQ_TEST_CHECK(wtq_connect_decode_request(
+            bad[i].bytes, bad[i].len, &STRICT, &req, protos, 4, &nproto,
+            scratch, sizeof(scratch)) == WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED);
+        WTQ_TEST_CHECK(wtq_connect_decode_response(
+            bad[i].bytes, bad[i].len, &STRICT, &resp, scratch,
+            sizeof(scratch)) == WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED);
+        WTQ_TEST_CHECK(wtq_connect_validate_trailers(
+            bad[i].bytes, bad[i].len, scratch, sizeof(scratch)) ==
+            WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED);
+    }
+
+    const uint8_t status[] = { 0x00, 0x01, 0xd9 };
+    WTQ_TEST_CHECK(wtq_connect_decode_response(status, sizeof(status),
+        &STRICT, &resp, scratch, sizeof(scratch)) == WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK_EQ_INT(resp.status, 200);
+    /* Same valid QPACK, wrong pseudo-header context: HTTP error only. */
+    WTQ_TEST_CHECK(wtq_connect_decode_request(status, sizeof(status),
+        &STRICT, &req, protos, 4, &nproto, scratch, sizeof(scratch)) ==
+        WTQ_CONNECT_MALFORMED);
+    WTQ_TEST_CHECK(wtq_connect_validate_trailers(status, sizeof(status),
+        scratch, sizeof(scratch)) == WTQ_CONNECT_MALFORMED);
+
+    uint8_t buf[256];
+    size_t len = build(REQ_BASE, 5, buf, sizeof(buf));
+    WTQ_TEST_CHECK(len > 2);
+    buf[1] = 1;
+    WTQ_TEST_CHECK(wtq_connect_decode_request(buf, len, &STRICT, &req,
+        protos, 4, &nproto, scratch, sizeof(scratch)) == WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK(span_eq(req.authority, req.authority_len, "example.com"));
+
+    const wtq_qpack_field_t regular = { "x-test", 6, "ok", 2, false };
+    len = build(&regular, 1, buf, sizeof(buf));
+    buf[1] = 1;
+    WTQ_TEST_CHECK(wtq_connect_validate_trailers(buf, len, scratch,
+        sizeof(scratch)) == WTQ_CONNECT_OK);
+    /* Valid QPACK with insufficient local scratch is never a peer error. */
+    WTQ_TEST_CHECK(wtq_connect_decode_request(buf, len, &STRICT, &req,
+        protos, 4, &nproto, NULL, 0) == WTQ_CONNECT_BUFFER);
+    WTQ_TEST_CHECK(wtq_connect_decode_response(buf, len, &STRICT, &resp,
+        NULL, 0) == WTQ_CONNECT_BUFFER);
+    WTQ_TEST_CHECK(wtq_connect_validate_trailers(buf, len, NULL, 0) ==
+        WTQ_CONNECT_BUFFER);
+
+    uint8_t many[WTQ_CONNECT_MAX_FIELDS + 3] = { 0x00, 0x01 };
+    memset(many + 2, 0xd9, sizeof(many) - 2);
+    WTQ_TEST_CHECK(wtq_connect_decode_request(many, sizeof(many), &STRICT,
+        &req, protos, 4, &nproto, scratch, sizeof(scratch)) == WTQ_CONNECT_BUFFER);
+    WTQ_TEST_CHECK(wtq_connect_decode_response(many, sizeof(many), &STRICT,
+        &resp, scratch, sizeof(scratch)) == WTQ_CONNECT_BUFFER);
+    WTQ_TEST_CHECK(wtq_connect_validate_trailers(many, sizeof(many), scratch,
+        sizeof(scratch)) == WTQ_CONNECT_BUFFER);
+    *fp += failures;
+}
+
+static void test_connection_specific_fields(int *fp)
+{
+    int failures = 0;
+    const struct {
+        const char *name;
+        const char *value;
+        bool request_ok;
+        bool response_ok;
+    } cases[] = {
+        { "connection", "close", false, false },
+        { "connection", "", false, false },
+        { "keep-alive", "timeout=5", false, false },
+        { "proxy-connection", "keep-alive", false, false },
+        { "transfer-encoding", "chunked", false, false },
+        { "upgrade", "websocket", false, false },
+        { "te", "gzip", false, false },
+        { "te", "trailers, gzip", false, false },
+        { "te", "gzip, trailers", false, false },
+        { "te", "trailers;q=1", false, false },
+        { "te", "\"trailers\"", false, false },
+        { "te", "trailer", false, false },
+        { "te", "", false, false },
+        { "te", ",,", false, false },
+        { "te", "trailers", true, false },
+        { "te", "Trailers", true, false },
+        { "te", "trailers, TRAILERS", true, false },
+        { "te", ",trailers,\t,trailers,", true, false },
+        { "x-connection", "close", true, true },
+        { "trailer", "x-checksum", true, true },
+        { "content-encoding", "gzip", true, true },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        wtq_qpack_field_t fields[6];
+        memcpy(fields, REQ_BASE, sizeof(REQ_BASE));
+        fields[5] = (wtq_qpack_field_t){ cases[i].name,
+            strlen(cases[i].name), cases[i].value, strlen(cases[i].value), false };
+        uint8_t buf[256];
+        char scratch[256];
+        wtq_connect_req_t req;
+        wtq_connect_resp_t resp;
+        wtq_sf_str_t protos[4];
+        size_t nproto = 0;
+        size_t len = build(fields, 6, buf, sizeof(buf));
+        WTQ_TEST_CHECK(len > 0);
+        WTQ_TEST_CHECK(wtq_connect_decode_request(buf, len, &STRICT, &req,
+            protos, 4, &nproto, scratch, sizeof(scratch)) ==
+            (cases[i].request_ok ? WTQ_CONNECT_OK : WTQ_CONNECT_MALFORMED));
+
+        /* The same rules apply before NOT_WEBTRANSPORT classification. */
+        fields[0] = (wtq_qpack_field_t){ ":method", 7, "GET", 3, false };
+        fields[4] = fields[5];
+        len = build(fields, 5, buf, sizeof(buf));
+        WTQ_TEST_CHECK(wtq_connect_decode_request(buf, len, &STRICT, &req,
+            protos, 4, &nproto, scratch, sizeof(scratch)) ==
+            (cases[i].request_ok ? WTQ_CONNECT_NOT_WEBTRANSPORT :
+                                   WTQ_CONNECT_MALFORMED));
+
+        fields[0] = (wtq_qpack_field_t){ ":status", 7, "200", 3, false };
+        fields[1] = fields[5];
+        len = build(fields, 2, buf, sizeof(buf));
+        WTQ_TEST_CHECK(wtq_connect_decode_response(buf, len, &STRICT, &resp,
+            scratch, sizeof(scratch)) ==
+            (cases[i].response_ok ? WTQ_CONNECT_OK : WTQ_CONNECT_MALFORMED));
+        len = build(fields + 1, 1, buf, sizeof(buf));
+        WTQ_TEST_CHECK(wtq_connect_validate_trailers(buf, len, scratch,
+            sizeof(scratch)) ==
+            (cases[i].response_ok ? WTQ_CONNECT_OK : WTQ_CONNECT_MALFORMED));
+    }
+    /* A second TE line is a list continuation, not an ignored field. */
+    wtq_qpack_field_t fields[7];
+    memcpy(fields, REQ_BASE, sizeof(REQ_BASE));
+    fields[5] = (wtq_qpack_field_t){ "te", 2, "trailers", 8, false };
+    fields[6] = fields[5];
+    WTQ_TEST_CHECK(decode_fields(fields, 7, &STRICT) == WTQ_CONNECT_OK);
+    fields[6].value = "gzip";
+    fields[6].value_len = 4;
+    WTQ_TEST_CHECK(decode_fields(fields, 7, &STRICT) == WTQ_CONNECT_MALFORMED);
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1106,6 +1269,8 @@ int main(void)
     test_request_roundtrip(&failures);
     test_response_roundtrip(&failures);
     test_request_rejects(&failures);
+    test_qpack_error_boundary(&failures);
+    test_connection_specific_fields(&failures);
     test_not_webtransport_classification(&failures);
     test_host_authority_rules(&failures);
     test_token_and_scheme_syntax(&failures);

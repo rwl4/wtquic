@@ -8,6 +8,20 @@
 
 int main(void)
 {
+    if (wtq_session_local_flush(NULL) != WTQ_ERR_INVALID_ARG ||
+        wtq_session_local_flush_mode(NULL) != WTQ_LOCAL_FLUSH_UNSUPPORTED)
+        return 1;
+    wtq_local_flush_mode_t flush_mode = WTQ_LOCAL_FLUSH_ACKNOWLEDGED;
+    if (flush_mode == WTQ_LOCAL_FLUSH_TRANSPORT)
+        return 1;
+    if (wtq_session_send_commit_mode(NULL) != WTQ_SEND_COMMIT_UNSUPPORTED ||
+        wtq_stream_enable_send_commit(NULL) != WTQ_ERR_INVALID_ARG) return 1;
+    wtq_session_events_init_ex(NULL, 99);
+    wtq_connect_request_metadata_t metadata = WTQ_CONNECT_REQUEST_METADATA_INIT;
+    if (metadata.struct_size != sizeof(metadata) || metadata.reserved0 != 0 ||
+        metadata.authority.data != NULL || metadata.path.len != 0 ||
+        wtq_session_connect_request_metadata(NULL, &metadata) != WTQ_ERR_INVALID_ARG)
+        return 1;
     if (wtq_session_service_stream_admission(NULL) != WTQ_ERR_INVALID_ARG) return 1;
     size_t quantum = 99;
     wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;

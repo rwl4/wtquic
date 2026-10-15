@@ -72,6 +72,50 @@ typedef enum wtq_session_status {
     WTQ_SESSION_STATUS_FAILED,   /* terminal (never established) */
 } wtq_session_status_t;
 
+/* Evidence supporting the passive reliable-output observation below. */
+typedef enum wtq_local_flush_mode {
+    WTQ_LOCAL_FLUSH_UNSUPPORTED = 0,
+    WTQ_LOCAL_FLUSH_TRANSPORT = 1,
+    WTQ_LOCAL_FLUSH_ACKNOWLEDGED = 2
+} wtq_local_flush_mode_t;
+
+/* Both queries require this session's serialization domain. A managed caller
+ * must TRY its own guard without waiting; lane contention is its own result,
+ * and no WT state may be read until entry succeeds. Inside callbacks the
+ * domain is already held: do not relock a nonrecursive guard.
+ *
+ * local_flush observes presently required accepted reliable bytes and FIN,
+ * including stream prefaces, session setup/capsules and generated protocol-control
+ * output. Datagrams are excluded. This implementation has one WT session per
+ * connection. There is no protocol pump, transport call, allocation, callback
+ * or wait. Later submissions may immediately invalidate an OK observation.
+ * Upper-layer retained output must be composed under the same domain.
+ *
+ * Explicitly accepted application send cancellation, or lawful peer STOP of
+ * an ordinary WT data stream, may supersede that generation's remaining
+ * payload/FIN intent. Its borrows, deferred submissions and abort ownership
+ * must settle before OK; an in-flight cancellation decision remains pending.
+ * This is cancellation settlement, NOT delivery of withdrawn bytes, FIN or
+ * RESET. ACKNOWLEDGED evidence applies only to non-superseded output. Refused
+ * cancellation withdraws nothing; partial failure is not successful settlement.
+ * Receive-only abort cannot settle outgoing output. Internal/control loss and
+ * unexplained cancellation are never authorized by an abort flag alone.
+ *
+ * Results: INVALID_ARG for NULL; BACKEND after unexpected accepted-output loss
+ * (sticky even on retained terminal handles); CLOSED on a
+ * terminal handle without recorded output loss; STATE before establishment;
+ * UNSUPPORTED without capability;
+ * WOULD_BLOCK while bytes/FIN remain; OK otherwise. Refused submissions create
+ * no obligation. Intentional cancellation cannot clear an earlier loss.
+ * ACKNOWLEDGED evidence is conservative: peer ACK latency can delay OK beyond
+ * local transmission. Neither mode promises peer application consumption.
+ * This is local API policy, not session drain or a new wire guarantee (QUIC
+ * stream/FIN/reset semantics: RFC 9000 ss3.1,4.4,4.5). The capability query is
+ * also usable on a retained terminal handle; NULL reports UNSUPPORTED. */
+WTQ_API wtq_local_flush_mode_t wtq_session_local_flush_mode(
+    const wtq_session_t *session);
+WTQ_API wtq_result_t wtq_session_local_flush(const wtq_session_t *session);
+
 /*
  * Caller-owned serialization-domain guard (optional; whether a backend
  * honors it is backend-defined — see the backend header). When a session
@@ -162,7 +206,8 @@ typedef struct wtq_session_events {
      * remains usable until reset or finished; typically respond with
      * wtq_stream_reset() — or wtq_stream_abort() on transports where an
      * exact single-half reset of a fully-open bidi is unsupported
-     * (wtq_stream_reset returns WTQ_ERR_UNSUPPORTED there). */
+     * (wtq_stream_reset returns WTQ_ERR_UNSUPPORTED there). An opted-in send
+     * commit stream instead closes without commit after this notification. */
     void (*on_stream_stop)(wtq_session_t *session, wtq_stream_t *stream,
                            uint32_t app_code, void *user);
     /* THE terminal event for a stream: both directions are done (or
@@ -189,13 +234,39 @@ typedef struct wtq_session_events {
      * it; a NULL member is skipped like any other. */
     void (*on_stream_writable)(wtq_session_t *session,
                                wtq_stream_t *stream, void *user);
+
+    /* Opted-in local UNI only: the peer ACKed every native stream byte
+     * (including transport framing) AND FIN. Success-only, exactly once before
+     * on_stream_closed; buffer return is independent. Reset/abort, peer STOP
+     * or teardown winning first suppresses this event. The outcome is final
+     * before entry. Reentrant release/close is legal; this stream's terminal
+     * callback and the session terminal callback wait until it returns. */
+    void (*on_stream_send_committed)(wtq_session_t *session,
+                                     wtq_stream_t *stream, void *user);
 } wtq_session_events_t;
 
 #define WTQ_SESSION_EVENTS_INIT \
     { (uint32_t)sizeof(wtq_session_events_t), 0, 0, 0, 0, 0, \
-      0, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0, 0 }
 
+/* Bare symbol preserves the frozen v1 extent through on_stream_writable.
+ * The sized entry initializes min(caller_size, current_size), stamps bytes
+ * written if the size field fits, and leaves future caller tails untouched. */
 WTQ_API void wtq_session_events_init(wtq_session_events_t *events);
+WTQ_API void wtq_session_events_init_ex(wtq_session_events_t *events,
+                                       size_t caller_size);
+#define wtq_session_events_init(events) \
+    wtq_session_events_init_ex((events), sizeof(wtq_session_events_t))
+
+typedef enum wtq_send_commit_mode {
+    WTQ_SEND_COMMIT_UNSUPPORTED = 0,
+    WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE = 1
+} wtq_send_commit_mode_t;
+
+/* Immutable backend contract, not stream status. NULL is unsupported.
+ * Ordinary reset before ACK+FIN is not reliable-prefix RESET_STREAM_AT. */
+WTQ_API wtq_send_commit_mode_t wtq_session_send_commit_mode(
+    const wtq_session_t *session);
 
 /*
  * The WebTransport-over-HTTP/3 wire profile a connection speaks. Two
@@ -541,6 +612,33 @@ WTQ_API wtq_result_t wtq_session_transport_error(
 /* Negotiated subprotocol ("" when none); borrowed until the session is
  * destroyed. */
 WTQ_API wtq_str_t wtq_session_subprotocol(const wtq_session_t *session);
+
+typedef struct wtq_connect_request_metadata {
+    uint32_t struct_size;
+    uint32_t reserved0;       /* library writes zero */
+    wtq_str_t authority;
+    wtq_str_t path;
+} wtq_connect_request_metadata_t;
+
+#define WTQ_CONNECT_REQUEST_METADATA_INIT \
+    { (uint32_t)sizeof(wtq_connect_request_metadata_t), 0u, \
+      { NULL, 0 }, { NULL, 0 } }
+
+/* Exact, counted accepted CONNECT :authority and :path, without normalization
+ * or URI validation. Both spans are nonempty on success; neither is promised
+ * NUL termination. Peer-asserted metadata is not authenticated routing policy.
+ * The immutable connection-owned bytes remain valid until session destruction,
+ * including on a retained terminal server handle. Callable in on_established
+ * under the ordinary session serialization-domain/guard rules.
+ *
+ * Initialize struct_size before calling. The v1 floor ends after the complete
+ * path field: smaller or straddled outputs are WTQ_ERR_INVALID_ARG, as are NULL
+ * arguments. Future-larger outputs preserve struct_size and their unknown tail.
+ * Client, pre-establishment, refused and failed sessions return WTQ_ERR_STATE.
+ * Every error leaves all output bytes untouched. No path matching policy is
+ * changed: configured paths still match the entire accepted :path exactly. */
+WTQ_API wtq_result_t wtq_session_connect_request_metadata(
+    const wtq_session_t *session, wtq_connect_request_metadata_t *out);
 
 WTQ_API void wtq_session_set_user(wtq_session_t *session, void *user);
 WTQ_API void *wtq_session_get_user(const wtq_session_t *session);

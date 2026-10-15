@@ -684,9 +684,38 @@ static void test_stream_sid_validity(int *fp)
     *fp += failures;
 }
 
+static void test_quarter_stream_id_bound(int *fp)
+{
+    int failures = 0;
+    const uint64_t ids[] = { (UINT64_C(1) << 60) - 1,
+                              UINT64_C(1) << 60,
+                             (UINT64_C(1) << 62) - 1 };
+    for (int active = 0; active < 2; active++) {
+        for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+            rig_t r;
+            uint8_t data[8];
+            size_t len = 0;
+            rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+            if (active)
+                establish_client(&r, fp);
+            WTQ_TEST_CHECK(wtq_varint_encode(ids[i], data, sizeof(data), &len) == WTQ_VARINT_OK);
+            WTQ_TEST_CHECK(wtq_conn_on_datagram(r.conn, data, len, 0) ==
+                            (i == 0 ? WTQ_OK : WTQ_ERR_PROTO));
+            WTQ_TEST_CHECK_EQ_U64(wtq_conn_dgrams_dropped(r.conn), i == 0 ? 1 : 0);
+            WTQ_TEST_CHECK_EQ_INT(r.app.dgram_events, 0);
+            if (i != 0)
+                WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), WTQ_H3_DATAGRAM_ERROR);
+            rig_down(&r, fp);
+        }
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
+
+    test_quarter_stream_id_bound(&failures);
 
     test_dgram_send_basic(&failures);
     test_dgram_send_nonzero_sid(&failures);

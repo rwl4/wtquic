@@ -158,11 +158,13 @@ wtq_add_engine_test(engine_dgram)
 wtq_add_engine_test(engine_async_id)
 wtq_add_engine_test(engine_shutdown)
 wtq_add_engine_test(api_session)
+wtq_add_engine_test(api_local_flush)
 wtq_add_engine_test(api_async_id)
 wtq_add_engine_test(api_abort)
 wtq_add_engine_test(api_transport_error)
 wtq_add_engine_test(api_stream)
 wtq_add_engine_test(api_pair support/wtq_fault_alloc.c)
+wtq_add_engine_test(api_send_commit support/wtq_fault_alloc.c)
 wtq_add_engine_test(api_pause)
 wtq_add_engine_test(receive_contract)
 wtq_add_engine_test(simpair_bootstrap support/wtq_simpair.c)
@@ -315,6 +317,48 @@ if(WTQ_MSQUIC_ENABLED)
             QUIC_API_ENABLE_PREVIEW_FEATURES)
     endif()
     add_test(NAME msquic_ops COMMAND test_msquic_ops)
+    add_executable(test_msquic_local_flush
+        msquic/local_flush.c
+        ../backends/msquic/msq_client.c
+        ../backends/msquic/msq_conn.c
+        ../backends/msquic/msq_env.c
+        ../backends/msquic/msq_listener.c
+        ../backends/msquic/msq_settings.c
+        ../backends/msquic/msq_stream.c
+        ../src/engine/conn.c
+        ../src/api/session.c
+        ../src/types.c
+        $<TARGET_OBJECTS:wtq_proto>)
+    target_include_directories(test_msquic_local_flush PRIVATE
+        ../src ../include ${CMAKE_BINARY_DIR}/include ../backends/msquic unit)
+    target_compile_options(test_msquic_local_flush PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_msquic_local_flush PRIVATE
+        msquic::msquic Threads::Threads)
+    if(WTQ_MSQUIC_PREVIEW)
+        target_compile_definitions(test_msquic_local_flush PRIVATE
+            QUIC_API_ENABLE_PREVIEW_FEATURES)
+    endif()
+    add_test(NAME msquic_local_flush COMMAND test_msquic_local_flush)
+    set_tests_properties(msquic_local_flush PROPERTIES LABELS msquic TIMEOUT 30)
+
+    add_executable(test_local_flush_native msquic/local_flush_native.c)
+    target_include_directories(test_local_flush_native PRIVATE
+        ../src ../backends/msquic unit)
+    target_compile_options(test_local_flush_native PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_local_flush_native PRIVATE
+        wtq::msquic msquic::msquic Threads::Threads)
+    add_test(NAME local_flush_native COMMAND test_local_flush_native
+        ${CMAKE_CURRENT_BINARY_DIR}/certs)
+    set_tests_properties(local_flush_native PROPERTIES
+        FIXTURES_REQUIRED certs LABELS "msquic;loopback" TIMEOUT 90)
+    add_test(NAME msquic_send_commit_dispatch COMMAND test_msquic_ops --send-commit)
+    set_tests_properties(msquic_send_commit_dispatch PROPERTIES LABELS msquic TIMEOUT 30)
+    add_executable(test_send_commit_native msquic/send_commit_native.c)
+    target_include_directories(test_send_commit_native PRIVATE ../src ../backends/msquic unit)
+    target_compile_options(test_send_commit_native PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_send_commit_native PRIVATE wtq::msquic msquic::msquic Threads::Threads)
+    add_test(NAME send_commit_native COMMAND test_send_commit_native ${CMAKE_CURRENT_BINARY_DIR}/certs)
+    set_tests_properties(send_commit_native PROPERTIES FIXTURES_REQUIRED certs LABELS msquic TIMEOUT 90)
     add_test(NAME admission_resume_failure COMMAND test_msquic_ops --admission-resume-failure)
     add_test(NAME admission_fifo COMMAND test_msquic_ops --admission-fifo)
     add_test(NAME admission_bidi_reset COMMAND test_msquic_ops --admission-bidi-reset)
@@ -470,6 +514,10 @@ if(WTQ_MSQUIC_ENABLED)
             FIXTURES_SETUP certs
             LABELS "msquic;loopback")
         add_test(NAME loopback_msquic COMMAND loopback_msquic)
+        add_test(NAME loopback_connect_metadata COMMAND loopback_msquic
+            ${CMAKE_CURRENT_BINARY_DIR}/certs --metadata)
+        set_tests_properties(loopback_connect_metadata PROPERTIES
+            FIXTURES_REQUIRED certs LABELS "msquic;loopback" TIMEOUT 120)
         set_tests_properties(loopback_msquic PROPERTIES
             FIXTURES_REQUIRED certs
             ENVIRONMENT "WTQ_TEST_CERT_DIR=${CMAKE_CURRENT_BINARY_DIR}/certs"

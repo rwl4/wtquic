@@ -147,6 +147,7 @@ typedef struct wtq_shutdown {
     uint8_t mode;      /* wtq_shutdown_mode_t */
     bool abort_send;   /* RESET_STREAM our send half */
     bool abort_recv;   /* STOP_SENDING their send half */
+    bool app_send_cancel; /* validated app intent; internal paths stay zero */
     uint64_t send_err;
     uint64_t recv_err; /* WHOLE_STREAM: == send_err */
 } wtq_shutdown_t;
@@ -167,6 +168,9 @@ typedef enum wtq_driver_cap {
      * treated as delivery-only. Surfaced publicly as
      * WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED. */
     WTQ_DCAP_RECV_FLOW_CONTROLLED = 1u << 3,
+    /* Opt-in local UNI ACK-through-FIN plus operational post-FIN reset.
+     * Requires the versioned generation/commit ingress below. */
+    WTQ_DCAP_SEND_COMMIT_ACK_FIN = 1u << 4,
 } wtq_driver_cap_t;
 
 typedef struct wtq_driver_ops {
@@ -389,6 +393,9 @@ typedef struct wtq_conn_callbacks {
      * es is valid for the callback's duration only. */
     void (*on_wt_stream_terminal)(wtq_conn_t *conn, wtq_estream_t *es,
                                   void *ctx);
+    /* Internal conn_create callback record, never a cross-library table. */
+    void (*on_wt_stream_send_committed)(wtq_conn_t *conn, wtq_estream_t *es,
+                                       void *ctx);
     void *ctx;
 } wtq_conn_callbacks_t;
 
@@ -521,6 +528,19 @@ WTQ_SPI wtq_result_t wtq_conn_on_stream_reset(wtq_conn_t *conn,
  */
 WTQ_SPI wtq_result_t wtq_conn_on_stream_terminal(wtq_conn_t *conn,
                                                  wtq_estream_t *es);
+
+/* Version1 send-shutdown identity. Capture the generation at local open while
+ * ectx is valid; a stale input cannot target a recycled engine slot. Graceful
+ * means ACK through ALL bytes and FIN, never buffer return or generic shutdown.
+ * False is native send cancellation/whole-stream terminal without that proof.
+ * Unopted streams are unaffected. Call on the serialized domain inside the same
+ * API enter/leave borrow as other native inputs. Detached/mismatched identities
+ * and already-resolved outcomes are ignored. No unsized driver table grows. */
+WTQ_SPI uint64_t wtq_estream_generation_v1(const wtq_estream_t *es);
+WTQ_SPI bool wtq_estream_is_wt_data_v1(const wtq_estream_t *es,
+                                      const wtq_dstream_t *ds);
+WTQ_SPI void wtq_conn_on_stream_send_shutdown_v1(wtq_conn_t *conn,
+    wtq_estream_t *es, wtq_dstream_t *ds, uint64_t generation, bool graceful);
 
 /* Transport-level close observed (peer or local transport). */
 WTQ_SPI void wtq_conn_on_conn_closed(wtq_conn_t *conn, uint64_t err, bool remote,
@@ -698,6 +718,7 @@ wtq_result_t wtq_conn_wt_open_bidi(wtq_conn_t *conn,
  * when the driver lacks send_gather; WTQ_ERR_CLOSED after the session
  * terminated.
  */
+wtq_result_t wtq_conn_wt_enable_send_commit(wtq_conn_t *conn, wtq_estream_t *es);
 wtq_result_t wtq_conn_wt_send(wtq_conn_t *conn, wtq_estream_t *es,
                               const wtq_span_t *spans, size_t count,
                               bool fin, void *cookie);

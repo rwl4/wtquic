@@ -71,6 +71,10 @@ static int test_recv_enable_dead_stream(void)
         WTQ_TEST_CHECK_EQ_INT(
             wtq_msq_driver_ops()->recv_enable(drv, ds, true),
             WTQ_ERR_CLOSED);
+        ds->shutdown_complete = true;
+        WTQ_TEST_CHECK_EQ_INT(
+            wtq_msq_driver_ops()->recv_enable(drv, ds, true),
+            WTQ_ERR_CLOSED); /* no retained engine input to replay */
     }
 
     drv->conn = NULL; /* nothing to close */
@@ -1485,7 +1489,15 @@ static struct rx_cap {
     unsigned terminal_order;
     uint32_t reset_code, stop_code;
     unsigned closed_calls;
+    unsigned commit_calls;
 } g_pr;
+
+static void pr_on_send_committed(wtq_session_t *s, wtq_stream_t *st, void *u)
+{
+    (void)s; (void)st; (void)u;
+    g_pr.commit_calls++;
+    g_pr.terminal_order = g_pr.terminal_order * 10 + 3;
+}
 
 static void pr_on_established(wtq_session_t *s, wtq_str_t sub, void *u)
 {
@@ -1631,6 +1643,8 @@ static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
     ev.on_stream_closed = pr_on_stream_closed;
     ev.on_stream_reset = pr_on_stream_reset;
     ev.on_stream_stop = pr_on_stream_stop;
+    ev.on_stream_send_committed = pr_on_send_committed;
+    ev.on_closed = cap_on_closed;
     wtq_api_session_cfg_t scfg = {
         .alloc = alloc,
         .perspective = WTQ_PERSPECTIVE_CLIENT,
@@ -2603,6 +2617,365 @@ static int test_bounded_handle_debt(void)
     return failures;
 }
 
+static unsigned abort_nested_errors;
+static QUIC_STATUS QUIC_API abort_shutdown_inline(HQUIC handle,
+    QUIC_STREAM_SHUTDOWN_FLAGS flags, QUIC_UINT62 code)
+{
+    struct wtq_dstream *ds = (void *)handle;
+    wtq_estream_t *owner = ds->ectx;
+    unsigned closed = g_pr.closed_calls;
+    (void)flags; (void)code;
+    lifetime_shutdown(ds);
+    lifetime_poll(ds->drv);
+    /* The engine still borrows owner until its shutdown op returns. */
+    if (ds->ectx != owner || g_pr.closed_calls != closed)
+        abort_nested_errors++;
+    return QUIC_STATUS_SUCCESS;
+}
+
+/* MsQuic does not indicate PEER_SEND_ABORTED for the RESET answering our
+ * STOP_SENDING. Dispatch only its whole-stream terminal, never invent RESET. */
+static int test_abort_shutdown_completion(void)
+{
+    int failures = 0;
+    for (int bounded = 0; bounded < 2; ++bounded) {
+        for (int nested = 0; nested < 2; ++nested) {
+            QUIC_API_TABLE api;
+            wtq_session_t *sess = NULL;
+            struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+                wtq_alloc_default(), bounded != 0);
+            WTQ_TEST_CHECK(drv != NULL);
+            if (!drv) continue;
+            size_t baseline = stream_record_count(drv);
+            abort_nested_errors = 0;
+            if (nested) api.StreamShutdown = abort_shutdown_inline;
+            for (unsigned i = 0; i < 32; ++i) {
+                wtq_stream_t *st = NULL;
+                wtq_result_t rc = wtq_session_open_bidi(sess, &st);
+                WTQ_TEST_CHECK_EQ_INT(rc, WTQ_OK);
+                if (rc != WTQ_OK) break;
+                wtq_stream_add_ref(st);
+                struct wtq_dstream *ds = drv->streams;
+                WTQ_TEST_CHECK(ds->is_local && ds->is_bidi && ds->ectx);
+                admission_credit_handle = ds->stream;
+                admission_credit_closes = 0;
+                api.StreamClose = admission_close;
+                WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(st, 17), WTQ_OK);
+                WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, i + 1);
+                if (!nested) lifetime_shutdown(ds);
+                if (bounded)
+                    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+                else
+                    lifetime_poll(drv);
+                WTQ_TEST_CHECK(ds->ectx == NULL);
+                WTQ_TEST_CHECK(ds->shutdown_complete && ds->send_refs != 0);
+                /* A pending copied preamble pins the record through completion.
+                 * Repeated terminal input must neither callback nor close twice. */
+                lifetime_shutdown(ds);
+                WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, i + 1);
+                WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+                WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+                complete_all_sends();
+                wtq_stream_release(st);
+                lifetime_poll(drv);
+                WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), baseline);
+                WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+            }
+            WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 32);
+            WTQ_TEST_CHECK_EQ_INT(abort_nested_errors, 0);
+            wtq_api_session_admission_detach(sess);
+            wtq_session_release(sess);
+            drv->session = NULL; drv->conn = NULL;
+            wtq_msq_conn_free(drv);
+        }
+    }
+    return failures;
+}
+
+static int test_abort_pooled_shutdown_credit(void)
+{
+    int failures = 0;
+    for (int held_data = 0; held_data < 2; ++held_data) {
+        QUIC_API_TABLE api;
+        wtq_session_t *sess = NULL;
+        struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+            wtq_alloc_default(), true);
+        WTQ_TEST_CHECK(drv != NULL);
+        if (!drv) continue;
+        g_pr.retain_stream = true;
+        for (unsigned i = 0; i < 16; ++i) {
+            g_ord.n = 0;
+            int handle;
+            feed_peer_stream_started(drv, (HQUIC)(void *)&handle, false, 7 + 4 * i);
+            struct wtq_dstream *ds = g_ord.call[0].ctx;
+            const uint8_t prefix[] = { 0x40, 0x54, 0 };
+            WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), false), 3);
+            wtq_stream_t *st = g_pr.stream;
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_pause_receive(st), WTQ_OK);
+            const uint8_t byte = 42;
+            WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, &byte,
+                held_data ? 1 : 0, true), 0);
+            WTQ_TEST_CHECK(ds->recv_held_data || ds->fin_pending);
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_stop_sending(st, 18), WTQ_OK);
+            admission_credit_handle = ds->stream;
+            admission_credit_closes = 0;
+            api.StreamClose = admission_close;
+            lifetime_shutdown(ds);
+            WTQ_TEST_CHECK(ds->ectx == NULL && ds->admission.es == NULL);
+            WTQ_TEST_CHECK(ds->occupied && ds->credit_held);
+            WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 0);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, i + 1);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 0);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+            wtq_stream_release(st);
+            WTQ_TEST_CHECK(ds->occupied); /* release only marks */
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+            WTQ_TEST_CHECK(!ds->occupied);
+            WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+            if (ds->occupied) break;
+        }
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 16);
+        wtq_api_session_admission_detach(sess);
+        wtq_session_release(sess);
+        drv->session = NULL; drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+    }
+    return failures;
+}
+
+static int test_terminal_deferred_fin(void)
+{
+    int failures = 0;
+    for (int bounded = 0; bounded < 2; ++bounded) {
+        QUIC_API_TABLE api;
+        wtq_session_t *sess = NULL;
+        struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+            wtq_alloc_default(), bounded != 0);
+        WTQ_TEST_CHECK(drv != NULL);
+        if (!drv) continue;
+        g_pr.retain_stream = true;
+        g_ord.n = 0;
+        int handle;
+        feed_peer_stream_started(drv, (HQUIC)(void *)&handle, false, 7);
+        struct wtq_dstream *ds = g_ord.call[0].ctx;
+        const uint8_t prefix[] = { 0x40, 0x54, 0 };
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), false), 3);
+        wtq_stream_t *st = g_pr.stream;
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_pause_receive(st), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, NULL, 0, true), 0);
+        admission_credit_handle = ds->stream;
+        admission_credit_closes = 0;
+        api.StreamClose = admission_close;
+        lifetime_shutdown(ds);
+        lifetime_poll(drv);
+        WTQ_TEST_CHECK(ds->fin_pending && ds->ectx && ds->occupied);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 0);
+        WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, bounded ? 0 : 1);
+        WTQ_TEST_CHECK((ds->stream != NULL) == (bounded != 0));
+        int enables = g_rse_calls;
+        if (!bounded) {
+            ds->recv_held_data = true;
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(st), WTQ_ERR_CLOSED);
+            WTQ_TEST_CHECK(ds->fin_pending && ds->ectx);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+            ds->recv_held_data = false;
+        }
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(st), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(g_rse_calls, enables); /* logical replay only */
+        WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+        WTQ_TEST_CHECK(ds->ectx == NULL);
+        WTQ_TEST_CHECK(ds->credit_held == (bounded != 0));
+        WTQ_TEST_CHECK_EQ_INT(wtq_msq_driver_ops()->recv_enable(drv, ds, true),
+            bounded ? WTQ_OK : WTQ_ERR_CLOSED);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+        wtq_stream_release(st);
+        if (bounded) {
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+            WTQ_TEST_CHECK(!ds->occupied);
+        } else {
+            lifetime_poll(drv);
+        }
+        WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+        wtq_api_session_admission_detach(sess);
+        wtq_session_release(sess);
+        drv->session = NULL; drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+    }
+    return failures;
+}
+
+static int test_terminal_callback_reentrancy(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *sess = NULL;
+    struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+        wtq_alloc_default(), true);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (!drv) return failures;
+    g_pr.retain_stream = true;
+    g_ord.n = 0;
+    int handle;
+    feed_peer_stream_started(drv, (HQUIC)(void *)&handle, false, 7);
+    struct wtq_dstream *ds = g_ord.call[0].ctx;
+    const uint8_t prefix[] = { 0x40, 0x54, 0 };
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), false), 3);
+    memset(&admission_borrow, 0, sizeof(admission_borrow));
+    admission_borrow.drv = drv;
+    admission_borrow.active = true;
+    admission_credit_handle = ds->stream;
+    admission_credit_closes = 0;
+    api.StreamClose = admission_close;
+    lifetime_shutdown(ds);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(admission_borrow.probes, 1);
+    WTQ_TEST_CHECK_EQ_INT(admission_borrow.unsafe_publications, 0);
+    WTQ_TEST_CHECK(ds->occupied && !ds->credit_held && ds->ectx == NULL);
+    WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 0);
+    lifetime_shutdown(ds);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+    admission_borrow.active = false;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+    WTQ_TEST_CHECK(!ds->occupied);
+    WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+    wtq_api_session_admission_detach(sess);
+    wtq_session_release(sess);
+    drv->session = NULL; drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    memset(&admission_borrow, 0, sizeof(admission_borrow));
+    return failures;
+}
+
+/* Select the actual control/QPACK handles opened by the engine. All have
+ * NULL ectx; a peer STOP is nevertheless a critical-stream failure. */
+static int test_local_critical_shutdown(void)
+{
+    int failures = 0;
+    for (int bounded = 0; bounded < 2; ++bounded) {
+        for (unsigned critical = 0; critical < 3; ++critical) {
+            for (unsigned event = 0; event < 6; ++event) {
+                QUIC_API_TABLE api;
+                wtq_session_t *sess = NULL;
+                struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+                    wtq_alloc_default(), bounded != 0);
+                WTQ_TEST_CHECK(drv != NULL);
+                if (!drv) continue;
+                struct wtq_dstream *ds = drv->streams;
+                while (ds && !(ds->is_local && !ds->is_bidi &&
+                    ds->id == 2 + 4 * critical)) ds = ds->next;
+                WTQ_TEST_CHECK(ds != NULL && ds->ectx == NULL);
+                if (ds) {
+                    WTQ_TEST_CHECK(ds->local_critical);
+                    g_conn_shutdowns = g_term_fired = 0;
+                    drv->shutdown_started = event >= 4;
+                    QUIC_STREAM_EVENT ev = { .Type = event == 0 || event == 4
+                        ? QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED
+                        : QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE };
+                    if (event == 0 || event == 4) ev.PEER_RECEIVE_ABORTED.ErrorCode = 42;
+                    else {
+                        ev.SHUTDOWN_COMPLETE.ConnectionShutdown = event == 2;
+                        ev.SHUTDOWN_COMPLETE.AppCloseInProgress = event == 3;
+                    }
+                    (void)wtq_msq_stream_callback(ds->stream, ds, &ev);
+                    wtq_conn_t *ec = wtq_api_session_conn(sess);
+                    WTQ_TEST_CHECK(wtq_conn_is_closed(ec) == (event < 2));
+                    WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, event < 2 ? 1 : 0);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_fired, event < 2 ? 1 : 0);
+                    if (event < 2) {
+                        WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(ec), WTQ_H3_CLOSED_CRITICAL_STREAM);
+                        WTQ_TEST_CHECK_EQ_INT(g_term_err.kind, WTQ_ERR_KIND_QUIC_APP);
+                        WTQ_TEST_CHECK_EQ_HEX(g_term_err.quic_code, WTQ_H3_CLOSED_CRITICAL_STREAM);
+                        WTQ_TEST_CHECK_EQ_INT(g_term_err.native_domain, WTQ_ERRDOM_NONE);
+                        WTQ_TEST_CHECK_EQ_INT(g_term_err.native_code, 0);
+                        /* Shutdown after STOP must preserve the first cause. */
+                        lifetime_shutdown(ds);
+                        WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, 1);
+                        WTQ_TEST_CHECK_EQ_INT(g_term_fired, 1);
+                    }
+                }
+                wtq_api_session_admission_detach(sess);
+                wtq_session_release(sess);
+                drv->session = NULL; drv->conn = NULL;
+                wtq_msq_conn_free(drv);
+            }
+        }
+        for (unsigned prior = 0; prior < 4; ++prior) {
+            QUIC_API_TABLE api;
+            wtq_session_t *sess = NULL;
+            struct wtq_driver *drv = pause_estab_mode(&api, &sess,
+                wtq_alloc_default(), bounded != 0);
+            WTQ_TEST_CHECK(drv != NULL);
+            if (!drv) continue;
+            wtq_conn_t *ec = wtq_api_session_conn(sess);
+            g_conn_shutdowns = g_term_fired = 0;
+            if (prior < 3) {
+                struct wtq_dstream *ds = drv->streams;
+                while (ds && !ds->local_critical) ds = ds->next;
+                WTQ_TEST_CHECK(ds != NULL);
+                wtq_transport_error_t cause = {
+                    .struct_size = (uint32_t)sizeof(cause),
+                    .kind = WTQ_ERR_KIND_LOCAL,
+                    .quic_code = WTQ_H3_INTERNAL_ERROR,
+                    .native_domain = WTQ_ERRDOM_MSQUIC,
+                    .native_code = 17,
+                };
+                if (prior == 0) wtq_conn_set_transport_error(ec, &cause);
+                else if (prior == 1)
+                    wtq_msq_conn_stage_local_cause(drv, cause.quic_code, 17);
+                else {
+                    /* env_close publishes this latch before queueing native
+                     * shutdown; a stream terminal can be delivered first. */
+                    cause.quic_code = WTQ_H3_NO_ERROR;
+                    cause.native_code = 0;
+                    atomic_store_explicit(&drv->env_close_req, true,
+                        memory_order_release);
+                }
+                if (ds) {
+                    QUIC_STREAM_EVENT ev = { .Type = QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED };
+                    ev.PEER_RECEIVE_ABORTED.ErrorCode = 42;
+                    (void)wtq_msq_stream_callback(ds->stream, ds, &ev);
+                    WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, 1);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_fired, 1);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_err.kind, cause.kind);
+                    WTQ_TEST_CHECK_EQ_HEX(g_term_err.quic_code, cause.quic_code);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_err.native_domain, cause.native_domain);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_err.native_code, cause.native_code);
+                }
+            } else {
+                /* A detached local WT uni also has NULL ectx, but is not critical. */
+                wtq_stream_t *st = NULL;
+                WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &st), WTQ_OK);
+                if (st) {
+                    wtq_stream_add_ref(st);
+                    struct wtq_dstream *ds = drv->streams;
+                    WTQ_TEST_CHECK(!ds->local_critical);
+                    WTQ_TEST_CHECK_EQ_INT(wtq_stream_reset(st, 19), WTQ_OK);
+                    WTQ_TEST_CHECK(ds->ectx == NULL);
+                    lifetime_shutdown(ds);
+                    WTQ_TEST_CHECK(!wtq_conn_is_closed(ec));
+                    WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, 0);
+                    WTQ_TEST_CHECK_EQ_INT(g_term_fired, 0);
+                    complete_all_sends();
+                    wtq_stream_release(st);
+                }
+            }
+            wtq_api_session_admission_detach(sess);
+            wtq_session_release(sess);
+            drv->session = NULL; drv->conn = NULL;
+            wtq_msq_conn_free(drv);
+        }
+    }
+    return failures;
+}
+
 static struct {
     struct wtq_driver *drv;
     wtq_stream_t *lease;
@@ -3029,8 +3402,83 @@ static int test_admission_fifo(void)
     return failures;
 }
 
+static int test_send_commit_dispatch(void)
+{
+    int failures = 0;
+    for (unsigned row = 0; row < 7; ++row) {
+        QUIC_API_TABLE api;
+        wtq_session_t *session = NULL;
+        struct wtq_driver *drv = pause_estab(&api, &session);
+        WTQ_TEST_CHECK(drv != NULL);
+        if (drv == NULL) continue;
+        wtq_stream_t *st = NULL;
+        WTQ_TEST_CHECK(wtq_session_send_commit_mode(session) == WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE);
+        WTQ_TEST_CHECK(wtq_session_open_uni(session, &st) == WTQ_OK);
+        struct wtq_dstream *ds = drv->streams;
+        WTQ_TEST_CHECK(ds != NULL && ds->is_local && !ds->is_bidi);
+        WTQ_TEST_CHECK(ds->ectx_generation == wtq_estream_generation_v1(ds->ectx));
+        complete_all_sends(); /* WT framing buffer return cannot commit */
+        WTQ_TEST_CHECK(wtq_stream_enable_send_commit(st) == WTQ_OK);
+        wtq_stream_add_ref(st);
+        const uint8_t data[] = { 1, 2, 3, 4 };
+        wtq_span_t span = { data, sizeof(data) };
+        WTQ_TEST_CHECK(wtq_stream_send(st, &span, 1, 0, NULL) == WTQ_OK);
+        complete_all_sends(); /* data-only completion cannot commit */
+        WTQ_TEST_CHECK_EQ_INT(g_pr.commit_calls, 0);
+        WTQ_TEST_CHECK(wtq_stream_send(st, NULL, 0, WTQ_SEND_FIN, NULL) == WTQ_OK);
+        complete_all_sends(); /* even all application buffers returned is not FIN ACK */
+        WTQ_TEST_CHECK_EQ_INT(g_pr.commit_calls, 0);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 0);
+        QUIC_STREAM_EVENT ev = { .Type = QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE };
+        g_ord.n = 0;
+        if (row == 1 || row == 2) {
+            WTQ_TEST_CHECK((row == 1 ? wtq_stream_reset(st, 42) : wtq_stream_abort(st, 42)) == WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(g_ord.n, 1);
+            WTQ_TEST_CHECK(g_ord.call[0].stream == ds->stream);
+            WTQ_TEST_CHECK(g_ord.call[0].flags & QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND);
+            WTQ_TEST_CHECK_EQ_U64(g_ord.call[0].code, wtq_app_error_to_h3(42));
+        } else if (row == 3) {
+            QUIC_STREAM_EVENT stop = { .Type = QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED };
+            stop.PEER_RECEIVE_ABORTED.ErrorCode = wtq_app_error_to_h3(7);
+            (void)wtq_msq_stream_callback(ds->stream, ds, &stop);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.stop_code, 7);
+        } else if (row == 4) {
+            QUIC_STREAM_EVENT terminal = { .Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE };
+            (void)wtq_msq_stream_callback(ds->stream, ds, &terminal);
+        } else if (row == 5) {
+            ds->ectx_generation++; /* stale native identity must not match */
+        } else if (row == 6) {
+            ev.SEND_SHUTDOWN_COMPLETE.Graceful = FALSE;
+            (void)wtq_msq_stream_callback(ds->stream, ds, &ev);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.commit_calls, 0);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+        }
+        ev.SEND_SHUTDOWN_COMPLETE.Graceful = TRUE;
+        (void)wtq_msq_stream_callback(ds->stream, ds, &ev);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.commit_calls, row == 0 ? 1 : 0);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, row == 5 ? 0 : 1);
+        (void)wtq_msq_stream_callback(ds->stream, ds, &ev);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.commit_calls, row == 0 ? 1 : 0);
+        if (row == 5) WTQ_TEST_CHECK(wtq_stream_reset(st, 0) == WTQ_OK);
+        wtq_stream_release(st);
+        wtq_session_release(session);
+        drv->session = NULL;
+        drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+    }
+    printf("send_commit_dispatch: failures=%d\n", failures);
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--send-commit") == 0)
+        return test_send_commit_dispatch();
+    if (argc == 2 && strcmp(argv[1], "--abort-terminal") == 0)
+        return test_abort_shutdown_completion() + test_abort_pooled_shutdown_credit() +
+            test_terminal_callback_reentrancy() + test_terminal_deferred_fin();
+    if (argc == 2 && strcmp(argv[1], "--local-critical") == 0)
+        return test_local_critical_shutdown();
     if (argc == 2 && strcmp(argv[1], "--admission-bidi-reset") == 0)
         return test_admission_bidi_reset();
     if (argc == 2 && strcmp(argv[1], "--admission-resume-failure") == 0)
@@ -3053,6 +3501,7 @@ int main(int argc, char **argv)
         return test_recv_callback_quantum();
     bool baseline = argc == 2 && strcmp(argv[1], "--baseline") == 0;
     int failures = 0;
+    failures += test_send_commit_dispatch();
     failures += test_peer_stream_started_handler_before_shutdown();
     failures += test_peer_stream_started_accepted();
     test_tuning_stream_credits(&failures);
@@ -3078,6 +3527,11 @@ int main(int argc, char **argv)
     failures += test_recv_fin_deferred_while_paused();
     failures += test_settings_non_multi_receive();
     if (!baseline) {
+        failures += test_abort_shutdown_completion();
+        failures += test_abort_pooled_shutdown_credit();
+        failures += test_terminal_callback_reentrancy();
+        failures += test_terminal_deferred_fin();
+        failures += test_local_critical_shutdown();
         failures += test_recv_callback_pause_multibuffer();
         failures += test_recv_callback_pause_opened();
         failures += test_recv_callback_quantum();

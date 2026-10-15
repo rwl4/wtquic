@@ -54,6 +54,12 @@ struct side {
      * on_established callback of the real MsQuic backend */
     int prof_rc;
     int prof;
+    wtq_result_t metadata_rc;
+    char metadata_authority[512];
+    size_t metadata_authority_len;
+    char metadata_path[128];
+    size_t metadata_path_len;
+    const char *connect_authority;
     uint32_t closed_code;
     bool closed_clean;
     char closed_reason[64];
@@ -277,6 +283,16 @@ static void cb_established(wtq_session_t *s, wtq_str_t sub, void *user)
         wtq_webtransport_profile_t prof = (wtq_webtransport_profile_t)0x7f;
         sd->prof_rc = (int)wtq_session_webtransport_profile(s, &prof);
         sd->prof = (int)prof;
+        wtq_connect_request_metadata_t metadata = WTQ_CONNECT_REQUEST_METADATA_INIT;
+        sd->metadata_rc = wtq_session_connect_request_metadata(s, &metadata);
+        if (sd->metadata_rc == WTQ_OK) {
+            sd->metadata_authority_len = metadata.authority.len;
+            sd->metadata_path_len = metadata.path.len;
+            if (metadata.authority.len <= sizeof(sd->metadata_authority))
+                memcpy(sd->metadata_authority, metadata.authority.data, metadata.authority.len);
+            if (metadata.path.len <= sizeof(sd->metadata_path))
+                memcpy(sd->metadata_path, metadata.path.data, metadata.path.len);
+        }
     }
     pthread_mutex_unlock(&sd->mu);
 
@@ -907,7 +923,7 @@ static wtq_result_t client_up_profile(wtq_msquic_env_t *env, struct side *sd,
     wtq_msquic_client_cfg_t cfg = WTQ_MSQUIC_CLIENT_CFG_INIT;
 
     events_for(&ev);
-    connect.authority = "localhost";
+    connect.authority = sd->connect_authority ? sd->connect_authority : "localhost";
     connect.path = path;
     connect.subprotocols = protos;
     connect.subprotocol_count = 1;
@@ -1326,6 +1342,10 @@ static int t_profile_negotiation(void)
     wtq_msquic_env_t *env = NULL;
     wtq_msquic_listener_t *listener = NULL;
     struct side sv;
+    char authority[301];
+    memset(authority, 'a', 300);
+    authority[300] = 0;
+    const char *path = "/echo?x=%2F";
     static const uint32_t cases[] = {
         (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_CURRENT,
         (uint32_t)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
@@ -1335,7 +1355,7 @@ static int t_profile_negotiation(void)
     side_init(&sv);
     WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&ecfg, &env), WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(
-        listener_up_profiles(env, &sv, "/echo",
+        listener_up_profiles(env, &sv, path,
                              WTQ_WEBTRANSPORT_PROFILES_ALL, &listener),
         WTQ_OK);
     if (env == NULL || listener == NULL)
@@ -1347,6 +1367,7 @@ static int t_profile_negotiation(void)
         wtq_session_t *cs = NULL;
 
         side_init(&cl);
+        cl.connect_authority = authority;
         cl.close_in_established = true;
         cl.close_code = 0;
         cl.close_reason = "done";
@@ -1360,7 +1381,7 @@ static int t_profile_negotiation(void)
         pthread_mutex_unlock(&sv.mu);
 
         WTQ_TEST_CHECK_EQ_INT(
-            client_up_profile(env, &cl, port, "/echo", cases[i], &cs),
+            client_up_profile(env, &cl, port, path, cases[i], &cs),
             WTQ_OK);
         WTQ_TEST_CHECK(side_wait(&cl, &cl.closed));
         WTQ_TEST_CHECK_EQ_INT(cl.established, 1);
@@ -1368,6 +1389,7 @@ static int t_profile_negotiation(void)
         /* the CLIENT's own callback saw its requested profile selected */
         WTQ_TEST_CHECK_EQ_INT(cl.prof_rc, (int)WTQ_OK);
         WTQ_TEST_CHECK_EQ_INT(cl.prof, (int)cases[i]);
+        WTQ_TEST_CHECK(cl.metadata_rc == WTQ_ERR_STATE);
 
         /* Wait for the SERVER's OWN i-th establishment before reading its
          * query. sv.established is cumulative, so a non-zero test would be
@@ -1379,6 +1401,11 @@ static int t_profile_negotiation(void)
         pthread_mutex_lock(&sv.mu);
         int srv_rc = sv.prof_rc;
         int srv_prof = sv.prof;
+        WTQ_TEST_CHECK(sv.metadata_rc == WTQ_OK);
+        WTQ_TEST_CHECK_EQ_SIZE(sv.metadata_authority_len, 300);
+        WTQ_TEST_CHECK(memcmp(sv.metadata_authority, authority, 300) == 0);
+        WTQ_TEST_CHECK_EQ_SIZE(sv.metadata_path_len, strlen(path));
+        WTQ_TEST_CHECK(memcmp(sv.metadata_path, path, strlen(path)) == 0);
         pthread_mutex_unlock(&sv.mu);
         WTQ_TEST_CHECK_EQ_INT(srv_rc, (int)WTQ_OK);
         WTQ_TEST_CHECK_EQ_INT(srv_prof, (int)cases[i]);
@@ -2045,6 +2072,8 @@ int main(int argc, char **argv)
 
     if (certs_locate(argc > 1 ? argv[1] : NULL) != 0)
         return 2;
+    if (argc > 2 && strcmp(argv[2], "--metadata") == 0)
+        return t_profile_negotiation() == 0 ? 0 : 1;
 
     /* deterministic content for the byte-exact pause/resume check */
     for (size_t i = 0; i < sizeof(budget_a); i++)

@@ -425,6 +425,16 @@ struct wtq_msquic_env {
  * record types. */
 struct wtq_msq_send_hdr {
     bool gather;
+    bool flush_bytes;       /* nonempty reliable submission, not a FIN proof */
+    bool flush_fin;
+    uint64_t flush_epoch;
+};
+
+/* Transient shutdown transaction, owned by the active API stack frame. */
+struct wtq_msq_flush_decision {
+    struct wtq_msq_flush_decision *previous;
+    bool loss;
+    bool shutdown_complete;
 };
 
 /* One in-flight borrow-during-call send: the QUIC_BUFFER and a copy of
@@ -476,9 +486,23 @@ struct wtq_dstream {
     struct wtq_driver *drv;
     HQUIC stream;            /* NULL once the stream shut down */
     wtq_estream_t *ectx;     /* engine ctx; NULL = engine refused it */
+    uint64_t ectx_generation;
     struct wtq_dstream *next;
     size_t send_refs;        /* cold and gather records, including empty sends */
+    size_t flush_sends;      /* nonempty sends awaiting ACK/return */
+    bool flush_fin;          /* accepted FIN awaiting graceful send shutdown */
+    size_t flush_required_sends;
+    uint64_t flush_epoch;    /* accepted supersession boundary, reset with ds */
+    bool flush_wt_data;      /* classification retained across engine detach */
+    bool flush_settling;
+    bool flush_abort_complete;
+    bool flush_shutdown_pending;
+    bool flush_shutdown_graceful;
+    bool flush_output_canceled; /* same-stream reliable output cannot commit */
+    struct wtq_msq_flush_decision *flush_decision;
     bool shutdown_complete;
+    bool terminal_pending;  /* whole-terminal input awaits a safe engine boundary */
+    bool local_critical;    /* latched at open, never inferred after detach */
     bool pooled;
     bool occupied;
     bool credit_held;
@@ -536,6 +560,11 @@ struct wtq_driver {
     int pending_sends;       /* send records awaiting SEND_COMPLETE
                                 (cold and gather both — the close flush
                                 gate waits for all of them) */
+    /* One session per connection: includes all cold protocol output and
+     * application gathers. Counts obligations, not historical sends/bytes. */
+    size_t flush_sends, flush_fins;
+    size_t flush_settlements, flush_decisions;
+    bool flush_failed;       /* sticky accepted-output loss, never reset */
     int dgram_inflight;      /* datagram records awaiting a final state */
     uint64_t dgram_max;      /* transport datagram limit (0 = disabled) */
     uint64_t local_uni_count;  /* local streams opened, by type — the */
@@ -593,6 +622,106 @@ struct wtq_driver {
     struct wtq_driver *env_next;
     struct wtq_driver *env_prev;
 };
+
+/* Publish before provider submission: synchronous completions may reenter.
+ * A refused submission has no callback and rolls back exactly its additions. */
+static inline bool wtq_msq_flush_begin(struct wtq_dstream *ds, bool bytes, bool fin)
+{
+    if (bytes) {
+        ds->flush_sends++; ds->drv->flush_sends++;
+        ds->flush_required_sends++;
+    }
+    bool new_fin = fin && !ds->flush_fin;
+    if (new_fin) { ds->flush_fin = true; ds->drv->flush_fins++; }
+    return new_fin;
+}
+
+static inline void wtq_msq_flush_rollback(struct wtq_dstream *ds,
+    bool bytes, bool new_fin)
+{
+    if (bytes) {
+        ds->flush_sends--; ds->drv->flush_sends--;
+        ds->flush_required_sends--;
+    }
+    if (new_fin) { ds->flush_fin = false; ds->drv->flush_fins--; }
+}
+
+static inline void wtq_msq_flush_fail(struct wtq_driver *drv)
+{
+    drv->flush_failed = true;
+    /* Session-owned history survives this driver's free, including a loss
+     * discovered after the session's terminal callback has already run. */
+    if (drv->session) wtq_api_session_local_flush_failed(drv->session);
+}
+
+static inline bool wtq_msq_flush_pending(const struct wtq_driver *drv)
+{
+    return drv->flush_sends || drv->flush_fins || drv->flush_settlements ||
+        drv->flush_decisions;
+}
+
+static inline void wtq_msq_flush_discard(struct wtq_dstream *ds)
+{
+    if (ds->flush_required_sends || ds->flush_fin || ds->flush_settling ||
+        ds->flush_decision) wtq_msq_flush_fail(ds->drv);
+    if (ds->flush_fin) { ds->flush_fin = false; ds->drv->flush_fins--; }
+    /* Byte obligations retire with their records, even after engine detach. */
+}
+
+static inline bool wtq_msq_flush_is_wt(struct wtq_dstream *ds)
+{
+    return !ds->local_critical && (ds->is_local || ds->is_bidi) &&
+        (ds->flush_wt_data ||
+        wtq_estream_is_wt_data_v1(ds->ectx, ds));
+}
+
+static inline void wtq_msq_flush_settle(struct wtq_dstream *ds)
+{
+    if (ds->flush_settling && ds->flush_abort_complete &&
+        !ds->send_refs && !ds->flush_decision) {
+        ds->flush_settling = false;
+        ds->drv->flush_settlements--;
+    }
+}
+
+static inline void wtq_msq_flush_withdraw(struct wtq_dstream *ds)
+{
+    /* Never clear loss history. A new epoch supersedes only older records. */
+    if (ds->flush_epoch == UINT64_MAX) { wtq_msq_flush_fail(ds->drv); return; }
+    ds->flush_epoch++;
+    ds->flush_required_sends = 0;
+    if (ds->flush_fin) { ds->flush_fin = false; ds->drv->flush_fins--; }
+    if (!ds->flush_settling) {
+        ds->flush_settling = true;
+        ds->drv->flush_settlements++;
+    }
+    wtq_msq_flush_settle(ds);
+}
+
+static inline void wtq_msq_flush_cancel_loss(struct wtq_dstream *ds)
+{
+    if (ds->flush_decision) ds->flush_decision->loss = true;
+    else wtq_msq_flush_fail(ds->drv);
+}
+
+static inline void wtq_msq_flush_complete(struct wtq_dstream *ds,
+    const struct wtq_msq_send_hdr *h, bool canceled)
+{
+    if (canceled && (h->flush_bytes || h->flush_fin))
+        ds->flush_output_canceled = true;
+    bool required = h->flush_epoch == ds->flush_epoch;
+    if (canceled && required && (h->flush_bytes || h->flush_fin)) {
+        wtq_msq_flush_cancel_loss(ds);
+        if (h->flush_fin && ds->flush_fin) {
+            ds->flush_fin = false;
+            ds->drv->flush_fins--;
+        }
+    }
+    if (h->flush_bytes) {
+        ds->flush_sends--; ds->drv->flush_sends--;
+        if (required) ds->flush_required_sends--;
+    }
+}
 
 struct wtq_msquic_listener {
     wtq_alloc_t alloc;
@@ -685,6 +814,8 @@ void wtq_msq_conn_abandon(struct wtq_driver *drv);
  */
 void wtq_msq_conn_stage_local_cause(struct wtq_driver *drv, uint64_t code,
                                     int64_t status);
+/* Consume the env-thread request on-domain before classifying a terminal. */
+void wtq_msq_conn_consume_env_close(struct wtq_driver *drv);
 
 /*
  * Deliver the staged causal tuple to the engine (write-once there),

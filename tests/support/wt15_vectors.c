@@ -728,6 +728,7 @@ int wt15_vector_feed_hostile(const wt15_vector_t *v, const uint8_t *wire,
          * for something other than WebTransport. */
         if (st != WTQ_CONNECT_OK && st != WTQ_CONNECT_BUFFER &&
             st != WTQ_CONNECT_MALFORMED &&
+            st != WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED &&
             st != WTQ_CONNECT_NOT_WEBTRANSPORT)
             return vfail(v, "dirty connect-req status %d", st);
         return 0;
@@ -739,7 +740,8 @@ int wt15_vector_feed_hostile(const wt15_vector_t *v, const uint8_t *wire,
             wire, wire_len, &WT15_STRICT, &resp, scratch,
             sizeof(scratch));
         if (st != WTQ_CONNECT_OK && st != WTQ_CONNECT_BUFFER &&
-            st != WTQ_CONNECT_MALFORMED)
+            st != WTQ_CONNECT_MALFORMED &&
+            st != WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED)
             return vfail(v, "dirty connect-resp status %d", st);
         return 0;
     }

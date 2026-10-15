@@ -20,6 +20,8 @@ set(ALLOWED_SYMBOLS
     wtq_version
     # session/stream public API
     wtq_session_events_init
+    wtq_session_events_init_ex
+    wtq_session_send_commit_mode
     wtq_connect_config_init
     wtq_connect_config_init_ex
     wtq_serve_config_init
@@ -35,14 +37,18 @@ set(ALLOWED_SYMBOLS
     wtq_session_send_datagram
     wtq_session_datagram_max_size
     wtq_session_status
+    wtq_session_local_flush
+    wtq_session_local_flush_mode
     wtq_session_transport_error
     wtq_session_subprotocol
+    wtq_session_connect_request_metadata
     wtq_session_webtransport_profile
     wtq_session_set_user
     wtq_session_get_user
     wtq_stream_add_ref
     wtq_stream_release
     wtq_stream_send
+    wtq_stream_enable_send_commit
     wtq_stream_reset
     wtq_stream_abort
     wtq_stream_stop_sending
@@ -63,6 +69,8 @@ set(ALLOWED_SYMBOLS
     wtq_api_session_create_admission
     wtq_api_session_admission_root
     wtq_api_session_admission_detach
+    wtq_api_session_set_local_flush
+    wtq_api_session_local_flush_failed
     wtq_api_session_admit
     wtq_conn_peer_admission_init
     wtq_conn_peer_admission_bytes
@@ -88,6 +96,9 @@ set(ALLOWED_SYMBOLS
     wtq_conn_set_transport_error
     wtq_conn_on_datagram
     wtq_conn_on_send_complete
+    wtq_conn_on_stream_send_shutdown_v1
+    wtq_estream_generation_v1
+    wtq_estream_is_wt_data_v1
     wtq_conn_session_state
     wtq_conn_validate_protocols
     wtq_conn_validate_origin_policy

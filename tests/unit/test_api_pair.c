@@ -32,6 +32,7 @@ struct side {
     /* app state */
     int established;
     int failed;
+    uint16_t refused_status;
     int draining;
     int closed;
     uint32_t closed_code;
@@ -53,6 +54,8 @@ struct side {
     int cb_query_rc;
     int cb_profile;
     int cb_status_after_query;
+    wtq_connect_request_metadata_t cb_metadata;
+    wtq_result_t cb_metadata_rc;
     wtq_estream_t *es_for_slot[FAKE_MAX_STREAMS];
 };
 
@@ -68,6 +71,14 @@ static void on_established(wtq_session_t *s, wtq_str_t sub, void *user)
     /* a following status query from the same callback still behaves
      * normally — this records that STATUS, not callback depth */
     sd->cb_status_after_query = (int)wtq_session_status(s);
+    sd->cb_metadata = (wtq_connect_request_metadata_t)WTQ_CONNECT_REQUEST_METADATA_INIT;
+    sd->cb_metadata_rc = wtq_session_connect_request_metadata(s, &sd->cb_metadata);
+}
+
+static void on_refused(wtq_session_t *s, uint16_t status, void *user)
+{
+    (void)s;
+    ((side_t *)user)->refused_status = status;
 }
 
 static void on_failed(wtq_session_t *s, wtq_connect_failure_t why,
@@ -187,6 +198,7 @@ static int side_up_profiles_alloc(side_t *sd, char label, bool client,
     fake_driver_init(&sd->drv, client);
     wtq_session_events_init(&ev);
     ev.on_established = on_established;
+    ev.on_refused = on_refused;
     ev.on_failed = on_failed;
     ev.on_draining = on_draining;
     ev.on_closed = on_closed;
@@ -1171,9 +1183,156 @@ static int scenario_authoritative_set_ignores_singular(uint64_t seed, int *fp)
     return 0;
 }
 
+static void metadata_error(wtq_session_t *s, uint32_t size,
+                           wtq_result_t expected, int *fp)
+{
+    int failures = 0;
+    wtq_connect_request_metadata_t out;
+    unsigned char before[sizeof(out)];
+    memset(&out, 0xa5, sizeof(out));
+    out.struct_size = size;
+    memcpy(before, &out, sizeof(out));
+    WTQ_TEST_CHECK(wtq_session_connect_request_metadata(s, &out) == expected);
+    WTQ_TEST_CHECK(memcmp(before, &out, sizeof(out)) == 0);
+    *fp += failures;
+}
+
+static void metadata_equal(const wtq_connect_request_metadata_t *m,
+                           const char *authority, const char *path, int *fp)
+{
+    int failures = 0;
+    WTQ_TEST_CHECK(m->reserved0 == 0);
+    WTQ_TEST_CHECK(m->authority.data != NULL && m->authority.len == strlen(authority));
+    WTQ_TEST_CHECK(m->path.data != NULL && m->path.len == strlen(path));
+    if (m->authority.data && m->authority.len == strlen(authority))
+        WTQ_TEST_CHECK(memcmp(m->authority.data, authority, m->authority.len) == 0);
+    if (m->path.data && m->path.len == strlen(path))
+        WTQ_TEST_CHECK(memcmp(m->path.data, path, m->path.len) == 0);
+    *fp += failures;
+}
+
+static void scenario_connect_metadata(int profile, const char *path,
+                                      const char *authority, int *fp)
+{
+    int failures = 0;
+    static side_t c, s;
+    wtq_fault_alloc_t fa;
+    wtq_fault_alloc_init(&fa);
+    if (side_up_profiles_alloc(&c, 'c', true, profile, 0, &fa.vtable, fp) ||
+        side_up_profiles_alloc(&s, 's', false, 0, WTQ_WEBTRANSPORT_PROFILES_ALL,
+                               &fa.vtable, fp))
+        return;
+    const uint32_t v1 = (uint32_t)(offsetof(wtq_connect_request_metadata_t, path) +
+                                   sizeof(wtq_str_t));
+    metadata_error(s.s, v1, WTQ_ERR_STATE, fp);
+    metadata_error(c.s, v1, WTQ_ERR_STATE, fp);
+    metadata_error(NULL, v1, WTQ_ERR_INVALID_ARG, fp);
+    WTQ_TEST_CHECK(wtq_session_connect_request_metadata(s.s, NULL) == WTQ_ERR_INVALID_ARG);
+    for (uint32_t size = 0; size < v1; ++size)
+        metadata_error(s.s, size, WTQ_ERR_INVALID_ARG, fp);
+
+    wtq_serve_config_t sc = WTQ_SERVE_CONFIG_INIT;
+    sc.path = path;
+    serve_with_test_origin(&sc);
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &sc, 1) == WTQ_OK);
+    wtq_connect_config_t cc = WTQ_CONNECT_CONFIG_INIT;
+    cc.authority = authority;
+    cc.path = path;
+    cc.origin = TEST_ORIGINS[0];
+    cc.webtransport_profile = (uint32_t)profile;
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    int attempts = fa.attempts;
+    pump(0xC027, &c, &s);
+    WTQ_TEST_CHECK_EQ_INT(fa.attempts, attempts); /* no accept allocation */
+    WTQ_TEST_CHECK_EQ_INT(c.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(s.established, 1);
+    WTQ_TEST_CHECK(s.cb_metadata_rc == WTQ_OK);
+    WTQ_TEST_CHECK(c.cb_metadata_rc == WTQ_ERR_STATE);
+    metadata_equal(&s.cb_metadata, authority, path, fp);
+    metadata_error(c.s, v1, WTQ_ERR_STATE, fp);
+    for (uint32_t size = 0; size < v1; ++size)
+        metadata_error(s.s, size, WTQ_ERR_INVALID_ARG, fp);
+
+    struct {
+        wtq_connect_request_metadata_t value;
+        unsigned char tail[19];
+    } future;
+    memset(&future, 0xa5, sizeof(future));
+    future.value.struct_size = sizeof(future);
+    WTQ_TEST_CHECK(wtq_session_connect_request_metadata(s.s, &future.value) == WTQ_OK);
+    WTQ_TEST_CHECK(future.value.struct_size == sizeof(future));
+    metadata_equal(&future.value, authority, path, fp);
+    for (size_t i = v1; i < sizeof(future); ++i)
+        WTQ_TEST_CHECK(((const unsigned char *)&future)[i] == 0xa5);
+    wtq_connect_request_metadata_t exact = WTQ_CONNECT_REQUEST_METADATA_INIT;
+    exact.struct_size = v1;
+    WTQ_TEST_CHECK(wtq_session_connect_request_metadata(s.s, &exact) == WTQ_OK);
+    WTQ_TEST_CHECK(exact.struct_size == v1);
+    metadata_equal(&exact, authority, path, fp);
+    WTQ_TEST_CHECK(exact.authority.data == s.cb_metadata.authority.data);
+    WTQ_TEST_CHECK(exact.path.data == s.cb_metadata.path.data);
+
+    wtq_session_add_ref(s.s);
+    WTQ_TEST_CHECK(wtq_session_close(s.s, 0, NULL, 0) == WTQ_OK);
+    pump(0xC027, &c, &s);
+    WTQ_TEST_CHECK_EQ_INT(s.closed, 1);
+    WTQ_TEST_CHECK(wtq_session_status(s.s) == WTQ_SESSION_STATUS_CLOSED);
+    wtq_session_release(s.s);
+    WTQ_TEST_CHECK(wtq_session_connect_request_metadata(s.s, &exact) == WTQ_OK);
+    metadata_equal(&exact, authority, path, fp);
+    WTQ_TEST_CHECK(exact.authority.data == s.cb_metadata.authority.data);
+    WTQ_TEST_CHECK(exact.path.data == s.cb_metadata.path.data);
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+    WTQ_TEST_CHECK_EQ_INT(fa.live, 0);
+    WTQ_TEST_CHECK_EQ_INT(fa.errors, 0);
+    *fp += failures;
+}
+
+static void scenario_metadata_unavailable(int *fp)
+{
+    int failures = 0;
+    static side_t c, s;
+    if (side_up(&c, 'c', true, fp) || side_up(&s, 's', false, fp))
+        return;
+    wtq_serve_config_t sc = WTQ_SERVE_CONFIG_INIT;
+    sc.path = "/moq";
+    WTQ_TEST_CHECK(wtq_api_session_serve(s.s, &sc, 1) == WTQ_OK);
+    wtq_connect_config_t cc = WTQ_CONNECT_CONFIG_INIT;
+    cc.authority = "example.com";
+    cc.path = "/moq?x=1"; /* query must not become wildcard matching */
+    WTQ_TEST_CHECK(wtq_api_session_connect(c.s, &cc) == WTQ_OK);
+    pump(0xC027, &c, &s);
+    WTQ_TEST_CHECK(wtq_session_status(c.s) == WTQ_SESSION_STATUS_FAILED);
+    WTQ_TEST_CHECK_EQ_INT(c.refused_status, 404);
+    WTQ_TEST_CHECK_EQ_INT(s.established, 0);
+    metadata_error(c.s, sizeof(wtq_connect_request_metadata_t), WTQ_ERR_STATE, fp);
+    metadata_error(s.s, sizeof(wtq_connect_request_metadata_t), WTQ_ERR_STATE, fp);
+    wtq_conn_on_conn_closed(wtq_api_session_conn(s.s), 1, false, 10);
+    WTQ_TEST_CHECK(wtq_session_status(s.s) == WTQ_SESSION_STATUS_FAILED);
+    metadata_error(s.s, sizeof(wtq_connect_request_metadata_t), WTQ_ERR_STATE, fp);
+    wtq_session_release(c.s);
+    wtq_session_release(s.s);
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
+
+    char long_path[129], long_authority[301];
+    memset(long_path, 'p', 128);
+    long_path[0] = '/';
+    long_path[128] = 0;
+    memset(long_authority, 'a', 300);
+    long_authority[300] = 0;
+    for (int profile = 0; profile <= 2; ++profile) {
+        scenario_connect_metadata(profile, "/moq?x=1", "MiXeD.Example:443", &failures);
+        scenario_connect_metadata(profile, "/moq?", "[::1]:443", &failures);
+        scenario_connect_metadata(profile, long_path, "example.com", &failures);
+        scenario_connect_metadata(profile, "/moq?x=%2F#raw", long_authority, &failures);
+    }
+    scenario_metadata_unavailable(&failures);
 
     (void)scenario_api_pair(0xAB1E, &failures);
     (void)scenario_api_pair(0x5EED, &failures); /* other chunking */

@@ -87,6 +87,35 @@ static bool scheme_ieq(const wtq_qpack_field_t *f, const char *lit)
     return span_ieq(f->value, f->value_len, lit, strlen(lit));
 }
 
+/* RFC 9114 s4.2 and RFC 9110 s10.1.4: request TE may contain only
+ * trailers tokens. Accept case-insensitive list members and ignore
+ * empty members per RFC 9110 s5.6.1.2; field size bounds the work. */
+static bool te_is_trailers(const wtq_qpack_field_t *f)
+{
+    bool seen = false;
+    size_t off = 0;
+    while (off < f->value_len) {
+        size_t start = off;
+        while (off < f->value_len && f->value[off] != ',')
+            off++;
+        size_t end = off;
+        while (start < end &&
+               (f->value[start] == ' ' || f->value[start] == '\t'))
+            start++;
+        while (end > start &&
+               (f->value[end - 1] == ' ' || f->value[end - 1] == '\t'))
+            end--;
+        if (start != end) {
+            if (!span_ieq(f->value + start, end - start, "trailers", 8))
+                return false;
+            seen = true;
+        }
+        if (off < f->value_len)
+            off++;
+    }
+    return seen;
+}
+
 /* Field-value syntax (RFC 9110 field-content): empty is valid; a
  * nonempty value begins and ends with VCHAR (0x21-0x7E) or obs-text
  * (0x80-0xFF), with SP/HTAB additionally allowed between. CTLs — CR,
@@ -167,7 +196,8 @@ typedef struct walk {
 
 static wtq_connect_status_t walk_init(walk_t *w, const uint8_t *section,
                                       size_t len, char *scratch,
-                                      size_t scratch_cap)
+                                      size_t scratch_cap,
+                                      bool request_headers)
 {
     size_t count = 0;
     wtq_qpack_status_t st =
@@ -178,7 +208,7 @@ static wtq_connect_status_t walk_init(walk_t *w, const uint8_t *section,
     if (st == WTQ_QPACK_BUFFER)
         return WTQ_CONNECT_BUFFER;
     if (st != WTQ_QPACK_OK)
-        return WTQ_CONNECT_MALFORMED;
+        return WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED;
 
     w->count = count;
     w->sf_off = scratch_high_water(w->fields, count, scratch, scratch_cap);
@@ -198,6 +228,16 @@ static wtq_connect_status_t walk_init(walk_t *w, const uint8_t *section,
                 return WTQ_CONNECT_MALFORMED;
         } else {
             seen_regular = true;
+            const wtq_qpack_field_t *f = &w->fields[i];
+            /* Pseudo-headers are control data, not HTTP fields; their
+             * context-specific semantics are checked by the caller. */
+            if (name_is(f, "connection") || name_is(f, "keep-alive") ||
+                name_is(f, "proxy-connection") ||
+                name_is(f, "transfer-encoding") || name_is(f, "upgrade"))
+                return WTQ_CONNECT_MALFORMED;
+            if (name_is(f, "te") &&
+                (!request_headers || !te_is_trailers(f)))
+                return WTQ_CONNECT_MALFORMED;
         }
     }
     return WTQ_CONNECT_OK;
@@ -241,7 +281,7 @@ wtq_connect_status_t wtq_connect_decode_request(
 {
     walk_t w;
     wtq_connect_status_t st = walk_init(&w, section, len, scratch,
-                                        scratch_cap);
+                                        scratch_cap, true);
     if (st != WTQ_CONNECT_OK)
         return st;
 
@@ -412,7 +452,7 @@ wtq_connect_status_t wtq_connect_validate_trailers(const uint8_t *section,
     /* The universal rules (QPACK decode, lowercase token names, RFC
      * 9110 field-content values) come free with the walk. */
     wtq_connect_status_t st = walk_init(&w, section, len, scratch,
-                                        scratch_cap);
+                                        scratch_cap, false);
 
     if (st != WTQ_CONNECT_OK)
         return st;
@@ -430,7 +470,7 @@ wtq_connect_status_t wtq_connect_decode_response(
 {
     walk_t w;
     wtq_connect_status_t st = walk_init(&w, section, len, scratch,
-                                        scratch_cap);
+                                        scratch_cap, false);
     if (st != WTQ_CONNECT_OK)
         return st;
 

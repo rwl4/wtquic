@@ -47,14 +47,17 @@ extern "C" {
 typedef int wtq_connect_status_t;
 #define WTQ_CONNECT_OK          0
 #define WTQ_CONNECT_BUFFER      (-1) /* scratch/array capacity too small */
-#define WTQ_CONNECT_MALFORMED   (-2) /* bad QPACK, bad SF, or bad header
-                                        semantics */
+#define WTQ_CONNECT_MALFORMED   (-2) /* bad HTTP field semantics/input */
 #define WTQ_CONNECT_NO_PROTOCOL (-3) /* protocol negotiation: no overlap */
 /* A well-formed HTTP request that simply is not a WebTransport extended
  * CONNECT: an ordinary method (GET, ...), a plain CONNECT tunnel, or an
  * extended CONNECT for some other :protocol. The peer did nothing wrong
  * — the caller answers with a response, never a protocol error. */
 #define WTQ_CONNECT_NOT_WEBTRANSPORT (-4)
+/* Invalid encoded field section under our zero-dynamic-table contract:
+ * caller MUST use connection error QPACK_DECOMPRESSION_FAILED (0x200),
+ * not a stream-local HTTP message error. Decode/validate only. */
+#define WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED (-5)
 
 typedef struct wtq_connect_opts {
     bool lenient_sf_tokens;      /* accept bare-token SF members */
@@ -106,16 +109,17 @@ static inline bool wtq_connect_status_is_success(uint16_t status)
 }
 
 /*
- * Decode a request field section, classifying it three ways:
+ * Decode a request field section:
  *
  *   OK               - a WebTransport extended CONNECT; *out is filled.
  *   NOT_WEBTRANSPORT - a well-formed request that is not one: an
  *                      ordinary method, a plain CONNECT tunnel, or an
  *                      extended CONNECT for another :protocol. *out is
  *                      NOT filled; answer with an HTTP response.
- *   MALFORMED        - an HTTP/3 message-syntax violation (bad QPACK,
- *                      bad field name/value, missing or misplaced
- *                      pseudo-headers, a non-token :method / :protocol,
+ *   MALFORMED        - an HTTP/3 message-syntax violation (bad field
+ *                      name/value, prohibited connection fields or TE,
+ *                      missing or misplaced pseudo-headers, a non-token
+ *                      :method / :protocol,
  *                      a :scheme violating RFC 3986, a missing/empty/
  *                      duplicate/conflicting authority source on an
  *                      http(s) request, a WebTransport CONNECT whose
@@ -124,10 +128,15 @@ static inline bool wtq_connect_status_is_success(uint16_t status)
  *   BUFFER           - a LOCAL capacity limit (field count or scratch),
  *                      not a peer error; answer with a stream-local
  *                      H3_EXCESSIVE_LOAD, never H3_MESSAGE_ERROR.
+ *   QPACK_DECOMPRESSION_FAILED - invalid QPACK encoding; the caller
+ *                      MUST use a CONNECTION error of type
+ *                      QPACK_DECOMPRESSION_FAILED (RFC 9204 s2.2/s6).
  *
  * Generic URI schemes are compared case-insensitively (RFC 3986 s3.1)
  * when deciding whether a request is http(s); WebTransport's own
  * :scheme check is exact lowercase "https" per draft-15 s3.2.
+ * TE is permitted only in request headers with trailers tokens (ASCII
+ * case-insensitive); all other connection-specific fields are rejected.
  *
  * protocols[] receives the wt-available-protocols members (count 0 when
  * the header is absent — or present-but-malformed SF, which the draft
@@ -142,9 +151,10 @@ wtq_connect_status_t wtq_connect_decode_request(
 /*
  * Validate a TRAILING field section (RFC 9114 s4.1/s4.3): the same
  * QPACK decode and universal name/value rules as a header section, plus
- * "no pseudo-headers". Regular fields are accepted and intentionally
- * not reported — wtquic exposes no trailer API. OK / MALFORMED /
- * BUFFER carry the same meanings as wtq_connect_decode_request.
+ * "no pseudo-headers". Connection-specific fields (including TE) are
+ * rejected; other regular fields are intentionally not reported.
+ * OK / MALFORMED / BUFFER / QPACK_DECOMPRESSION_FAILED carry the same
+ * meanings as wtq_connect_decode_request.
  */
 wtq_connect_status_t wtq_connect_validate_trailers(const uint8_t *section,
                                                    size_t len,
@@ -155,6 +165,8 @@ wtq_connect_status_t wtq_connect_validate_trailers(const uint8_t *section,
  * Decode a response field section. A missing/malformed wt-protocol is
  * reported via has_protocol == false (the draft ignores the field);
  * duplicate wt-protocol headers are MALFORMED.
+ * Connection-specific fields (including TE) are MALFORMED. QPACK and
+ * capacity errors have the same meanings as decode_request.
  */
 wtq_connect_status_t wtq_connect_decode_response(
     const uint8_t *section, size_t len, const wtq_connect_opts_t *opts,

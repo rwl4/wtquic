@@ -407,10 +407,11 @@ static int f_malformed_request_qpack(wtq_apipair_t *p)
     uint8_t req[64];
     size_t rl = build_headers_garbage(req, sizeof(req));
     wtq_apipair_inject_stream(p, 's', 0, true, req, rl, false, 0);
-    /* RFC 9114 s4.1.2: a malformed request is a STREAM error — the
-     * offending request stream is reset, the connection lives on and
-     * no session is established. */
-    SC_CHECK(!wtq_conn_is_closed(wtq_apipair_conn(p, 's')));
+    /* QPACK decompression failure is connection-fatal (RFC 9204 s4.5),
+     * distinct from malformed HTTP fields after successful decoding. */
+    SC_CHECK(wtq_conn_is_closed(wtq_apipair_conn(p, 's')));
+    SC_CHECK(wtq_conn_close_code(wtq_apipair_conn(p, 's')) ==
+             WTQ_QPACK_DECOMPRESSION_FAILED);
     SC_CHECK(!wtq_conn_session_established(wtq_apipair_conn(p, 's')));
     return failures;
 }
@@ -427,7 +428,7 @@ static int f_malformed_response_qpack(wtq_apipair_t *p)
     SC_CHECK(p->c.failed == 1);
     SC_CHECK(wtq_conn_is_closed(wtq_apipair_conn(p, 'c')));
     SC_CHECK(wtq_conn_close_code(wtq_apipair_conn(p, 'c')) ==
-             WTQ_H3_MESSAGE_ERROR);
+             WTQ_QPACK_DECOMPRESSION_FAILED);
     return failures;
 }
 
@@ -718,9 +719,9 @@ static const wtq_scenario_t SCENARIOS[] = {
     { "forbidden_control_frame", f_forbidden_control_frame, 1, true, 0 },
     { "duplicate_settings", f_duplicate_settings, 1, true, 0xc928fd7608705556 },
     { "bad_settings_payload", f_bad_settings_payload, 1, true, 0 },
-    /* contained to its stream: no connection-level engine error */
-    { "malformed_request_qpack", f_malformed_request_qpack, 0, true, 0 },
-    { "malformed_response_qpack", f_malformed_response_qpack, 1, true, 0xba06062a17d9a4bd },
+    /* QPACK decompression errors are connection-fatal. */
+    { "malformed_request_qpack", f_malformed_request_qpack, 1, true, 0 },
+    { "malformed_response_qpack", f_malformed_response_qpack, 1, true, 0x0494882124674e73 },
     { "malformed_close_capsule", f_malformed_close_capsule, 1, true, 0 },
     { "malformed_drain_capsule", f_malformed_drain_capsule, 1, true, 0 },
     { "datagram_truncated_qsid", f_datagram_truncated_qsid, 1, true, 0xbaa29a9bf2f04696 },

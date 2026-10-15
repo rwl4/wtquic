@@ -99,7 +99,7 @@ void wtq_msq_conn_stage_local_cause(struct wtq_driver *drv, uint64_t code,
  * latch; the causal tuple is written here, on the serialization domain.
  * env_close always shuts down with 0x100 (H3_NO_ERROR).
  */
-static void conn_consume_env_close(struct wtq_driver *drv)
+void wtq_msq_conn_consume_env_close(struct wtq_driver *drv)
 {
     if (atomic_exchange_explicit(&drv->env_close_req, false,
                                  memory_order_acq_rel))
@@ -119,6 +119,7 @@ static void conn_shutdown(struct wtq_driver *drv, uint64_t err,
 {
     if (drv->shutdown_started || drv->conn == NULL)
         return;
+    if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
     drv->shutdown_started = true;
     if (cleanup)
         drv->close_cleanup = true;
@@ -207,6 +208,9 @@ static wtq_result_t op_open(struct wtq_driver *drv, wtq_estream_t *ectx,
     if (ds == NULL)
         return WTQ_ERR_NOMEM;
     ds->ectx = ectx;
+    ds->ectx_generation = wtq_estream_generation_v1(ectx);
+    /* Only the engine's control/QPACK opens have no estream at birth. */
+    ds->local_critical = !bidi && ectx == NULL;
 
     if (QUIC_FAILED(drv->api->StreamOpen(
             drv->conn,
@@ -260,9 +264,12 @@ static wtq_result_t op_send(wtq_driver_t *drv, wtq_dstream_t *ds,
         return WTQ_OK;
     if (len == 0) {
         /* pure FIN: graceful send-shutdown, nothing to borrow */
+        bool new_fin = wtq_msq_flush_begin(ds, false, true);
         if (QUIC_FAILED(drv->api->StreamShutdown(
-                ds->stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0)))
+                ds->stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0))) {
+            wtq_msq_flush_rollback(ds, false, new_fin);
             return WTQ_ERR_BACKEND;
+        }
         return WTQ_OK;
     }
 
@@ -272,6 +279,9 @@ static wtq_result_t op_send(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (rec == NULL)
         return WTQ_ERR_NOMEM;
     rec->h.gather = false;
+    rec->h.flush_bytes = true;
+    rec->h.flush_fin = fin;
+    rec->h.flush_epoch = ds->flush_epoch;
     rec->alloc_size = rec_size;
     rec->buf.Length = (uint32_t)len;
     rec->buf.Buffer = (uint8_t *)(rec + 1);
@@ -279,11 +289,13 @@ static wtq_result_t op_send(wtq_driver_t *drv, wtq_dstream_t *ds,
 
     ds->send_refs++;
     drv->pending_sends++;
+    bool new_fin = wtq_msq_flush_begin(ds, true, fin);
     if (QUIC_FAILED(drv->api->StreamSend(
             ds->stream, &rec->buf, 1,
             fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec))) {
         ds->send_refs--;
         drv->pending_sends--;
+        wtq_msq_flush_rollback(ds, true, new_fin);
         drv->alloc.free(rec, rec_size, drv->alloc.ctx);
         return WTQ_ERR_BACKEND;
     }
@@ -393,6 +405,9 @@ static wtq_result_t op_send_gather(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (rec == NULL)
         return WTQ_ERR_NOMEM;
     rec->cookie = cookie;
+    rec->h.flush_bytes = total != 0;
+    rec->h.flush_fin = fin;
+    rec->h.flush_epoch = ds->flush_epoch;
     rec->ds = ds;
     rec->bytes = total;
     for (size_t i = 0; i < count; i++) {
@@ -405,12 +420,14 @@ static wtq_result_t op_send_gather(wtq_driver_t *drv, wtq_dstream_t *ds,
     ds->send_refs++;
     ds->inflight_bytes += total;
     drv->pending_sends++;
+    bool new_fin = wtq_msq_flush_begin(ds, total != 0, fin);
     if (QUIC_FAILED(drv->api->StreamSend(
             ds->stream, rec->bufs, (uint32_t)count,
             fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec))) {
         ds->send_refs--;
         ds->inflight_bytes -= total;
         drv->pending_sends--;
+        wtq_msq_flush_rollback(ds, total != 0, new_fin);
         wtq_msq_gather_put(drv, rec);
         return WTQ_ERR_BACKEND; /* not accepted: no completion */
     }
@@ -435,17 +452,31 @@ static wtq_result_t op_shutdown_stream(wtq_driver_t *drv, wtq_dstream_t *ds,
     if (drv->shutdown_started || ds->stream == NULL)
         return WTQ_ERR_CLOSED;
 
+    bool intent = req->abort_send && req->app_send_cancel &&
+        wtq_msq_flush_is_wt(ds);
+    struct wtq_msq_flush_decision decision = { .previous = ds->flush_decision };
+    if (intent) {
+        ds->flush_decision = &decision;
+        drv->flush_decisions++;
+    }
+    wtq_result_t result = WTQ_OK;
+    bool send_accepted = false;
     if (req->abort_send && req->abort_recv &&
         req->send_err != req->recv_err) {
         if (QUIC_FAILED(drv->api->StreamShutdown(
                 ds->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND,
-                req->send_err)))
-            return WTQ_ERR_BACKEND;
+                req->send_err))) {
+            result = WTQ_ERR_BACKEND;
+            goto resolve;
+        }
+        send_accepted = true;
         if (QUIC_FAILED(drv->api->StreamShutdown(
                 ds->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
-                req->recv_err)))
-            return WTQ_ERR_BACKEND; /* partial: engine tears down */
-        return WTQ_OK;
+                req->recv_err))) {
+            result = WTQ_ERR_BACKEND;
+            goto resolve; /* partial */
+        }
+        goto resolve;
     }
 
     QUIC_STREAM_SHUTDOWN_FLAGS flags = 0;
@@ -455,8 +486,29 @@ static wtq_result_t op_shutdown_stream(wtq_driver_t *drv, wtq_dstream_t *ds,
         flags |= QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE;
     uint64_t code = req->abort_send ? req->send_err : req->recv_err;
     if (QUIC_FAILED(drv->api->StreamShutdown(ds->stream, flags, code)))
-        return WTQ_ERR_BACKEND;
-    return WTQ_OK;
+        result = WTQ_ERR_BACKEND;
+    else send_accepted = req->abort_send;
+resolve:
+    if (intent) {
+        ds->flush_decision = decision.previous;
+        drv->flush_decisions--;
+        if (result == WTQ_OK) {
+            if (decision.shutdown_complete) ds->flush_abort_complete = true;
+            wtq_msq_flush_withdraw(ds);
+        } else if (send_accepted) wtq_msq_flush_fail(drv); /* partial */
+        else if (decision.loss) {
+            if (decision.previous) decision.previous->loss = true;
+            else wtq_msq_flush_fail(drv);
+        }
+    } else if (send_accepted) wtq_msq_flush_discard(ds);
+    wtq_msq_flush_settle(ds);
+    if (result == WTQ_OK && req->abort_recv) {
+        /* MsQuic disables receives and suppresses the answering RESET event.
+         * Any paused suffix/FIN was discarded by this accepted abort. */
+        ds->recv_held_data = false;
+        ds->fin_pending = false;
+    }
+    return result;
 }
 
 /*
@@ -536,10 +588,12 @@ static size_t op_dgram_max_size(wtq_driver_t *drv)
 static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
                                    bool enabled)
 {
-    if (drv->shutdown_started || ds->stream == NULL)
+    bool logical_resume = enabled && ds->shutdown_complete && ds->ectx &&
+        !ds->recv_held_data && drv->session;
+    if (drv->shutdown_started || (ds->stream == NULL && !logical_resume))
         return WTQ_ERR_CLOSED;
-    /* A queued prefix-only FIN can already be native-terminal. Its retained
-     * credit handle needs logical resume/replay, not another native enable. */
+    /* A deferred bare FIN can already be native-terminal, even after a
+     * legacy handle closed. Replay logically; never re-enable that handle. */
     if (!ds->shutdown_complete && QUIC_FAILED(drv->api->StreamReceiveSetEnabled(
             ds->stream, enabled ? TRUE : FALSE)))
         return WTQ_ERR_BACKEND;
@@ -564,6 +618,7 @@ static wtq_result_t op_recv_enable(wtq_driver_t *drv, wtq_dstream_t *ds,
         }
         if (ds->shutdown_complete && ds->ectx && !ds->fin_pending &&
             !ds->recv_held_data && !drv->shutdown_started && drv->session) {
+            ds->terminal_pending = false;
             wtq_api_session_enter(drv->session);
             (void)wtq_conn_on_stream_terminal(wtq_api_session_conn(drv->session), ds->ectx);
             wtq_msq_conn_leave_and_poll(drv);
@@ -591,8 +646,10 @@ static void op_detach(wtq_driver_t *drv, wtq_dstream_t *ds,
                       wtq_estream_t *es)
 {
     (void)drv;
-    if (ds->ectx == es)
+    if (ds->ectx == es) {
+        ds->flush_wt_data = wtq_estream_is_wt_data_v1(es, ds);
         ds->ectx = NULL;
+    }
 }
 
 /* Driver calls can synchronously enter provider callbacks (notably close
@@ -642,7 +699,8 @@ const wtq_driver_ops_t *wtq_msq_driver_ops(void)
          * consumed), so a paused peer is eventually blocked by QUIC flow
          * control, not merely unpumped. */
         .caps = WTQ_DCAP_SHUT_BIDI_SEND | WTQ_DCAP_SHUT_BIDI_RECV |
-                WTQ_DCAP_SHUT_SPLIT_CODES | WTQ_DCAP_RECV_FLOW_CONTROLLED,
+                WTQ_DCAP_SHUT_SPLIT_CODES | WTQ_DCAP_RECV_FLOW_CONTROLLED |
+                WTQ_DCAP_SEND_COMMIT_ACK_FIN,
         .shutdown_stream = borrow_op_shutdown_stream,
         .conn_close = borrow_op_conn_close,
         .open_bidi = borrow_op_open_bidi,
@@ -722,7 +780,8 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
         break;
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
-        conn_consume_env_close(drv);
+        if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
+        wtq_msq_conn_consume_env_close(drv);
         /* latest-event code for the legacy terminal input only — the
          * staged causal tuple is immutable once assigned */
         drv->event_err =
@@ -739,7 +798,8 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
         break;
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
-        conn_consume_env_close(drv);
+        if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
+        wtq_msq_conn_consume_env_close(drv);
         drv->event_err = ev->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
         drv->event_err_set = true;
         drv->close_remote = true;
@@ -751,8 +811,9 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
         break;
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
         /* the last event this connection will ever deliver */
-        conn_consume_env_close(drv);
+        wtq_msq_conn_consume_env_close(drv);
         if (drv->session != NULL) {
             /* Legacy terminal code: the latest transport-event code
              * when one exists (it drives the engine's close_code even

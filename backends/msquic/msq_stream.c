@@ -65,15 +65,73 @@ static void admission_remove(struct wtq_driver *drv, struct wtq_dstream *ds)
     }
 }
 
+static void stream_complete_terminals(struct wtq_driver *drv)
+{
+    if (drv->callback_depth || drv->api_depth || drv->shutdown_started ||
+        drv->session == NULL)
+        return;
+    /* StreamShutdown can complete inline while the engine still borrows its
+     * estream. Deliver only at a dispatch/admission root. Protect the list
+     * against callbacks releasing leases and recursively polling collection. */
+    drv->callback_depth++;
+    wtq_api_session_enter(drv->session);
+    for (struct wtq_dstream *ds = drv->streams; ds; ds = ds->next) {
+        if (ds->flush_shutdown_pending && !ds->flush_decision) {
+            ds->flush_shutdown_pending = false;
+            wtq_conn_on_stream_send_shutdown_v1(
+                wtq_api_session_conn(drv->session), ds->ectx, ds,
+                ds->ectx_generation, ds->flush_shutdown_graceful &&
+                ds->flush_epoch == 0 && !ds->flush_output_canceled);
+        }
+        if (!ds->terminal_pending)
+            continue;
+        if (ds->local_critical) {
+            ds->terminal_pending = false;
+            wtq_conn_t *conn = wtq_api_session_conn(drv->session);
+            wtq_msq_conn_consume_env_close(drv);
+            /* Preserve a previously staged cause; otherwise this is an
+             * HTTP/3 protocol error, not a native MsQuic status. */
+            if (drv->close_kind != WTQ_ERR_KIND_NONE)
+                wtq_msq_conn_put_error_detail(drv);
+            const wtq_transport_error_t detail = {
+                .struct_size = (uint32_t)sizeof(detail),
+                .kind = WTQ_ERR_KIND_QUIC_APP,
+                .quic_code = WTQ_H3_CLOSED_CRITICAL_STREAM,
+                .native_domain = WTQ_ERRDOM_NONE,
+                .native_code = 0,
+            };
+            wtq_conn_set_transport_error(conn, &detail);
+            if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
+            wtq_conn_on_conn_closed(conn, WTQ_H3_CLOSED_CRITICAL_STREAM,
+                false, wtq_msq_now_us());
+            break;
+        }
+        if (!ds->ectx || ds->fin_pending ||
+            ds->recv_held_data)
+            continue;
+        ds->terminal_pending = false;
+        (void)wtq_conn_on_stream_terminal(wtq_api_session_conn(drv->session),
+            ds->ectx);
+    }
+    wtq_msq_conn_leave_and_poll(drv);
+    drv->callback_depth--;
+}
+
 static void stream_collect(struct wtq_driver *drv,
                             const struct wtq_dstream *borrowed)
 {
+    stream_complete_terminals(drv);
     struct wtq_dstream **link = &drv->streams;
     while (*link != NULL) {
         struct wtq_dstream *ds = *link;
         if (ds != borrowed && ds->shutdown_complete && ds->ectx == NULL &&
             ds->admission.es == NULL && ds->admission.state != 1 &&
             !ds->credit_held && ds->send_refs == 0) {
+            if (ds->flush_settling) {
+                wtq_msq_flush_fail(drv); /* retired without abort evidence */
+                ds->flush_settling = false;
+                drv->flush_settlements--;
+            }
             *link = ds->next;
             if (ds->pooled) admission_remove(drv, ds);
             if (ds->pooled && drv->session)
@@ -213,20 +271,41 @@ static wtq_result_t admission_service(wtq_driver_t *drv)
     return result;
 }
 
+static wtq_result_t local_flush_probe(const void *ctx)
+{
+    const struct wtq_driver *drv = ctx;
+    if (drv->flush_failed) return WTQ_ERR_BACKEND;
+    if (drv->shutdown_started) return WTQ_ERR_CLOSED;
+    return wtq_msq_flush_pending(drv) ? WTQ_ERR_WOULD_BLOCK : WTQ_OK;
+}
+
 wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
     const wtq_api_session_cfg_t *cfg, const wtq_msquic_tuning_t *tuning,
     wtq_session_t **out)
 {
     QUIC_SETTINGS settings;
     wtq_msq_settings_init(&settings, tuning);
-    if (settings.PeerUnidiStreamCount != 8 || settings.PeerBidiStreamCount != 7)
-        return wtq_api_session_create_accounted(cfg, out);
     const wtq_api_admission_ops_t ops = {
         .peer_uni = 8, .peer_bidi = 7,
         .service = admission_service, .lease = admission_lease,
     };
-    wtq_result_t rc = wtq_api_session_create_admission(cfg, &ops, out);
-    if (rc == WTQ_OK) drv->bounded_admission = true;
+    bool bounded = settings.PeerUnidiStreamCount == 8 && settings.PeerBidiStreamCount == 7;
+    wtq_result_t rc = bounded ? wtq_api_session_create_admission(cfg, &ops, out)
+                              : wtq_api_session_create_accounted(cfg, out);
+    if (rc != WTQ_OK) return rc;
+    drv->bounded_admission = bounded;
+    /* Exactly the settings translation passed to ConfigurationOpen on both
+     * client and listener paths. Buffered buffer-return cannot certify ACKs
+     * for an open stream (MsQuic docs/Streams.md, Send Buffering). */
+    if (settings.IsSet.SendBufferingEnabled && !settings.SendBufferingEnabled) {
+        rc = wtq_api_session_set_local_flush(*out, WTQ_LOCAL_FLUSH_ACKNOWLEDGED,
+            local_flush_probe, drv);
+        if (rc != WTQ_OK) {
+            wtq_session_release(*out);
+            *out = NULL;
+            drv->bounded_admission = false;
+        }
+    }
     return rc;
 }
 
@@ -261,8 +340,10 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         /* The id the backend computed at open MUST be the id MsQuic
          * assigned — a divergence would corrupt every id-derived piece
          * of session state, so it kills the connection. */
-        if (QUIC_FAILED(ev->START_COMPLETE.Status))
+        if (QUIC_FAILED(ev->START_COMPLETE.Status)) {
+            wtq_msq_flush_discard(ds);
             break; /* start failed: the connection is going down */
+        }
         if (ev->START_COMPLETE.ID != ds->id) {
             /* the main MsQuic backend-invariant failure: stage its
              * full-fidelity causal detail (native value = the MsQuic
@@ -276,6 +357,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
             if (drv->session != NULL) {
                 wtq_api_session_enter(drv->session);
                 wtq_msq_conn_put_error_detail(drv);
+                if (wtq_msq_flush_pending(drv)) wtq_msq_flush_fail(drv);
                 wtq_conn_on_conn_closed(
                     wtq_api_session_conn(drv->session),
                     WTQ_H3_INTERNAL_ERROR, false, wtq_msq_now_us());
@@ -407,6 +489,12 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         break;
 
     case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        if (wtq_msq_flush_is_wt(ds)) wtq_msq_flush_withdraw(ds);
+        else wtq_msq_flush_discard(ds);
+        if (ds->local_critical && !drv->shutdown_started) {
+            ds->terminal_pending = true;
+            break;
+        }
         if (ds->pooled && ds->ectx == NULL && !ds->admission_stop_pending) {
             ds->admission_stop_pending = true;
             ds->admission_stop_first = !ds->admission_reset_pending;
@@ -417,6 +505,40 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
             (void)wtq_conn_on_stop_sending(
                 wtq_api_session_conn(drv->session), ds->ectx,
                 ev->PEER_RECEIVE_ABORTED.ErrorCode, wtq_msq_now_us());
+            wtq_msq_conn_leave_and_poll(drv);
+        }
+        break;
+
+    case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+        if (ev->SEND_SHUTDOWN_COMPLETE.Graceful) {
+            if (ds->flush_fin) {
+                ds->flush_fin = false;
+                drv->flush_fins--;
+            }
+        } else if (ds->flush_required_sends || ds->flush_fin) {
+            wtq_msq_flush_cancel_loss(ds);
+            if (ds->flush_fin) { ds->flush_fin = false; drv->flush_fins--; }
+        }
+        /* Evidence arose after every enclosing intent began; only an
+         * accepted return may consume it. Refusal is not supersession. */
+        for (struct wtq_msq_flush_decision *p = ds->flush_decision; p;
+             p = p->previous) p->shutdown_complete = true;
+        if (ds->flush_settling) {
+            ds->flush_abort_complete = true;
+            wtq_msq_flush_settle(ds);
+        }
+        /* Graceful alone cannot prove commitment after canceled reliable
+         * output on this stream. Buffer return is independent of commitment. */
+        if (ds->flush_decision) {
+            /* Never emit N23 commit before the engine applies cancellation. */
+            ds->flush_shutdown_pending = true;
+            ds->flush_shutdown_graceful = ev->SEND_SHUTDOWN_COMPLETE.Graceful != FALSE;
+        } else if (ds->ectx != NULL && drv->session != NULL) {
+            wtq_api_session_enter(drv->session);
+            wtq_conn_on_stream_send_shutdown_v1(wtq_api_session_conn(drv->session),
+                ds->ectx, ds, ds->ectx_generation,
+                ev->SEND_SHUTDOWN_COMPLETE.Graceful != FALSE &&
+                ds->flush_epoch == 0 && !ds->flush_output_canceled);
             wtq_msq_conn_leave_and_poll(drv);
         }
         break;
@@ -433,7 +555,9 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
             void *cookie = rec->cookie;
             struct wtq_dstream *rds = rec->ds;
 
+            wtq_msq_flush_complete(rds, h, ev->SEND_COMPLETE.Canceled != FALSE);
             rds->send_refs--;
+            wtq_msq_flush_settle(rds);
             rds->inflight_bytes -= rec->bytes;
             wtq_msq_gather_put(drv, rec);
             drv->pending_sends--;
@@ -456,7 +580,9 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         } else {
             struct wtq_msq_send_rec *rec = (struct wtq_msq_send_rec *)h;
 
+            wtq_msq_flush_complete(ds, h, ev->SEND_COMPLETE.Canceled != FALSE);
             ds->send_refs--;
+            wtq_msq_flush_settle(ds);
             drv->alloc.free(rec, rec->alloc_size, drv->alloc.ctx);
             drv->pending_sends--;
         }
@@ -488,20 +614,29 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
     }
 
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
+        wtq_msq_flush_discard(ds);
         /* Publish the dead handle before Close can synchronously call back.
          * The record is only eligible after Close and this frame return. */
         HQUIC handle = ds->stream;
+        ds->shutdown_complete = true;
+        if (!ev->SHUTDOWN_COMPLETE.ConnectionShutdown &&
+            !ev->SHUTDOWN_COMPLETE.AppCloseInProgress)
+            ds->terminal_pending = true;
         if (!ds->pooled || ev->SHUTDOWN_COMPLETE.AppCloseInProgress)
             ds->stream = NULL;
         if (!ds->pooled && !ev->SHUTDOWN_COMPLETE.AppCloseInProgress && handle != NULL)
             drv->api->StreamClose(handle);
-        ds->shutdown_complete = true;
+        if (ds->is_local && !ds->is_bidi && ds->ectx != NULL && drv->session != NULL) {
+            wtq_api_session_enter(drv->session);
+            wtq_conn_on_stream_send_shutdown_v1(wtq_api_session_conn(drv->session),
+                ds->ectx, ds, ds->ectx_generation, false);
+            wtq_msq_conn_leave_and_poll(drv);
+        }
         break;
     }
 
     default:
-        /* SEND_SHUTDOWN_COMPLETE, IDEAL_SEND_BUFFER_SIZE, PEER_ACCEPTED
-         * carry nothing the backend acts on yet */
+        /* Other native advisory events carry nothing the backend acts on. */
         break;
     }
     return QUIC_STATUS_SUCCESS;
@@ -527,6 +662,7 @@ QUIC_STATUS QUIC_API wtq_msq_stream_callback(HQUIC stream, void *ctx,
     drv->callback_depth++;
     QUIC_STATUS st = stream_dispatch(stream, ds, ev);
     drv->callback_depth--;
+    wtq_msq_stream_collect(drv, ds);
     if (admission_root && !drv->shutdown_started && drv->session != NULL) {
         drv->admission_borrowed = ds;
         (void)wtq_session_service_stream_admission(drv->session);

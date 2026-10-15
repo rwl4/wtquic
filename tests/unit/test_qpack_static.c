@@ -161,7 +161,7 @@ static void test_static_table(int *fp)
 static void test_prefix(int *fp)
 {
     int failures = 0;
-    wtq_qpack_field_t fields[4];
+    wtq_qpack_field_t fields[4] = { { 0 } };
     size_t count = 99;
     char scratch[64];
 
@@ -180,9 +180,63 @@ static void test_prefix(int *fp)
     WTQ_TEST_CHECK(wtq_qpack_decode_section(bad_sign, 2, fields, 4, &count,
                                             scratch, sizeof(scratch)) ==
                    WTQ_QPACK_MALFORMED);
-    const uint8_t bad_base[] = { 0x00, 0x01 };
-    WTQ_TEST_CHECK(wtq_qpack_decode_section(bad_base, 2, fields, 4, &count,
+    const uint8_t nonzero_base[] = { 0x00, 0x01 };
+    WTQ_TEST_CHECK(wtq_qpack_decode_section(nonzero_base, 2, fields, 4, &count,
                                             scratch, sizeof(scratch)) ==
+                   WTQ_QPACK_OK);
+    WTQ_TEST_CHECK_EQ_SIZE(count, 0);
+    const uint8_t status[] = { 0x00, 0x01, 0xd9 };
+    WTQ_TEST_CHECK(wtq_qpack_decode_section(status, sizeof(status), fields,
+                                            4, &count, scratch,
+                                            sizeof(scratch)) == WTQ_QPACK_OK);
+    WTQ_TEST_CHECK_EQ_SIZE(count, 1);
+    WTQ_TEST_CHECK(field_is(&fields[0], ":status", "200"));
+
+    /* Base does not create dynamic references. Exercise continuation
+     * boundaries and the full supported range, including signed forms
+     * that would underflow Base = RIC - Delta Base - 1. */
+    const uint64_t bases[] = { 0, 1, 126, 127, 128, 16384,
+                               (UINT64_C(1) << 62) - 1 };
+    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+        uint8_t buf[16] = { 0 };
+        size_t n = 0;
+        WTQ_TEST_CHECK(wtq_qpack_int_encode(bases[i], 0, 7, buf + 1,
+                                            sizeof(buf) - 2, &n) ==
+                       WTQ_QPACK_OK);
+        buf[1 + n] = 0xd9;
+        WTQ_TEST_CHECK(wtq_qpack_decode_section(buf, n + 2, fields, 4,
+                                                &count, scratch,
+                                                sizeof(scratch)) ==
+                       WTQ_QPACK_OK);
+        WTQ_TEST_CHECK_EQ_SIZE(count, 1);
+        WTQ_TEST_CHECK(field_is(&fields[0], ":status", "200"));
+        for (size_t cut = 1; cut < n + 1; cut++)
+            WTQ_TEST_CHECK(wtq_qpack_decode_section(buf, cut, fields, 4,
+                                                    &count, scratch,
+                                                    sizeof(scratch)) ==
+                           WTQ_QPACK_MALFORMED);
+        buf[1] |= 0x80;
+        WTQ_TEST_CHECK(wtq_qpack_decode_section(buf, n + 2, fields, 4,
+                                                &count, scratch,
+                                                sizeof(scratch)) ==
+                       WTQ_QPACK_MALFORMED);
+        buf[1] &= 0x7f;
+        /* All four dynamic-only representations remain forbidden. */
+        const uint8_t dynamic[] = { 0x80, 0x40, 0x10, 0x00 };
+        for (size_t d = 0; d < sizeof(dynamic); d++) {
+            buf[1 + n] = dynamic[d];
+            WTQ_TEST_CHECK(wtq_qpack_decode_section(buf, n + 2, fields, 4,
+                                                    &count, scratch,
+                                                    sizeof(scratch)) ==
+                           WTQ_QPACK_MALFORMED);
+        }
+    }
+    /* Delta Base = 2^62 exceeds the decoder's supported range. */
+    const uint8_t overflow[] = { 0x00, 0x7f, 0x81, 0xff, 0xff, 0xff,
+                                0xff, 0xff, 0xff, 0xff, 0x3f };
+    WTQ_TEST_CHECK(wtq_qpack_decode_section(overflow, sizeof(overflow),
+                                            fields, 4, &count, scratch,
+                                            sizeof(scratch)) ==
                    WTQ_QPACK_MALFORMED);
     const uint8_t trunc1[] = { 0x00 };
     WTQ_TEST_CHECK(wtq_qpack_decode_section(trunc1, 1, fields, 4, &count,
@@ -333,13 +387,13 @@ static void test_reject(int *fp)
                                             fields, 8, &count, scratch,
                                             sizeof(scratch)) ==
                    WTQ_QPACK_MALFORMED);
-    /* post-base name ref (0001....): 0x10 */
+    /* post-base indexed (0001....): 0x10 */
     const uint8_t pb_ref[] = { 0x00, 0x00, 0x10, 0x01, 'x' };
     WTQ_TEST_CHECK(wtq_qpack_decode_section(pb_ref, sizeof(pb_ref), fields,
                                             8, &count, scratch,
                                             sizeof(scratch)) ==
                    WTQ_QPACK_MALFORMED);
-    /* post-base indexed (0000....): 0x01 */
+    /* post-base name ref (0000....): 0x01 */
     const uint8_t pb_idx[] = { 0x00, 0x00, 0x01 };
     WTQ_TEST_CHECK(wtq_qpack_decode_section(pb_idx, 3, fields, 8, &count,
                                             scratch, sizeof(scratch)) ==

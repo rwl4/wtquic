@@ -79,7 +79,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         wtq_connect_status_t st = wtq_connect_decode_response(
             in, len, &opts, &resp, scratch, scratch_cap);
         if (st != WTQ_CONNECT_OK && st != WTQ_CONNECT_BUFFER &&
-            st != WTQ_CONNECT_MALFORMED)
+            st != WTQ_CONNECT_MALFORMED &&
+            st != WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED)
             abort();
         if (st != WTQ_CONNECT_OK)
             return 0;
@@ -123,7 +124,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         in, len, &opts, &req, protos, MAX_PROTOS, &nproto, scratch,
         scratch_cap);
     if (st != WTQ_CONNECT_OK && st != WTQ_CONNECT_BUFFER &&
-        st != WTQ_CONNECT_MALFORMED)
+        st != WTQ_CONNECT_MALFORMED &&
+        st != WTQ_CONNECT_QPACK_DECOMPRESSION_FAILED &&
+        st != WTQ_CONNECT_NOT_WEBTRANSPORT)
         abort();
     if (st != WTQ_CONNECT_OK)
         return 0;

@@ -8,9 +8,11 @@
  * INTERNAL header — not installed, never included from public headers.
  *
  * Scope (wtquic v1, by contract):
- *   - No dynamic table: the field-section prefix MUST be {0x00, 0x00}
- *     (Required Insert Count 0, sign clear, Delta Base 0); any dynamic
- *     or post-base field line form is MALFORMED.
+ *   - No dynamic table: Required Insert Count MUST be 0. Any valid Base
+ *     is accepted (sign clear, Delta Base in the supported integer
+ *     range); sign set would produce a forbidden negative Base. Any
+ *     dynamic or post-base field line form is MALFORMED. The encoder
+ *     emits the canonical prefix {0x00, 0x00}.
  *   - Decoder handles plain and Huffman string literals; the encoder
  *     emits plain literals only and prefers, per field:
  *       exact static name+value  -> Indexed Field Line (static)

@@ -29,7 +29,14 @@ typedef struct app_state {
     uint64_t last_error;
     int closed_events;
     bool closed_clean;
+    int draining_events;
 } app_state_t;
+
+static void cb_draining(wtq_conn_t *c, void *ctx)
+{
+    (void)c;
+    ((app_state_t *)ctx)->draining_events++;
+}
 
 static void cb_settings(wtq_conn_t *c, bool wt, void *ctx)
 {
@@ -131,6 +138,7 @@ static void rig_up_profiles(rig_t *r, wtq_perspective_t persp,
                        .on_session_rejected = cb_rejected,
                        .on_session_failed = cb_failed,
                        .on_session_closed = cb_closed,
+                       .on_session_draining = cb_draining,
                        .ctx = &r->app },
     };
     WTQ_TEST_CHECK(wtq_conn_create(&cfg, &r->drv, fake_driver_ops(),
@@ -195,6 +203,7 @@ static void deliver_peer_settings_frame(rig_t *r, const uint8_t *frame,
     WTQ_TEST_CHECK(wtq_conn_on_peer_uni_opened(r->conn, ds,
                                                is_client ? 3 : 2, &es) ==
                    WTQ_OK);
+    ds->ectx = es;
     /* the engine reports WTQ_ERR_PROTO when the SETTINGS kill the
      * connection — the caller asserts the outcome it expects */
     (void)wtq_conn_on_stream_bytes(r->conn, es, buf, 1 + flen, false,
@@ -676,7 +685,7 @@ static void test_connect_bad_response(int *fp)
     WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
     WTQ_TEST_CHECK(wtq_conn_is_closed(r.conn));
     WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn),
-                          WTQ_H3_MESSAGE_ERROR);
+                          WTQ_QPACK_DECOMPRESSION_FAILED);
     rig_down(&r);
     *fp += failures;
 }
@@ -833,6 +842,7 @@ static void expect_response_status(struct wtq_dstream *ds, uint16_t status,
         *fp += failures;
         return;
     }
+    WTQ_TEST_CHECK(ds->fin == (status >= 300));
 
     wtq_h3_frame_t hdr;
     int frc = wtq_h3_frame_decode_header(ds->bytes, ds->len, &hdr);
@@ -862,6 +872,96 @@ static void expect_response_status(struct wtq_dstream *ds, uint16_t status,
 
 /* server accepts /moq, selects first client-preferred protocol, and
  * responds 200 — across every request chunking */
+static void test_server_long_authority(int *fp)
+{
+    int failures = 0;
+    char authority[300];
+    memset(authority, 'a', sizeof(authority));
+    uint8_t section[512], request[520];
+    size_t slen = 0, hlen = 0;
+    WTQ_TEST_CHECK(wtq_connect_encode_request(
+        authority, sizeof(authority), "/moq", 4, NULL, 0, NULL, 0,
+        section, sizeof(section), &slen) == WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK(wtq_h3_frame_encode_header(
+        WTQ_H3_FRAME_HEADERS, slen, request, sizeof(request), &hlen) == 0);
+    memcpy(request + hlen, section, slen);
+    rig_t r;
+    server_up(&r, false, fp);
+    struct wtq_dstream *ds = feed_request(&r, 0, request, hlen + slen, 7, fp);
+    expect_response_status(ds, 200, fp);
+    WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 1);
+    size_t alen = 0;
+    const char *accepted = wtq_conn_request_authority(r.conn, &alen);
+    WTQ_TEST_CHECK_EQ_SIZE(alen, sizeof(authority));
+    WTQ_TEST_CHECK(alen == sizeof(authority) &&
+                   memcmp(accepted, authority, sizeof(authority)) == 0);
+    rig_down(&r);
+    *fp += failures;
+}
+
+static void test_server_huffman_authority_bound(int *fp)
+{
+    int failures = 0;
+    const wtq_qpack_field_t base[] = {
+        { ":method", 7, "CONNECT", 7, false },
+        { ":scheme", 7, "https", 5, false },
+        { ":path", 5, "/moq", 4, false },
+        { ":protocol", 9, "webtransport-h3", 15, false },
+    };
+    const size_t sizes[] = { 480, 485, 600 };
+    for (size_t row = 0; row < sizeof(sizes) / sizeof(sizes[0]); ++row) {
+        uint8_t section[512], frame[520];
+        size_t len = 0, count = 0, hlen = 0;
+        WTQ_TEST_CHECK(wtq_qpack_encode_section(base, 4, section,
+                                               sizeof(section), &len) == WTQ_QPACK_OK);
+        section[len++] = 0x50; /* literal with static :authority name */
+        size_t encoded = (sizes[row] * 5 + 7) / 8;
+        WTQ_TEST_CHECK(wtq_qpack_int_encode(encoded, 0x80, 7, section + len,
+                        sizeof(section) - len, &count) == WTQ_QPACK_OK);
+        len += count;
+        memset(section + len, 0xff, encoded);
+        /* RFC 7541 Appendix B: 'a' is 00011, followed by EOS-prefix padding. */
+        for (size_t bit = 0; bit < sizes[row] * 5; ++bit) {
+            if (bit % 5 < 3)
+                section[len + bit / 8] &= (uint8_t)~(1u << (7 - bit % 8));
+        }
+        len += encoded;
+        WTQ_TEST_CHECK(len <= 512); /* all rows fit the encoded frame cap */
+        wtq_connect_req_t req;
+        char scratch[1024];
+        WTQ_TEST_CHECK(wtq_connect_decode_request(section, len, NULL, &req,
+                        NULL, 0, &count, scratch, sizeof(scratch)) == WTQ_CONNECT_OK);
+        WTQ_TEST_CHECK_EQ_SIZE(req.authority_len, sizes[row]);
+        for (size_t i = 0; i < req.authority_len; ++i)
+            WTQ_TEST_CHECK(req.authority[i] == 'a');
+        WTQ_TEST_CHECK(wtq_connect_decode_request(section, len, NULL, &req,
+                        NULL, 0, &count, scratch, 512) ==
+                        (row == 0 ? WTQ_CONNECT_OK : WTQ_CONNECT_BUFFER));
+        WTQ_TEST_CHECK(wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, len,
+                        frame, sizeof(frame), &hlen) == 0);
+        memcpy(frame + hlen, section, len);
+        rig_t r;
+        server_up(&r, false, fp);
+        struct wtq_dstream *ds = feed_request(&r, 0, frame, hlen + len, 11, fp);
+        if (row == 0) {
+            expect_response_status(ds, 200, fp);
+            WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 1);
+            size_t alen = 0;
+            const char *authority = wtq_conn_request_authority(r.conn, &alen);
+            WTQ_TEST_CHECK_EQ_SIZE(alen, sizes[row]);
+            for (size_t i = 0; i < alen; ++i)
+                WTQ_TEST_CHECK(authority[i] == 'a');
+        } else {
+            WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+            WTQ_TEST_CHECK_EQ_SIZE(ds->len, 0);
+            WTQ_TEST_CHECK(ds->reset && ds->stopped);
+            WTQ_TEST_CHECK_EQ_U64(ds->reset_err, WTQ_H3_EXCESSIVE_LOAD);
+        }
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
 static void test_server_accept(int *fp)
 {
     int failures = 0;
@@ -1773,6 +1873,15 @@ static void test_server_malformed_contained(int *fp)
         server_up(&r, false, fp);
         struct wtq_dstream *ds = feed_request(&r, 0, req, qlen, 2, fp);
 
+        if (which == 0) {
+            WTQ_TEST_CHECK(wtq_conn_is_closed(r.conn));
+            WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn),
+                                  WTQ_QPACK_DECOMPRESSION_FAILED);
+            WTQ_TEST_CHECK(!ds->reset && !ds->stopped);
+            WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+            rig_down(&r);
+            continue;
+        }
         WTQ_TEST_CHECK(ds->reset);
         WTQ_TEST_CHECK(ds->stopped);
         WTQ_TEST_CHECK_EQ_U64(ds->reset_err, WTQ_H3_MESSAGE_ERROR);
@@ -1933,8 +2042,8 @@ static void test_server_rejected_streams_no_slot_leak(int *fp)
     };
     uint8_t req[512];
     size_t qlen = build_headers(req, sizeof(req), GET_F, 4);
-    /* HEADERS whose payload is a dynamic-table reference */
-    static const uint8_t BAD_QPACK[] = { 0x01, 0x03, 0x00, 0x00, 0x81 };
+    /* Valid QPACK, malformed HTTP: a request containing :status. */
+    static const uint8_t BAD_HTTP[] = { 0x01, 0x03, 0x00, 0x00, 0xd9 };
 
     WTQ_TEST_CHECK(qlen > 0);
     server_up(&r, false, fp);
@@ -1946,8 +2055,8 @@ static void test_server_rejected_streams_no_slot_leak(int *fp)
                                   fp);
         } else {
             /* malformed, ended by a peer RESET */
-            (void)feed_request_es(&r, i * 4, BAD_QPACK,
-                                  sizeof(BAD_QPACK), 64, false, &es, fp);
+            (void)feed_request_es(&r, i * 4, BAD_HTTP,
+                                  sizeof(BAD_HTTP), 64, false, &es, fp);
             WTQ_TEST_CHECK(es != NULL);
             if (es != NULL)
                 (void)wtq_conn_on_stream_reset(r.conn, es,
@@ -2422,6 +2531,15 @@ static void test_trailers_malformed(int *fp)
         (void)wtq_conn_on_stream_bytes(r.conn, es, buf, tlen, false,
                                        3000);
 
+        if (which == 2) {
+            WTQ_TEST_CHECK(wtq_conn_is_closed(r.conn));
+            WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn),
+                                  WTQ_QPACK_DECOMPRESSION_FAILED);
+            WTQ_TEST_CHECK_EQ_INT(r.app.closed_events, 1);
+            WTQ_TEST_CHECK(!ds->reset && !ds->stopped);
+            rig_down(&r);
+            continue;
+        }
         WTQ_TEST_CHECK(ds->reset);
         WTQ_TEST_CHECK(ds->stopped);
         WTQ_TEST_CHECK_EQ_U64(ds->reset_err, WTQ_H3_MESSAGE_ERROR);
@@ -4242,9 +4360,211 @@ static void test_origin_policy_validation_and_capacity(int *fp)
     *fp += failures;
 }
 
+static void test_informational_responses(int *fp)
+{
+    int failures = 0;
+    for (int final = 0; final < 3; final++) {
+        rig_t r;
+        uint8_t buf[512];
+        rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+        WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+        deliver_peer_settings(&r, fp);
+        size_t n = build_response(buf, sizeof(buf), 100, NULL);
+        feed_response(&r, buf, n, 1, fp);
+        n = build_response(buf, sizeof(buf), 103, NULL);
+        feed_response(&r, buf, n, 1, fp);
+        WTQ_TEST_CHECK_EQ_INT(r.app.rejected_events, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.failed_events, 0);
+        if (final == 2) {
+            struct wtq_dstream *ds = find_local_bidi(&r);
+            WTQ_TEST_CHECK(wtq_conn_on_stream_bytes(r.conn, ds->ectx,
+                                                   NULL, 0, true, 0) == WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(r.app.failed_events, 1);
+        } else {
+            n = build_response(buf, sizeof(buf), final ? 403 : 200, NULL);
+            feed_response(&r, buf, n, 1, fp);
+            WTQ_TEST_CHECK_EQ_INT(r.app.established_events, final ? 0 : 1);
+            WTQ_TEST_CHECK_EQ_INT(r.app.rejected_events, final ? 1 : 0);
+        }
+        rig_down(&r);
+    }
+    /* HTTP/3 does not support the HTTP Upgrade status. */
+    rig_t r;
+    uint8_t buf[512];
+    rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+    WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+    deliver_peer_settings(&r, fp);
+    size_t n = build_response(buf, sizeof(buf), 101, NULL);
+    feed_response(&r, buf, n, n, fp);
+    WTQ_TEST_CHECK_EQ_INT(r.app.failed_events, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.app.rejected_events, 0);
+    rig_down(&r);
+    *fp += failures;
+}
+
+static void test_rejection_response_fin(int *fp)
+{
+    int failures = 0;
+    for (int peer_fin = 0; peer_fin < 2; peer_fin++) {
+        rig_t r;
+        uint8_t buf[512];
+        server_up(&r, false, fp);
+        size_t n = build_request(buf, sizeof(buf), "/missing", NULL, 0);
+        struct wtq_dstream *ds = feed_request_es(&r, 0, buf, n, 1,
+                                                  peer_fin != 0, NULL, fp);
+        expect_response_status(ds, 404, fp);
+        WTQ_TEST_CHECK(ds->fin);
+        WTQ_TEST_CHECK(!ds->reset);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        expect_fresh_connect_works(&r, 4, fp);
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
+static void test_goaway_session_gate(int *fp)
+{
+    int failures = 0;
+    for (int sent = 0; sent < 3; sent++) {
+        rig_t r;
+        uint8_t peer[128];
+        rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+        if (sent)
+            WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+        wtq_h3_settings_encode_cfg_t cfg = { true, 0 };
+        size_t n = 0;
+        peer[0] = 0;
+        WTQ_TEST_CHECK(wtq_h3_settings_encode_frame(&cfg, peer + 1,
+                                      sizeof(peer) - 1, &n) == 0);
+        struct wtq_dstream *ctrl = fake_driver_add_peer_stream(&r.drv, 3);
+        wtq_estream_t *es = NULL;
+        WTQ_TEST_CHECK(wtq_conn_on_peer_uni_opened(r.conn, ctrl, 3, &es) == WTQ_OK);
+        WTQ_TEST_CHECK(wtq_conn_on_stream_bytes(r.conn, es, peer, n + 1,
+                                                false, 0) == WTQ_OK);
+        if (sent == 2) {
+            n = build_response(peer, sizeof(peer), 200, NULL);
+            feed_response(&r, peer, n, n, fp);
+        }
+        const uint8_t goaway[] = { 7, 1, 4 };
+        WTQ_TEST_CHECK(wtq_conn_on_stream_bytes(r.conn, es, goaway,
+                            sizeof(goaway), false, 0) == WTQ_OK);
+        if (!sent) {
+            int opens = r.drv.open_calls;
+            WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_ERR_STATE);
+            WTQ_TEST_CHECK_EQ_INT(r.drv.open_calls, opens);
+        } else {
+            if (sent == 1) {
+                n = build_response(peer, sizeof(peer), 200, NULL);
+                feed_response(&r, peer, n, n, fp);
+            }
+            WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 1);
+            WTQ_TEST_CHECK_EQ_INT(r.app.draining_events, 1);
+            WTQ_TEST_CHECK(wtq_conn_session_state(r.conn) == WTQ_SESSION_DRAINING);
+            WTQ_TEST_CHECK(wtq_conn_on_stream_bytes(r.conn, es, goaway,
+                                  sizeof(goaway), false, 0) == WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(r.app.draining_events, 1);
+        }
+        WTQ_TEST_CHECK(!wtq_conn_is_closed(r.conn));
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
+static void test_goaway_inflight(int *fp)
+{
+    int failures = 0;
+    /* A final response cannot establish a request excluded by GOAWAY,
+     * including when its native stream ID arrives asynchronously. */
+    for (int async = 0; async < 2; async++) {
+        rig_t r;
+        rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+        r.drv.async_ids = async != 0;
+        WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+        deliver_peer_settings(&r, fp);
+        struct wtq_dstream *ds = find_local_bidi(&r);
+        struct wtq_dstream *ctrl = NULL;
+        for (size_t i = 0; i < FAKE_MAX_STREAMS; i++)
+            if (r.drv.streams[i].in_use && !r.drv.streams[i].is_local &&
+                r.drv.streams[i].id == 3)
+                ctrl = &r.drv.streams[i];
+        WTQ_TEST_CHECK(ctrl != NULL);
+        if (ctrl == NULL) {
+            rig_down(&r);
+            continue;
+        }
+        const uint8_t goaway[] = { 7, 1, 0 };
+        WTQ_TEST_CHECK(wtq_conn_on_stream_bytes(r.conn, ctrl->ectx, goaway,
+                            sizeof(goaway), false, 0) == WTQ_OK);
+        uint8_t response[128];
+        size_t n = build_response(response, sizeof(response), 200, NULL);
+        feed_response(&r, response, n, 1, fp);
+        if (async)
+            wtq_conn_on_stream_native_id(r.conn, ds->ectx, ds->id);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.failed_events, 1);
+        WTQ_TEST_CHECK_EQ_INT(ds->shutdown_count, 1);
+        WTQ_TEST_CHECK(ds->reset && ds->stopped);
+        WTQ_TEST_CHECK(!wtq_conn_is_closed(r.conn));
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
+static void test_header_sequence_and_qpack_errors(int *fp)
+{
+    int failures = 0;
+    const uint8_t bad_qpack[] = { 1, 4, 0, 0, 0xff, 0x24 }; /* index 99 */
+    for (int server = 0; server < 2; server++) {
+        rig_t r;
+        if (server) {
+            server_up(&r, false, fp);
+            (void)feed_request(&r, 0, bad_qpack, sizeof(bad_qpack), 1, fp);
+        } else {
+            rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+            WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+            deliver_peer_settings(&r, fp);
+            feed_response(&r, bad_qpack, sizeof(bad_qpack), 1, fp);
+        }
+        WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), WTQ_QPACK_DECOMPRESSION_FAILED);
+        WTQ_TEST_CHECK_EQ_INT(r.app.error_events, 1);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, 0);
+        rig_down(&r);
+    }
+    for (int data = 0; data < 2; data++) {
+        rig_t r;
+        uint8_t response[512];
+        rig_up(&r, WTQ_PERSPECTIVE_CLIENT, fp);
+        WTQ_TEST_CHECK(do_connect(&r, false) == WTQ_OK);
+        deliver_peer_settings(&r, fp);
+        size_t n = build_response(response, sizeof(response), 103, NULL);
+        if (data) {
+            response[n++] = 0; response[n++] = 0; /* DATA before final HEADERS */
+        } else {
+            /* Nonzero Base in a static-only 200 after a 103, in one delivery. */
+            const uint8_t final[] = { 1, 3, 0, 1, 0xd9 };
+            memcpy(response + n, final, sizeof(final));
+            n += sizeof(final);
+        }
+        feed_response(&r, response, n, n, fp);
+        WTQ_TEST_CHECK_EQ_INT(r.app.rejected_events, 0);
+        WTQ_TEST_CHECK_EQ_INT(r.app.established_events, data ? 0 : 1);
+        if (data)
+            WTQ_TEST_CHECK_EQ_HEX(wtq_conn_close_code(r.conn), WTQ_H3_FRAME_UNEXPECTED);
+        rig_down(&r);
+    }
+    *fp += failures;
+}
+
 int main(void)
 {
     int failures = 0;
+
+    test_informational_responses(&failures);
+    test_rejection_response_fin(&failures);
+    test_goaway_session_gate(&failures);
+    test_goaway_inflight(&failures);
+    test_header_sequence_and_qpack_errors(&failures);
     test_subprotocol_malformed_content(&failures);
     test_subprotocol_128_129(&failures);
     test_subprotocol_boundaries(&failures);
@@ -4264,6 +4584,8 @@ int main(void)
     test_connect_stream_frames(&failures);
     test_server_bidi_to_client(&failures);
     test_server_accept(&failures);
+    test_server_long_authority(&failures);
+    test_server_huffman_authority_bound(&failures);
     test_server_defer_before_settings(&failures);
     test_server_defer_nonwt_settings(&failures);
     test_server_defer_fin_before_settings(&failures);

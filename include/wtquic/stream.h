@@ -19,7 +19,9 @@
  *   incoming: peer fin (on_stream_data fin=true), peer reset
  *             (on_stream_reset), or wtq_stream_stop_sending.
  * When the last open direction closes, on_stream_closed fires. A
- * unidirectional stream has only its one direction.
+ * unidirectional stream has only its one direction. With send commit enabled,
+ * local UNI FIN instead waits for ACK+FIN or cancellation before terminal;
+ * reset/abort remains operational while that outcome is pending.
  *
  * SEND OWNERSHIP: wtq_stream_send borrows the span DATA until the
  * matching on_send_complete(send_ctx) — exactly one per accepted send,
@@ -36,6 +38,16 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Opt in a live local UNI before its first accepted application send (the
+ * transport's initial framing is allowed). Requires backend ACK+FIN/resettable
+ * capability and a wholly present, non-NULL on_stream_send_committed callback;
+ * otherwise UNSUPPORTED. Invalid direction/lifetime or a prior accepted send
+ * is STATE; NULL is INVALID_ARG. Failure changes nothing. Repeated opt-in
+ * before sending is harmless. Merely registering the callback does not opt in.
+ * FIN then forbids writes but preserves operational reset/abort until one
+ * terminal outcome wins. Pending streams consume the existing finite budget. */
+WTQ_API wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *stream);
 
 /* --- lifetime ----------------------------------------------------------- */
 

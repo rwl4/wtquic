@@ -1,4 +1,5 @@
 #include "api_internal.h"
+#include "../proto/capsule.h"
 
 #include <string.h>
 
@@ -35,6 +36,8 @@ struct wtq_stream {
                            not the app's to drop. */
     bool alive;         /* pre-terminal: engine linkage valid */
     bool send_open;
+    bool send_commit;
+    bool fin_pending;
     bool recv_open;
     bool bidi;
     bool local;
@@ -49,6 +52,7 @@ struct wtq_session {
     uint32_t refs;
     wtq_alloc_t alloc;
     wtq_conn_t *conn;
+    wtq_perspective_t perspective;
     size_t receive_quantum;
     wtq_receive_pause_mode_t receive_mode;
     wtq_driver_t *admission_driver;
@@ -61,6 +65,17 @@ struct wtq_session {
     bool terminal_fired;     /* exactly-one terminal event guard */
     bool established_seen;
     bool failed;             /* terminal without establishment */
+    wtq_local_flush_mode_t local_flush_mode;
+    wtq_result_t (*local_flush_probe)(const void *ctx);
+    const void *local_flush_ctx;
+    bool local_flush_failed;
+    wtq_send_commit_mode_t send_commit_mode;
+    unsigned commit_depth;
+    bool closed_deferred;
+    uint32_t deferred_close_code;
+    bool deferred_close_clean;
+    size_t deferred_reason_len;
+    uint8_t deferred_reason[WTQ_CAPSULE_MAX_REASON];
     /* The negotiated wire profile, published by adapt_established BEFORE
      * the application's on_established runs, so the public query is already
      * answerable inside that callback. profile_available is the only
@@ -75,12 +90,58 @@ struct wtq_session {
 
 /* --- config helpers ------------------------------------------------------ */
 
-void wtq_session_events_init(wtq_session_events_t *events)
+typedef struct wtq_session_events_v1 {
+    uint32_t struct_size;
+    void (*on_established)(wtq_session_t *, wtq_str_t, void *);
+    void (*on_refused)(wtq_session_t *, uint16_t, void *);
+    void (*on_failed)(wtq_session_t *, wtq_connect_failure_t, void *);
+    void (*on_draining)(wtq_session_t *, void *);
+    void (*on_closed)(wtq_session_t *, uint32_t, const uint8_t *, size_t, bool, void *);
+    void (*on_stream_opened)(wtq_session_t *, wtq_stream_t *, bool, void *);
+    void (*on_stream_data)(wtq_session_t *, wtq_stream_t *, const uint8_t *, size_t, bool, void *);
+    void (*on_stream_reset)(wtq_session_t *, wtq_stream_t *, uint32_t, void *);
+    void (*on_stream_stop)(wtq_session_t *, wtq_stream_t *, uint32_t, void *);
+    void (*on_stream_closed)(wtq_session_t *, wtq_stream_t *, void *);
+    void (*on_send_complete)(wtq_session_t *, void *, bool, void *);
+    void (*on_datagram)(wtq_session_t *, const uint8_t *, size_t, void *);
+    void (*on_stream_writable)(wtq_session_t *, wtq_stream_t *, void *);
+} wtq_session_events_v1_t;
+
+#define EV_V1_OFFSET(member) \
+    _Static_assert(offsetof(wtq_session_events_v1_t, member) == \
+                   offsetof(wtq_session_events_t, member), "v1 event offset changed")
+EV_V1_OFFSET(struct_size);
+EV_V1_OFFSET(on_established);
+EV_V1_OFFSET(on_refused);
+EV_V1_OFFSET(on_failed);
+EV_V1_OFFSET(on_draining);
+EV_V1_OFFSET(on_closed);
+EV_V1_OFFSET(on_stream_opened);
+EV_V1_OFFSET(on_stream_data);
+EV_V1_OFFSET(on_stream_reset);
+EV_V1_OFFSET(on_stream_stop);
+EV_V1_OFFSET(on_stream_closed);
+EV_V1_OFFSET(on_send_complete);
+EV_V1_OFFSET(on_datagram);
+EV_V1_OFFSET(on_stream_writable);
+#undef EV_V1_OFFSET
+_Static_assert(offsetof(wtq_session_events_t, on_stream_send_committed) >=
+               sizeof(wtq_session_events_v1_t), "new callback overlaps frozen v1");
+
+void wtq_session_events_init_ex(wtq_session_events_t *events, size_t caller_size)
 {
     if (events != NULL) {
-        memset(events, 0, sizeof(*events));
-        events->struct_size = (uint32_t)sizeof(*events);
+        const wtq_session_events_t def = WTQ_SESSION_EVENTS_INIT;
+        size_t n = caller_size < sizeof(def) ? caller_size : sizeof(def);
+        memcpy(events, &def, n);
+        if (n >= sizeof(events->struct_size)) events->struct_size = (uint32_t)n;
     }
+}
+
+#undef wtq_session_events_init
+void wtq_session_events_init(wtq_session_events_t *events)
+{
+    wtq_session_events_init_ex(events, sizeof(wtq_session_events_v1_t));
 }
 
 /* Frozen v1 shadow of wtq_connect_config_t (through require_subprotocol),
@@ -240,6 +301,7 @@ void wtq_session_events_copy(wtq_session_events_t *dst,
     WTQ_EV_GATE(on_send_complete);
     WTQ_EV_GATE(on_datagram);
     WTQ_EV_GATE(on_stream_writable);
+    WTQ_EV_GATE(on_stream_send_committed);
 #undef WTQ_EV_GATE
     dst->struct_size = (uint32_t)full;
 }
@@ -354,13 +416,9 @@ static void stream_drop(struct wtq_stream *st)
     stream_credit_release(st);
 }
 
-/* Terminal: both directions done (or the session/connection ended).
- * Fires on_stream_closed exactly once, severs the engine linkage, and
- * drops the library's ref. */
-static void stream_terminal(wtq_session_t *s, struct wtq_stream *st)
+/* Latch the terminal identity before any application callback. */
+static void stream_unlink(struct wtq_stream *st)
 {
-    if (!st->alive)
-        return;
     st->alive = false;
     if (st->es != NULL) {
         /* freeze the final native id first: retained handles keep
@@ -373,6 +431,13 @@ static void stream_terminal(wtq_session_t *s, struct wtq_stream *st)
         wtq_estream_set_user(st->es, NULL);
         st->es = NULL;
     }
+}
+
+static void stream_terminal(wtq_session_t *s, struct wtq_stream *st)
+{
+    if (!st->alive)
+        return;
+    stream_unlink(st);
     if (s->ev.on_stream_closed != NULL)
         s->ev.on_stream_closed(s, st, s->user);
     stream_slot_release(st);
@@ -380,7 +445,7 @@ static void stream_terminal(wtq_session_t *s, struct wtq_stream *st)
 
 static void stream_maybe_terminal(wtq_session_t *s, struct wtq_stream *st)
 {
-    if (st->alive && !st->send_open && !st->recv_open)
+    if (st->alive && !st->send_open && !st->fin_pending && !st->recv_open)
         stream_terminal(s, st);
 }
 
@@ -392,6 +457,7 @@ static void streams_teardown(wtq_session_t *s)
         struct wtq_stream *st = &s->streams[i];
         if (st->refs > 0 && st->alive) {
             st->send_open = false;
+            st->fin_pending = false;
             st->recv_open = false;
             stream_terminal(s, st);
         }
@@ -526,7 +592,15 @@ static void adapt_session_closed(wtq_conn_t *conn, uint32_t code,
         s->terminal_fired = true;
         wtq_conn_seal_transport_error(conn);
         streams_teardown(s);
-        if (s->ev.on_closed != NULL)
+        if (s->commit_depth != 0) {
+            s->closed_deferred = true;
+            s->deferred_close_code = code;
+            s->deferred_close_clean = clean;
+            s->deferred_reason_len = reason_len;
+            /* All engine close reasons obey the capsule's fixed limit. The
+             * caller's reason may be stack storage in the commit callback. */
+            if (reason_len != 0) memcpy(s->deferred_reason, reason, reason_len);
+        } else if (s->ev.on_closed != NULL)
             s->ev.on_closed(s, code, reason, reason_len, clean, s->user);
     }
     session_exit(s);
@@ -634,8 +708,13 @@ static void adapt_stream_stop(wtq_conn_t *conn, wtq_estream_t *es,
         return;
     session_enter(s);
     stream_hold(st);
+    if (st->send_commit) {
+        st->send_open = false;
+        st->fin_pending = false;
+    }
     if (s->ev.on_stream_stop != NULL)
         s->ev.on_stream_stop(s, st, app_code, s->user);
+    if (st->send_commit) stream_maybe_terminal(s, st);
     stream_drop(st);
     session_exit(s);
 }
@@ -661,10 +740,39 @@ static void adapt_stream_terminal(wtq_conn_t *conn, wtq_estream_t *es,
     stream_hold(st);
     if (st->alive) {
         st->send_open = false;
+        st->fin_pending = false;
         st->recv_open = false;
         stream_maybe_terminal(s, st); /* exactly one closed event */
     }
     stream_drop(st);
+    session_exit(s);
+}
+
+static void adapt_send_committed(wtq_conn_t *conn, wtq_estream_t *es, void *ctx)
+{
+    wtq_session_t *s = ctx;
+    struct wtq_stream *st = handle_of(es);
+    (void)conn;
+    if (st == NULL || !st->alive || !st->send_commit || !st->fin_pending)
+        return;
+    session_enter(s);
+    stream_hold(st);
+    st->fin_pending = false;
+    st->send_open = false;
+    stream_unlink(st); /* final outcome; reentrant reset cannot win now */
+    s->commit_depth++;
+    s->ev.on_stream_send_committed(s, st, s->user);
+    s->commit_depth--;
+    if (s->ev.on_stream_closed != NULL)
+        s->ev.on_stream_closed(s, st, s->user);
+    stream_slot_release(st);
+    stream_drop(st);
+    if (s->commit_depth == 0 && s->closed_deferred) {
+        s->closed_deferred = false;
+        if (s->ev.on_closed != NULL)
+            s->ev.on_closed(s, s->deferred_close_code, s->deferred_reason,
+                s->deferred_reason_len, s->deferred_close_clean, s->user);
+    }
     session_exit(s);
 }
 
@@ -730,6 +838,9 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
     memset(s, 0, sizeof(*s));
     s->refs = 1;
     s->alloc = *cfg->alloc;
+    s->perspective = cfg->perspective;
+    s->send_commit_mode = (cfg->ops->caps & WTQ_DCAP_SEND_COMMIT_ACK_FIN)
+        ? WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE : WTQ_SEND_COMMIT_UNSUPPORTED;
     s->user = cfg->user;
     wtq_session_events_copy(&s->ev, cfg->events);
 
@@ -753,6 +864,7 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
                        .on_wt_datagram = adapt_datagram,
                        .on_wt_stream_writable = adapt_stream_writable,
                        .on_wt_stream_terminal = adapt_stream_terminal,
+                       .on_wt_stream_send_committed = adapt_send_committed,
                        .ctx = s },
     };
     wtq_result_t rc = wtq_conn_create(&ccfg, cfg->drv, cfg->ops, &s->conn);
@@ -1157,6 +1269,52 @@ wtq_result_t wtq_session_transport_error(const wtq_session_t *s,
     return WTQ_OK;
 }
 
+wtq_result_t wtq_api_session_set_local_flush(wtq_session_t *s,
+    wtq_local_flush_mode_t mode, wtq_result_t (*probe)(const void *ctx),
+    const void *ctx)
+{
+    if (s == NULL || probe == NULL || ctx == NULL ||
+        (mode != WTQ_LOCAL_FLUSH_TRANSPORT &&
+         mode != WTQ_LOCAL_FLUSH_ACKNOWLEDGED))
+        return WTQ_ERR_INVALID_ARG;
+    if (s->established_seen || s->terminal_fired || s->local_flush_probe != NULL)
+        return WTQ_ERR_STATE;
+    s->local_flush_mode = mode;
+    s->local_flush_probe = probe;
+    s->local_flush_ctx = ctx;
+    return WTQ_OK;
+}
+
+wtq_local_flush_mode_t wtq_session_local_flush_mode(const wtq_session_t *s)
+{
+    return s != NULL ? s->local_flush_mode : WTQ_LOCAL_FLUSH_UNSUPPORTED;
+}
+
+void wtq_api_session_local_flush_failed(wtq_session_t *s)
+{
+    if (s != NULL && s->local_flush_mode != WTQ_LOCAL_FLUSH_UNSUPPORTED)
+        s->local_flush_failed = true;
+}
+
+wtq_result_t wtq_session_local_flush(const wtq_session_t *s)
+{
+    if (s == NULL)
+        return WTQ_ERR_INVALID_ARG;
+    if (s->local_flush_failed)
+        return WTQ_ERR_BACKEND;
+    /* Never dereference a provider after terminal: its context may already
+     * have been freed while the application retains the session handle. */
+    wtq_session_status_t status = wtq_session_status(s);
+    if (s->terminal_fired || status == WTQ_SESSION_STATUS_CLOSED ||
+        status == WTQ_SESSION_STATUS_FAILED)
+        return WTQ_ERR_CLOSED;
+    if (!s->established_seen)
+        return WTQ_ERR_STATE;
+    if (s->local_flush_probe == NULL)
+        return WTQ_ERR_UNSUPPORTED;
+    return s->local_flush_probe(s->local_flush_ctx);
+}
+
 wtq_session_status_t wtq_session_status(const wtq_session_t *s)
 {
     if (s == NULL)
@@ -1176,6 +1334,25 @@ wtq_session_status_t wtq_session_status(const wtq_session_t *s)
     default:
         return WTQ_SESSION_STATUS_CONNECTING;
     }
+}
+
+wtq_result_t wtq_session_connect_request_metadata(
+    const wtq_session_t *s, wtq_connect_request_metadata_t *out)
+{
+    const size_t v1_size = offsetof(wtq_connect_request_metadata_t, path) +
+                           sizeof(out->path);
+    if (s == NULL || out == NULL || out->struct_size < v1_size)
+        return WTQ_ERR_INVALID_ARG;
+    if (s->perspective != WTQ_PERSPECTIVE_SERVER || !s->established_seen)
+        return WTQ_ERR_STATE;
+
+    wtq_connect_request_metadata_t value = WTQ_CONNECT_REQUEST_METADATA_INIT;
+    value.struct_size = out->struct_size;
+    value.authority.data = wtq_conn_request_authority(s->conn,
+                                                     &value.authority.len);
+    value.path.data = wtq_conn_request_path(s->conn, &value.path.len);
+    memcpy(out, &value, v1_size);
+    return WTQ_OK;
 }
 
 /*
@@ -1240,6 +1417,23 @@ void wtq_stream_release(wtq_stream_t *st)
     session_unref(s); /* may free the session (and this slot) */
 }
 
+wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
+{
+    return s != NULL ? s->send_commit_mode : WTQ_SEND_COMMIT_UNSUPPORTED;
+}
+
+wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *st)
+{
+    if (st == NULL) return WTQ_ERR_INVALID_ARG;
+    if (!st->alive || !st->local || st->bidi) return WTQ_ERR_STATE;
+    wtq_session_t *s = st->session;
+    if (s->send_commit_mode == WTQ_SEND_COMMIT_UNSUPPORTED ||
+        s->ev.on_stream_send_committed == NULL) return WTQ_ERR_UNSUPPORTED;
+    wtq_result_t rc = wtq_conn_wt_enable_send_commit(s->conn, st->es);
+    if (rc == WTQ_OK) st->send_commit = true;
+    return rc;
+}
+
 wtq_result_t wtq_stream_send(wtq_stream_t *st, const wtq_span_t *spans,
                              size_t count, uint32_t flags, void *send_ctx)
 {
@@ -1253,12 +1447,15 @@ wtq_result_t wtq_stream_send(wtq_stream_t *st, const wtq_span_t *spans,
     wtq_session_t *s = st->session;
     bool fin = (flags & WTQ_SEND_FIN) != 0;
     session_enter(s);
+    stream_hold(st);
     wtq_result_t rc =
         wtq_conn_wt_send(s->conn, st->es, spans, count, fin, send_ctx);
     if (rc == WTQ_OK && fin) {
         st->send_open = false;
+        st->fin_pending = st->send_commit;
         stream_maybe_terminal(s, st);
     }
+    stream_drop(st);
     session_exit(s);
     return rc;
 }
@@ -1269,16 +1466,19 @@ wtq_result_t wtq_stream_reset(wtq_stream_t *st, uint32_t app_code)
         return WTQ_ERR_INVALID_ARG;
     if (!st->alive)
         return WTQ_ERR_CLOSED;
-    if (!st->send_open)
+    if (!st->send_open && !st->fin_pending)
         return WTQ_ERR_STATE;
 
     wtq_session_t *s = st->session;
     session_enter(s);
+    stream_hold(st);
     wtq_result_t rc = wtq_conn_wt_reset(s->conn, st->es, app_code);
     if (rc == WTQ_OK) {
         st->send_open = false;
+        st->fin_pending = false;
         stream_maybe_terminal(s, st);
     }
+    stream_drop(st);
     session_exit(s);
     return rc;
 }
@@ -1294,11 +1494,13 @@ wtq_result_t wtq_stream_stop_sending(wtq_stream_t *st, uint32_t app_code)
 
     wtq_session_t *s = st->session;
     session_enter(s);
+    stream_hold(st);
     wtq_result_t rc = wtq_conn_wt_stop(s->conn, st->es, app_code);
     if (rc == WTQ_OK) {
         st->recv_open = false;
         stream_maybe_terminal(s, st);
     }
+    stream_drop(st);
     session_exit(s);
     return rc;
 }
@@ -1309,17 +1511,20 @@ wtq_result_t wtq_stream_abort(wtq_stream_t *st, uint32_t app_code)
         return WTQ_ERR_INVALID_ARG;
     if (!st->alive)
         return WTQ_ERR_CLOSED;
-    if (!st->send_open && !st->recv_open)
+    if (!st->send_open && !st->fin_pending && !st->recv_open)
         return WTQ_ERR_STATE;
 
     wtq_session_t *s = st->session;
     session_enter(s);
+    stream_hold(st);
     wtq_result_t rc = wtq_conn_wt_abort(s->conn, st->es, app_code);
     if (rc == WTQ_OK) {
         st->send_open = false;
+        st->fin_pending = false;
         st->recv_open = false;
         stream_maybe_terminal(s, st);
     }
+    stream_drop(st);
     session_exit(s);
     return rc;
 }

@@ -8,6 +8,19 @@
 
 int main()
 {
+    if (wtq_session_local_flush(nullptr) != WTQ_ERR_INVALID_ARG ||
+        wtq_session_local_flush_mode(nullptr) != WTQ_LOCAL_FLUSH_UNSUPPORTED)
+        return 1;
+    static_assert(WTQ_LOCAL_FLUSH_ACKNOWLEDGED != WTQ_LOCAL_FLUSH_TRANSPORT,
+        "completion evidence modes must differ");
+    if (wtq_session_send_commit_mode(nullptr) != WTQ_SEND_COMMIT_UNSUPPORTED ||
+        wtq_stream_enable_send_commit(nullptr) != WTQ_ERR_INVALID_ARG) return 1;
+    wtq_session_events_init_ex(nullptr, 99);
+    wtq_connect_request_metadata_t metadata = WTQ_CONNECT_REQUEST_METADATA_INIT;
+    if (metadata.struct_size != sizeof(metadata) || metadata.reserved0 != 0 ||
+        metadata.authority.data != nullptr || metadata.path.len != 0 ||
+        wtq_session_connect_request_metadata(nullptr, &metadata) != WTQ_ERR_INVALID_ARG)
+        return 1;
     if (wtq_session_service_stream_admission(nullptr) != WTQ_ERR_INVALID_ARG) return 1;
     size_t quantum = 99;
     wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;

@@ -255,9 +255,8 @@ wtq_qpack_status_t wtq_qpack_decode_section(const uint8_t *src, size_t len,
     size_t scratch_off = 0;
     size_t count = 0;
 
-    /* Prefix: Required Insert Count (8-bit prefix int) must be 0; base
-     * byte must have the sign bit clear and Delta Base 0. Static-only
-     * by contract. */
+    /* Static-only: Required Insert Count must be zero. RFC 9204
+     * s4.5.1.2 permits any valid Base without dynamic references. */
     uint64_t ric = 0;
     size_t c = 0;
     if (wtq_qpack_int_decode(src, len, 8, &ric, &c) != WTQ_QPACK_OK ||
@@ -266,12 +265,15 @@ wtq_qpack_status_t wtq_qpack_decode_section(const uint8_t *src, size_t len,
     off += c;
     if (off >= len)
         return WTQ_QPACK_MALFORMED;
-    if (src[off] & 0x80)
-        return WTQ_QPACK_MALFORMED; /* sign bit: dynamic reference */
-    uint64_t base = 0;
-    if (wtq_qpack_int_decode(src + off, len - off, 7, &base, &c) !=
-            WTQ_QPACK_OK ||
-        base != 0)
+    bool negative = (src[off] & 0x80) != 0;
+    uint64_t delta_base = 0;
+    if (wtq_qpack_int_decode(src + off, len - off, 7, &delta_base, &c) !=
+        WTQ_QPACK_OK)
+        return WTQ_QPACK_MALFORMED;
+    /* S=1: Base = RIC - Delta Base - 1 must not underflow. With RIC=0
+     * every signed encoding is invalid. S=0: Base = Delta Base, already
+     * range-checked by the integer decoder, and otherwise unused. */
+    if (negative && ric <= delta_base)
         return WTQ_QPACK_MALFORMED;
     off += c;
 
@@ -327,7 +329,7 @@ wtq_qpack_status_t wtq_qpack_decode_section(const uint8_t *src, size_t len,
             if (st != WTQ_QPACK_OK)
                 return st;
         } else {
-            /* 0001 (post-base name ref) and 0000 (post-base indexed)
+            /* 0001 (post-base indexed) and 0000 (post-base name ref)
              * are dynamic-only forms. */
             return WTQ_QPACK_MALFORMED;
         }
