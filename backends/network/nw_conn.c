@@ -1578,8 +1578,13 @@ static void ds_handle_failure(struct wtq_dstream *ds, nw_error_t e)
             ds->conn != NULL && stream_peer_reset_code(ds->conn, &code);
         ds->reset_delivered = true;
         wtq_api_session_enter(drv->session);
+        /* A reset whose code Network.framework did not report is passed
+         * as unreadable, not as 0: the legacy event still sees 0, and the
+         * classified abort says UNKNOWN instead of a code nobody sent. */
         (void)wtq_conn_on_stream_reset(wtq_api_session_conn(drv->session),
-                                       ds->ectx, has_code ? code : 0,
+                                       ds->ectx,
+                                       has_code ? code
+                                                : WTQ_QUIC_ERR_UNREADABLE,
                                        nw_now_us());
         nw_leave_and_poll(drv);
     }
@@ -1996,6 +2001,9 @@ static const wtq_driver_ops_t nw_driver_ops = {
      * cannot split codes; the mandatory baseline is exact and enough.
      * Datagram and receive-pause support are advertised structurally
      * (the ops below are non-NULL). */
+    /* No ABORT_* guarantee: a received STOP_SENDING has no public signal,
+     * and a reset's code is read from stream metadata that may be absent
+     * (the reset is then reported as UNKNOWN). */
     .caps = 0,
     .open_uni = op_open_uni,
     .open_bidi = op_open_bidi,

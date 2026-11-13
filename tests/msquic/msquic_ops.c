@@ -1497,10 +1497,14 @@ static struct rx_cap {
     void (*opened_hook)(wtq_session_t *);
     unsigned terminal_order;
     uint32_t reset_code, stop_code;
+    wtq_stream_abort_t aborts[4]; /* on_stream_abort records, in order */
+    unsigned abort_n;
     unsigned closed_calls;
     unsigned commit_calls;
 } g_pr;
 static void (*pr_established_hook)(wtq_session_t *, void *);
+/* When set, the rigs below also install on_stream_abort. */
+static bool g_pr_abort_events;
 
 static void pr_on_send_committed(wtq_session_t *s, wtq_stream_t *st, void *u)
 {
@@ -1599,6 +1603,17 @@ static void pr_on_stream_stop(wtq_session_t *s, wtq_stream_t *st, uint32_t code,
     g_pr.stop_code = code;
 }
 
+static void pr_on_stream_abort(wtq_session_t *s, wtq_stream_t *st,
+                               const wtq_stream_abort_t *rec, void *u)
+{
+    (void)s; (void)st; (void)u;
+    g_pr.terminal_order = g_pr.terminal_order * 10 +
+        (rec->direction == WTQ_STREAM_ABORT_RESET ? 1u : 2u);
+    if (g_pr.abort_n < sizeof(g_pr.aborts) / sizeof(g_pr.aborts[0]))
+        g_pr.aborts[g_pr.abort_n] = *rec;
+    g_pr.abort_n++;
+}
+
 /* Deliver a RECEIVE carrying exactly `data[0..len)` (single buffer, or a
  * bare FIN when len == 0). Returns the TotalBufferLength the callback
  * left — 0 == arrested, len == accepted. */
@@ -1658,6 +1673,8 @@ static struct wtq_driver *pause_estab_plan(QUIC_API_TABLE *api,
     ev.on_stream_reset = pr_on_stream_reset;
     ev.on_stream_stop = pr_on_stream_stop;
     ev.on_stream_send_committed = pr_on_send_committed;
+    if (g_pr_abort_events)
+        ev.on_stream_abort = pr_on_stream_abort;
     ev.on_closed = cap_on_closed;
     wtq_api_session_cfg_t scfg = {
         .alloc = alloc,
@@ -3557,6 +3574,93 @@ static int test_bounded_queued_terminals(void)
     return failures;
 }
 
+/* The backend's abort guarantees, on its stored and replayed ingress: a
+ * peer stream that is not yet admitted when its RESET_STREAM and
+ * STOP_SENDING arrive keeps both codes, and the admission service replays
+ * them in arrival order. Each reaches on_stream_abort classified from the
+ * exact wire code, and the legacy events are not called. */
+static int test_abort_records_stored_and_replayed(void)
+{
+    int failures = 0;
+    static const struct {
+        uint64_t reset_err, stop_err;
+        uint32_t reset_origin, stop_origin, reset_app, stop_app;
+    } cases[] = {
+        /* application code 0, and exactly WT_SESSION_GONE */
+        { UINT64_C(0x52e4a40fa8db), UINT64_C(0x170d7b68),
+          WTQ_STREAM_ABORT_ORIGIN_APPLICATION,
+          WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE, 0, 0 },
+        /* another protocol code, and application code 241 */
+        { UINT64_C(0x10c), 0 /* wtq_app_error_to_h3(241) */,
+          WTQ_STREAM_ABORT_ORIGIN_PROTOCOL,
+          WTQ_STREAM_ABORT_ORIGIN_APPLICATION, 0, 241 },
+    };
+
+    g_pr_abort_events = true;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+        uint64_t stop_err = cases[c].stop_err != 0
+            ? cases[c].stop_err : wtq_app_error_to_h3(241);
+        for (unsigned order = 0; order < 2; ++order) {
+            QUIC_API_TABLE api;
+            wtq_session_t *sess = NULL;
+            struct wtq_driver *drv =
+                pause_estab_mode(&api, &sess, wtq_alloc_default(), true);
+            WTQ_TEST_CHECK(drv != NULL);
+            if (!drv) { g_pr_abort_events = false; return failures; }
+            WTQ_TEST_CHECK_EQ_HEX(wtq_session_abort_observability(sess),
+                WTQ_ABORT_OBSERVES_RESET_CODE | WTQ_ABORT_OBSERVES_STOP_EVENT |
+                WTQ_ABORT_OBSERVES_STOP_CODE);
+            wtq_stream_t *locals[12] = { 0 };
+            for (size_t i = 0; i < 12; ++i)
+                WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &locals[i]), WTQ_OK);
+            complete_all_sends();
+            g_ord.n = 0;
+            feed_peer_stream_started(drv, (HQUIC)(void *)&locals, true, 1);
+            struct wtq_dstream *ds = g_ord.call[0].ctx;
+            const uint8_t prefix[] = { 0x40, 0x41, 0 };
+            wtq_api_session_enter(sess);
+            WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), false), 3);
+            for (unsigned i = 0; i < 2; ++i) {
+                QUIC_STREAM_EVENT terminal = { .Type = i == order
+                    ? QUIC_STREAM_EVENT_PEER_SEND_ABORTED
+                    : QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED };
+                if (i == order) terminal.PEER_SEND_ABORTED.ErrorCode = cases[c].reset_err;
+                else terminal.PEER_RECEIVE_ABORTED.ErrorCode = stop_err;
+                (void)wtq_msq_stream_callback(ds->stream, ds, &terminal);
+            }
+            lifetime_shutdown(ds);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.abort_n, 0); /* stored, not delivered */
+            WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[0], 0), WTQ_OK);
+            WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.abort_n, 2);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, order == 0 ? 12 : 21);
+            WTQ_TEST_CHECK_EQ_INT(g_pr.reset_code, 0); /* legacy not called */
+            WTQ_TEST_CHECK_EQ_INT(g_pr.stop_code, 0);
+            for (unsigned k = 0; k < 2 && k < g_pr.abort_n; ++k) {
+                const wtq_stream_abort_t *a = &g_pr.aborts[k];
+                bool reset = a->direction == WTQ_STREAM_ABORT_RESET;
+                WTQ_TEST_CHECK_EQ_INT(a->direction, (order == 0) == (k == 0)
+                    ? WTQ_STREAM_ABORT_RESET : WTQ_STREAM_ABORT_STOP);
+                WTQ_TEST_CHECK_EQ_SIZE(a->struct_size, sizeof(*a));
+                WTQ_TEST_CHECK_EQ_INT(a->origin, reset ? cases[c].reset_origin
+                                                       : cases[c].stop_origin);
+                WTQ_TEST_CHECK_EQ_HEX(a->app_code, reset ? cases[c].reset_app
+                                                         : cases[c].stop_app);
+                WTQ_TEST_CHECK_EQ_HEX(a->wire_code, reset ? cases[c].reset_err
+                                                          : stop_err);
+            }
+            wtq_api_session_admission_detach(sess);
+            wtq_session_release(sess);
+            drv->session = NULL; drv->conn = NULL;
+            wtq_msq_conn_free(drv);
+        }
+    }
+    g_pr_abort_events = false;
+    return failures;
+}
+
 static void admission_poison_free(void *p, size_t n, void *ctx)
 {
     memset(p, 0xdd, n);
@@ -4757,6 +4861,8 @@ int main(int argc, char **argv)
         return test_admission_resume_failure();
     if (argc == 2 && strcmp(argv[1], "--admission-fifo") == 0)
         return test_admission_fifo();
+    if (argc == 2 && strcmp(argv[1], "--abort-records") == 0)
+        return test_abort_records_stored_and_replayed();
     if (argc == 2 && strcmp(argv[1], "--bounded-admission") == 0)
         return test_bounded_admission_borrow_and_credit() + test_bounded_handle_debt() +
             test_bounded_snapshot_continuation() + test_bounded_resident_reuse() +
@@ -4826,6 +4932,7 @@ int main(int argc, char **argv)
         failures += test_bounded_resident_reuse();
         failures += test_bounded_final_shutdown();
         failures += test_bounded_queued_terminals();
+        failures += test_abort_records_stored_and_replayed();
         failures += test_admission_resume_failure();
         failures += test_admission_bidi_reset();
         failures += test_admission_fifo();

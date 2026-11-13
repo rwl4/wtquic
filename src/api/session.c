@@ -88,6 +88,7 @@ struct wtq_session {
     const void *local_flush_ctx;
     bool local_flush_failed;
     wtq_send_commit_mode_t send_commit_mode;
+    uint32_t abort_observability; /* fixed at creation from the driver */
     unsigned commit_depth;
     bool closed_deferred;
     uint32_t deferred_close_code;
@@ -170,6 +171,35 @@ EV_V1_OFFSET(on_stream_writable);
 #undef EV_V1_OFFSET
 _Static_assert(offsetof(wtq_session_events_t, on_stream_send_committed) >=
                sizeof(wtq_session_events_v1_t), "new callback overlaps frozen v1");
+/* The second published extent ends at on_stream_send_committed; the abort
+ * event starts at or after its end, so no caller of either earlier layout
+ * can cover part of it. */
+_Static_assert(offsetof(wtq_session_events_t, on_stream_abort) >=
+                   offsetof(wtq_session_events_t, on_stream_send_committed) +
+                       sizeof(((wtq_session_events_t *)0)->on_stream_send_committed),
+               "abort callback overlaps an earlier published extent");
+
+/* The abort record's frozen first layout, field by field. */
+_Static_assert(offsetof(wtq_stream_abort_t, struct_size) == 0,
+               "abort struct_size offset frozen");
+_Static_assert(offsetof(wtq_stream_abort_t, direction) == 4,
+               "abort direction offset frozen");
+_Static_assert(offsetof(wtq_stream_abort_t, origin) == 8,
+               "abort origin offset frozen");
+_Static_assert(offsetof(wtq_stream_abort_t, app_code) == 12,
+               "abort app_code offset frozen");
+_Static_assert(offsetof(wtq_stream_abort_t, wire_code) == 16,
+               "abort wire_code offset frozen");
+_Static_assert(WTQ_STREAM_ABORT_V0_SIZE == 24, "abort v0 extent frozen");
+_Static_assert(sizeof(wtq_stream_abort_t) == 24,
+               "abort record has no padding in any supported data model");
+/* A uint64_t's alignment as a struct member: 8 on most models, 4 where the
+ * data model packs it so (i686). _Alignof(uint64_t) alone can report the
+ * type's preferred alignment instead. */
+typedef struct wtq_u64_member { char c; uint64_t v; } wtq_u64_member_t;
+_Static_assert(_Alignof(wtq_stream_abort_t) ==
+                   offsetof(wtq_u64_member_t, v),
+               "abort record aligns as a uint64_t member");
 
 void wtq_session_events_init_ex(wtq_session_events_t *events, size_t caller_size)
 {
@@ -345,8 +375,26 @@ void wtq_session_events_copy(wtq_session_events_t *dst,
     WTQ_EV_GATE(on_datagram);
     WTQ_EV_GATE(on_stream_writable);
     WTQ_EV_GATE(on_stream_send_committed);
+    WTQ_EV_GATE(on_stream_abort);
 #undef WTQ_EV_GATE
     dst->struct_size = (uint32_t)full;
+}
+
+/* The public observation bits from the driver's capability word. A STOP
+ * code without the STOP event is not a coherent driver statement: it is
+ * dropped rather than advertised. */
+static uint32_t abort_observability_of(uint32_t caps)
+{
+    uint32_t bits = 0;
+
+    if (caps & WTQ_DCAP_ABORT_RESET_CODE)
+        bits |= WTQ_ABORT_OBSERVES_RESET_CODE;
+    if (caps & WTQ_DCAP_ABORT_STOP_EVENT) {
+        bits |= WTQ_ABORT_OBSERVES_STOP_EVENT;
+        if (caps & WTQ_DCAP_ABORT_STOP_CODE)
+            bits |= WTQ_ABORT_OBSERVES_STOP_CODE;
+    }
+    return bits;
 }
 
 /* --- deferred destroy ----------------------------------------------------- */
@@ -731,8 +779,26 @@ static void adapt_stream_data(wtq_conn_t *conn, wtq_estream_t *es,
     session_exit(s);
 }
 
+/*
+ * One classified abort goes to on_stream_abort when the application set it
+ * (and its table covers it: the copy gated it), otherwise to the legacy
+ * event, never to both. After the session's terminal event no abort is
+ * delivered: the terminal has been decided, and the streams were closed
+ * before it. The legacy events keep their earlier behaviour unchanged.
+ */
+static bool abort_delivered(wtq_session_t *s, struct wtq_stream *st,
+                            const wtq_stream_abort_t *rec)
+{
+    if (s->ev.on_stream_abort == NULL)
+        return false;
+    if (!s->terminal_fired)
+        s->ev.on_stream_abort(s, st, rec, s->user);
+    return true;
+}
+
 static void adapt_stream_reset(wtq_conn_t *conn, wtq_estream_t *es,
-                               uint32_t app_code, void *ctx)
+                               uint32_t app_code,
+                               const wtq_stream_abort_t *rec, void *ctx)
 {
     wtq_session_t *s = ctx;
     struct wtq_stream *st = handle_of(es);
@@ -742,7 +808,7 @@ static void adapt_stream_reset(wtq_conn_t *conn, wtq_estream_t *es,
         return;
     session_enter(s);
     stream_hold(st);
-    if (s->ev.on_stream_reset != NULL)
+    if (!abort_delivered(s, st, rec) && s->ev.on_stream_reset != NULL)
         s->ev.on_stream_reset(s, st, app_code, s->user);
     if (st->alive) {
         st->recv_open = false;
@@ -753,7 +819,8 @@ static void adapt_stream_reset(wtq_conn_t *conn, wtq_estream_t *es,
 }
 
 static void adapt_stream_stop(wtq_conn_t *conn, wtq_estream_t *es,
-                              uint32_t app_code, void *ctx)
+                              uint32_t app_code,
+                              const wtq_stream_abort_t *rec, void *ctx)
 {
     wtq_session_t *s = ctx;
     struct wtq_stream *st = handle_of(es);
@@ -767,7 +834,7 @@ static void adapt_stream_stop(wtq_conn_t *conn, wtq_estream_t *es,
         st->send_open = false;
         st->fin_pending = false;
     }
-    if (s->ev.on_stream_stop != NULL)
+    if (!abort_delivered(s, st, rec) && s->ev.on_stream_stop != NULL)
         s->ev.on_stream_stop(s, st, app_code, s->user);
     if (st->send_commit) stream_maybe_terminal(s, st);
     stream_drop(st);
@@ -904,6 +971,7 @@ static wtq_result_t session_create(const wtq_api_session_cfg_t *cfg,
     s->perspective = cfg->perspective;
     s->send_commit_mode = (cfg->ops->caps & WTQ_DCAP_SEND_COMMIT_ACK_FIN)
         ? WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE : WTQ_SEND_COMMIT_UNSUPPORTED;
+    s->abort_observability = abort_observability_of(cfg->ops->caps);
     s->user = cfg->user;
     wtq_session_events_copy(&s->ev, cfg->events);
 
@@ -1583,6 +1651,11 @@ void wtq_stream_release(wtq_stream_t *st)
     st->refs--;
     stream_credit_release(st);
     session_unref(s); /* may free the session (and this slot) */
+}
+
+uint32_t wtq_session_abort_observability(const wtq_session_t *s)
+{
+    return s != NULL ? s->abort_observability : 0;
 }
 
 wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)

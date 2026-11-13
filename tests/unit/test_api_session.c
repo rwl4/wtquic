@@ -221,6 +221,12 @@ static void nop_send_complete(wtq_session_t *s, void *sctx, bool canceled,
 { (void)s; (void)sctx; (void)canceled; (void)u; }
 static void nop_stream_writable(wtq_session_t *s, wtq_stream_t *st, void *u)
 { (void)s; (void)st; (void)u; }
+static void nop_stream_send_committed(wtq_session_t *s, wtq_stream_t *st,
+                                     void *u)
+{ (void)s; (void)st; (void)u; }
+static void nop_stream_abort(wtq_session_t *s, wtq_stream_t *st,
+                             const wtq_stream_abort_t *a, void *u)
+{ (void)s; (void)st; (void)a; (void)u; }
 
 static void all_events(wtq_session_events_t *ev)
 {
@@ -230,6 +236,8 @@ static void all_events(wtq_session_events_t *ev)
     ev->on_stream_stop = nop_stream_stop;
     ev->on_send_complete = nop_send_complete;
     ev->on_stream_writable = nop_stream_writable;
+    ev->on_stream_send_committed = nop_stream_send_committed;
+    ev->on_stream_abort = nop_stream_abort;
 }
 
 /* Create the session but do NOT start it (start is one-shot, so tests
@@ -733,6 +741,8 @@ static const size_t ev_member_off[] = {
     offsetof(wtq_session_events_t, on_send_complete),
     offsetof(wtq_session_events_t, on_datagram),
     offsetof(wtq_session_events_t, on_stream_writable),
+    offsetof(wtq_session_events_t, on_stream_send_committed),
+    offsetof(wtq_session_events_t, on_stream_abort),
 };
 
 /* Typed, member-specific state of callback `idx` (declaration order, matching
@@ -758,26 +768,42 @@ static int ev_member_state(const wtq_session_events_t *d,
     case 10: return S(on_send_complete);
     case 11: return S(on_datagram);
     case 12: return S(on_stream_writable);
+    case 13: return S(on_stream_send_committed);
+    case 14: return S(on_stream_abort);
     default: return -1;
     }
 #undef S
 }
 
-/* Cut the caller's struct_size ONE byte into each callback member in turn: the
+/* Cut the caller's struct_size inside each callback member in turn: the
  * straddled member (and everything after it) must normalise to NULL, while
  * every cleanly-complete earlier member is preserved with its exact typed
  * value. The source holds REAL typed callbacks, so a straddled member is a
- * truncated real pointer (not a synthetic pattern). Heap-backed. RED-prove:
- * drop any WTQ_EV_GATE and the cut straddling that member reports corrupt. */
+ * truncated real pointer (not a synthetic pattern). The cut keeps the
+ * member's bytes up to and including the first nonzero byte of that real
+ * pointer's representation, still short of the whole member, so a straddled
+ * member that is not normalised can never read as NULL by accident: the
+ * whole-pointer comparison reports it as not NULL. Nothing calls a
+ * normalised or truncated member. Heap-backed. */
 static void test_events_partial_callback_zeroed(int *fp)
 {
     int failures = 0;
     const size_t n = sizeof(ev_member_off) / sizeof(ev_member_off[0]);
     wtq_session_events_t tmpl;
+    const size_t psz = sizeof(tmpl.on_closed); /* one callback member */
 
     all_events(&tmpl);   /* every member a distinct typed no-op */
     for (size_t cut = 0; cut < n; cut++) {
-        const size_t sz = ev_member_off[cut] + 1;   /* 1 byte into member cut */
+        const unsigned char *member =
+            (const unsigned char *)&tmpl + ev_member_off[cut];
+        size_t first = 0;   /* first nonzero byte of the member's value */
+
+        while (first < psz - 1 && member[first] == 0)
+            first++;
+        WTQ_TEST_CHECK(first < psz - 1);   /* a nonzero strict prefix */
+        if (first >= psz - 1)
+            continue;
+        const size_t sz = ev_member_off[cut] + first + 1;
         unsigned char *buf = malloc(sz);
         WTQ_TEST_CHECK(buf != NULL);
         if (buf == NULL)

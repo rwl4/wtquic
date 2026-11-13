@@ -236,7 +236,9 @@ static void availability(int *fp)
         static rig_t r;
         uint32_t size = sizeof(wtq_session_events_t);
         if (row == 2) size = (uint32_t)offset;
-        if (row == 3) size = (uint32_t)sizeof(wtq_session_events_t) - 1;
+        if (row == 3) /* the send-commit member straddled */
+            size = (uint32_t)(offset +
+                sizeof(((const wtq_session_events_t *)0)->on_stream_send_committed) - 1);
         setup(&r, row != 0, size, row != 1, fp);
         WTQ_TEST_CHECK(wtq_session_send_commit_mode(r.session) ==
             (row == 0 ? WTQ_SEND_COMMIT_UNSUPPORTED : WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE));

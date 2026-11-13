@@ -1864,6 +1864,38 @@ wtq_result_t wtq_conn_on_stream_terminal(wtq_conn_t *conn,
     return WTQ_OK;
 }
 
+/*
+ * Classify a peer's abort from its QUIC error code alone
+ * (draft-ietf-webtrans-http3-16 section 4.4 for the application range and
+ * its skipped codepoints; section 6 for WT_SESSION_GONE, a protocol-level
+ * code). Every field is written, whatever the origin. The legacy app_code
+ * stays the mapped application code, 0 for every other origin.
+ */
+static uint32_t wt_abort_classify(uint32_t direction, uint64_t quic_err,
+                                  wtq_stream_abort_t *out)
+{
+    uint32_t app = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->struct_size = (uint32_t)sizeof(*out);
+    out->direction = direction;
+    if (quic_err == WTQ_QUIC_ERR_UNREADABLE) {
+        out->origin = WTQ_STREAM_ABORT_ORIGIN_UNKNOWN;
+        return 0;
+    }
+    out->wire_code = quic_err;
+    if (quic_err == WTQ_WT_SESSION_GONE) {
+        out->origin = WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE;
+    } else if (wtq_h3_error_to_app(quic_err, &app) == WTQ_OK) {
+        out->origin = WTQ_STREAM_ABORT_ORIGIN_APPLICATION;
+        out->app_code = app;
+    } else {
+        app = 0;
+        out->origin = WTQ_STREAM_ABORT_ORIGIN_PROTOCOL;
+    }
+    return app;
+}
+
 wtq_result_t wtq_conn_on_stream_reset(wtq_conn_t *conn, wtq_estream_t *es,
                                       uint64_t quic_err, uint64_t now_us)
 {
@@ -1899,11 +1931,12 @@ wtq_result_t wtq_conn_on_stream_reset(wtq_conn_t *conn, wtq_estream_t *es,
          * A reset is a receive-side event: a bidi stream's send side
          * stays usable, and the estream survives at least until the
          * callback returns. */
-        uint32_t app = 0;
-        (void)wtq_h3_error_to_app(quic_err, &app);
+        wtq_stream_abort_t rec;
+        uint32_t app = wt_abort_classify(WTQ_STREAM_ABORT_RESET, quic_err,
+                                         &rec);
         es->wt_recv_open = false;
         if (conn->cb.on_wt_stream_reset != NULL)
-            conn->cb.on_wt_stream_reset(conn, es, app, conn->cb.ctx);
+            conn->cb.on_wt_stream_reset(conn, es, app, &rec, conn->cb.ctx);
         wt_release_if_done(conn, es);
         return WTQ_OK;
     }
@@ -3607,17 +3640,18 @@ wtq_result_t wtq_conn_on_stop_sending(wtq_conn_t *conn, wtq_estream_t *es,
         return WTQ_OK;
     }
     if (es->kind == ES_WT) {
-        uint32_t app = 0;
+        wtq_stream_abort_t rec;
         uint64_t generation = es->generation;
         bool commit_mode = es->wt_send_commit;
-        (void)wtq_h3_error_to_app(quic_err, &app);
+        uint32_t app = wt_abort_classify(WTQ_STREAM_ABORT_STOP, quic_err,
+                                         &rec);
         /* Legacy streams stay usable; opted-in streams resolve without commit. */
         if (commit_mode) {
             es->wt_send_open = false;
             es->wt_fin_pending = false;
         }
         if (conn->cb.on_wt_stream_stop != NULL)
-            conn->cb.on_wt_stream_stop(conn, es, app, conn->cb.ctx);
+            conn->cb.on_wt_stream_stop(conn, es, app, &rec, conn->cb.ctx);
         if (commit_mode && es->generation == generation)
             wt_release_if_done(conn, es);
     }

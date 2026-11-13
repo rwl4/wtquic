@@ -17,12 +17,26 @@ set(_prefix "${WORK}/prefix")
 set(_cbuild "${WORK}/consumer-build")
 file(REMOVE_RECURSE "${_prefix}" "${_cbuild}")
 
-execute_process(
-    COMMAND ${CMAKE_COMMAND} --install "${BUILD}" --prefix "${_prefix}"
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "install failed:\n${_out}")
-endif()
+# Run one step. Its exit status and complete output are printed whether or
+# not it succeeds, and kept in WORK/<name>.log, so the test log carries every
+# install, configure, compiler and linker diagnostic of a passing run too.
+function(_consumer_step name)
+    execute_process(COMMAND ${ARGN}
+        RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+    file(WRITE "${WORK}/${name}.log" "${_out}")
+    message(STATUS "consumer_install_msquic: ${name} exit ${_rc}; "
+                   "complete output follows (also ${WORK}/${name}.log)")
+    if(NOT _out STREQUAL "")
+        message(NOTICE "${_out}")
+    endif()
+    message(STATUS "consumer_install_msquic: end of ${name} output")
+    if(NOT _rc EQUAL 0)
+        message(FATAL_ERROR "consumer_install_msquic: ${name} failed")
+    endif()
+endfunction()
+
+_consumer_step(install
+    ${CMAKE_COMMAND} --install "${BUILD}" --prefix "${_prefix}")
 
 set(_hints "")
 if(DEFINED MSQUIC_DIR AND NOT MSQUIC_DIR STREQUAL "")
@@ -40,19 +54,12 @@ if(DEFINED LINK_FLAGS AND NOT LINK_FLAGS STREQUAL "")
     list(APPEND _hints "-DCMAKE_EXE_LINKER_FLAGS=${LINK_FLAGS}")
 endif()
 
-execute_process(
-    COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild}"
-        "-DCMAKE_PREFIX_PATH=${_prefix}" ${_hints}
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "consumer configure failed:\n${_out}")
-endif()
+_consumer_step(configure
+    ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild}"
+        "-DCMAKE_PREFIX_PATH=${_prefix}" ${_hints})
 
-execute_process(
-    COMMAND ${CMAKE_COMMAND} --build "${_cbuild}"
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "consumer build failed:\n${_out}")
-endif()
+# One job, whatever the nested generator or environment would choose.
+_consumer_step(build
+    ${CMAKE_COMMAND} --build "${_cbuild}" --parallel 1)
 
 message(STATUS "consumer_install_msquic: OK")

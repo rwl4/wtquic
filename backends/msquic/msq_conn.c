@@ -711,9 +711,14 @@ const wtq_driver_ops_t *wtq_msq_driver_ops(void)
          * redelivery and does NOT extend receive credit while nothing is
          * consumed), so a paused peer is eventually blocked by QUIC flow
          * control, not merely unpumped. */
+        /* ABORT_*: every PEER_SEND_ABORTED and PEER_RECEIVE_ABORTED carries
+         * the peer's ErrorCode, and the admission path stores that code and
+         * replays it unchanged (msq_stream.c), so every reset and every stop
+         * reaches the engine with its code. */
         .caps = WTQ_DCAP_SHUT_BIDI_SEND | WTQ_DCAP_SHUT_BIDI_RECV |
                 WTQ_DCAP_SHUT_SPLIT_CODES | WTQ_DCAP_RECV_FLOW_CONTROLLED |
-                WTQ_DCAP_SEND_COMMIT_ACK_FIN,
+                WTQ_DCAP_SEND_COMMIT_ACK_FIN | WTQ_DCAP_ABORT_RESET_CODE |
+                WTQ_DCAP_ABORT_STOP_EVENT | WTQ_DCAP_ABORT_STOP_CODE,
         .shutdown_stream = borrow_op_shutdown_stream,
         .conn_close = borrow_op_conn_close,
         .open_bidi = borrow_op_open_bidi,

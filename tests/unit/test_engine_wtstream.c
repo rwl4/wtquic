@@ -48,6 +48,8 @@ typedef struct app_state {
     uint32_t wt_reset_code;
     int wt_stop_events;
     uint32_t wt_stop_code;
+    wtq_stream_abort_t wt_reset_abort; /* the last reset, classified */
+    wtq_stream_abort_t wt_stop_abort;  /* the last stop, classified */
     int wt_terminal_events;
     wtq_estream_t *wt_terminal_es;
 
@@ -130,7 +132,8 @@ static void cb_wt_data(wtq_conn_t *c, wtq_estream_t *es,
 }
 
 static void cb_wt_reset(wtq_conn_t *c, wtq_estream_t *es,
-                        uint32_t app_code, void *ctx)
+                        uint32_t app_code, const wtq_stream_abort_t *rec,
+                        void *ctx)
 {
     app_state_t *st = ctx;
 
@@ -138,10 +141,12 @@ static void cb_wt_reset(wtq_conn_t *c, wtq_estream_t *es,
     (void)es;
     st->wt_reset_events++;
     st->wt_reset_code = app_code;
+    st->wt_reset_abort = *rec;
 }
 
 static void cb_wt_stop(wtq_conn_t *c, wtq_estream_t *es,
-                       uint32_t app_code, void *ctx)
+                       uint32_t app_code, const wtq_stream_abort_t *rec,
+                       void *ctx)
 {
     app_state_t *st = ctx;
 
@@ -149,6 +154,7 @@ static void cb_wt_stop(wtq_conn_t *c, wtq_estream_t *es,
     (void)es;
     st->wt_stop_events++;
     st->wt_stop_code = app_code;
+    st->wt_stop_abort = *rec;
 }
 
 static void cb_wt_terminal(wtq_conn_t *c, wtq_estream_t *es, void *ctx)
@@ -816,6 +822,169 @@ static void test_wt_reset_mapping(int *fp)
     (void)wtq_conn_on_stream_reset(r.conn, r.app.wt_last_es, 0x10, 3300);
     WTQ_TEST_CHECK_EQ_SIZE((size_t)r.app.wt_reset_events, 2);
     WTQ_TEST_CHECK(r.app.wt_reset_code == 0);
+    rig_down(&r, fp);
+    *fp += failures;
+}
+
+/* --- classified aborts ---------------------------------------------------- */
+
+/* Expected classification of one peer abort, and the legacy code that
+ * goes with it. */
+typedef struct abort_case {
+    const char *name;
+    uint64_t quic_err;
+    uint32_t origin;
+    uint32_t app_code;  /* also the legacy app_code */
+    uint64_t wire_code; /* 0 for UNKNOWN */
+} abort_case_t;
+
+/* Every field of the last abort record the callback saw must hold its
+ * expected value. The callback copies the record over a 0xa5 fill, which
+ * shows the callback ran and copied it, but a copy cannot show whether the
+ * engine wrote a field: an unwritten field arrives with whatever the
+ * engine's own record storage held. These assertions catch it whenever
+ * that storage differs from the expected value, as it does deterministically
+ * in a build with -ftrivial-auto-var-init=pattern. */
+static int check_abort(const wtq_stream_abort_t *got, uint32_t direction,
+                       const abort_case_t *c)
+{
+    int failures = 0;
+
+    WTQ_TEST_CHECK_EQ_SIZE((size_t)got->struct_size,
+                           sizeof(wtq_stream_abort_t));
+    WTQ_TEST_CHECK_EQ_INT((int)got->direction, (int)direction);
+    WTQ_TEST_CHECK_EQ_INT((int)got->origin, (int)c->origin);
+    WTQ_TEST_CHECK_EQ_HEX(got->app_code, c->app_code);
+    WTQ_TEST_CHECK_EQ_HEX(got->wire_code, c->wire_code);
+    if (failures != 0)
+        fprintf(stderr, "  abort case: %s (%s)\n", c->name,
+                direction == WTQ_STREAM_ABORT_RESET ? "reset" : "stop");
+    return failures;
+}
+
+/* draft-ietf-webtrans-http3-16 section 4.4: the application range runs
+ * from 0x52e4a40fa8db (code 0) to 0x52e5ac983162 (code 0xffffffff),
+ * skipping the HTTP/3 reserved codepoints 0x1f * N + 0x21; any other code
+ * resets the stream with no application error code. Section 6:
+ * WT_SESSION_GONE (0x170d7b68) is protocol-level. A code the transport did
+ * not report is UNKNOWN, with every field still written. */
+static const abort_case_t ABORT_CASES[] = {
+    { "application 0", UINT64_C(0x52e4a40fa8db),
+      WTQ_STREAM_ABORT_ORIGIN_APPLICATION, 0, UINT64_C(0x52e4a40fa8db) },
+    { "application 1234", 0 /* filled below */,
+      WTQ_STREAM_ABORT_ORIGIN_APPLICATION, 1234, 0 },
+    { "application max", UINT64_C(0x52e5ac983162),
+      WTQ_STREAM_ABORT_ORIGIN_APPLICATION, 0xffffffffu,
+      UINT64_C(0x52e5ac983162) },
+    { "below the range", UINT64_C(0x52e4a40fa8da),
+      WTQ_STREAM_ABORT_ORIGIN_PROTOCOL, 0, UINT64_C(0x52e4a40fa8da) },
+    { "above the range", UINT64_C(0x52e5ac983163),
+      WTQ_STREAM_ABORT_ORIGIN_PROTOCOL, 0, UINT64_C(0x52e5ac983163) },
+    { "skipped codepoint", 0 /* filled below */,
+      WTQ_STREAM_ABORT_ORIGIN_PROTOCOL, 0, 0 },
+    { "WT_SESSION_GONE", UINT64_C(0x170d7b68),
+      WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE, 0, UINT64_C(0x170d7b68) },
+    { "HTTP/3 code", UINT64_C(0x10c),
+      WTQ_STREAM_ABORT_ORIGIN_PROTOCOL, 0, UINT64_C(0x10c) },
+    { "zero", 0, WTQ_STREAM_ABORT_ORIGIN_PROTOCOL, 0, 0 },
+    { "unreadable", WTQ_QUIC_ERR_UNREADABLE,
+      WTQ_STREAM_ABORT_ORIGIN_UNKNOWN, 0, 0 },
+};
+
+/* The first reserved codepoint 0x1f * N + 0x21 inside the application
+ * range. */
+static uint64_t first_skipped_codepoint(void)
+{
+    uint64_t first = UINT64_C(0x52e4a40fa8db);
+    uint64_t n = (first - 0x21 + 0x1e) / 0x1f;
+    return UINT64_C(0x1f) * n + 0x21;
+}
+
+static abort_case_t abort_case(size_t i)
+{
+    abort_case_t c = ABORT_CASES[i];
+    if (strcmp(c.name, "application 1234") == 0)
+        c.quic_err = c.wire_code = wtq_app_error_to_h3(1234);
+    if (strcmp(c.name, "skipped codepoint") == 0)
+        c.quic_err = c.wire_code = first_skipped_codepoint();
+    return c;
+}
+
+/* Every reset and every STOP_SENDING on a WT stream reaches the layer
+ * above classified, and the legacy code is unchanged: the application
+ * code for an application abort, 0 for every other one. */
+static void test_wt_abort_classified(int *fp)
+{
+    int failures = 0;
+    const size_t n = sizeof(ABORT_CASES) / sizeof(ABORT_CASES[0]);
+    rig_t r;
+
+    /* the skipped codepoint really is inside the range and unmapped */
+    uint32_t unused = 0;
+    WTQ_TEST_CHECK(first_skipped_codepoint() > UINT64_C(0x52e4a40fa8db) &&
+                   first_skipped_codepoint() < UINT64_C(0x52e5ac983162));
+    WTQ_TEST_CHECK(wtq_h3_error_to_app(first_skipped_codepoint(), &unused) ==
+                   WTQ_ERR_NOT_FOUND);
+
+    establish_client(&r, fp);
+    for (size_t i = 0; i < n; i++) {
+        abort_case_t c = abort_case(i);
+
+        /* a peer uni, reset by the peer */
+        uint8_t pre[8];
+        size_t plen = enc_preamble(false, 0, pre, sizeof(pre));
+        uint64_t id = 3 + 4 * (uint64_t)(i + 1);
+        struct wtq_dstream *ds = fake_driver_add_peer_stream(&r.drv, id);
+        wtq_estream_t *es = NULL;
+        WTQ_TEST_CHECK(ds != NULL);
+        if (ds == NULL)
+            break;
+        WTQ_TEST_CHECK(wtq_conn_on_peer_uni_opened(r.conn, ds, id, &es) ==
+                       WTQ_OK);
+        (void)wtq_conn_on_stream_bytes(r.conn, es, pre, plen, false, 3000);
+        int resets = r.app.wt_reset_events;
+        memset(&r.app.wt_reset_abort, 0xa5, sizeof(r.app.wt_reset_abort));
+        WTQ_TEST_CHECK(wtq_conn_on_stream_reset(r.conn, r.app.wt_last_es,
+                                                c.quic_err, 3100) == WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(r.app.wt_reset_events, resets + 1);
+        WTQ_TEST_CHECK_EQ_HEX(r.app.wt_reset_code, c.app_code);
+        failures += check_abort(&r.app.wt_reset_abort,
+                                WTQ_STREAM_ABORT_RESET, &c);
+
+        /* a local uni, stopped by the peer */
+        wtq_estream_t *les = NULL;
+        WTQ_TEST_CHECK(wtq_conn_wt_open_uni(r.conn, &les) == WTQ_OK);
+        if (les == NULL)
+            break;
+        int stops = r.app.wt_stop_events;
+        memset(&r.app.wt_stop_abort, 0xa5, sizeof(r.app.wt_stop_abort));
+        WTQ_TEST_CHECK(wtq_conn_on_stop_sending(r.conn, les, c.quic_err,
+                                                3200) == WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(r.app.wt_stop_events, stops + 1);
+        WTQ_TEST_CHECK_EQ_HEX(r.app.wt_stop_code, c.app_code);
+        failures += check_abort(&r.app.wt_stop_abort,
+                                WTQ_STREAM_ABORT_STOP, &c);
+        (void)wtq_conn_wt_reset(r.conn, les, 0);
+    }
+    rig_down(&r, fp);
+    *fp += failures;
+}
+
+/* The CONNECT stream's reset is the session terminal, never a stream
+ * abort. */
+static void test_connect_reset_is_not_an_abort(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    establish_client(&r, fp);
+    int resets = r.app.wt_reset_events;
+    WTQ_TEST_CHECK(r.sess_es != NULL);
+    if (r.sess_es != NULL)
+        (void)wtq_conn_on_stream_reset(r.conn, r.sess_es,
+                                       UINT64_C(0x170d7b68), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.wt_reset_events, resets);
+    WTQ_TEST_CHECK_EQ_SIZE((size_t)r.app.closed_events, 1);
     rig_down(&r, fp);
     *fp += failures;
 }
@@ -2050,6 +2219,8 @@ int main(void)
     test_wt_stream_after_close(&failures);
     test_preamble_fin_edges(&failures);
     test_wt_reset_mapping(&failures);
+    test_wt_abort_classified(&failures);
+    test_connect_reset_is_not_an_abort(&failures);
     test_wt_open_local(&failures);
     test_wt_send_success(&failures);
     test_wt_send_errors(&failures);

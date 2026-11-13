@@ -62,7 +62,27 @@ typedef struct app {
                                         the stop callback */
     wtq_stream_t *stop_stream;
     wtq_stream_t *reused_in_stop;
+    int abort_events;
+    wtq_stream_abort_t last_abort;
+    wtq_stream_t *abort_stream;
+    bool close_session_in_abort;   /* wtq_session_close from inside */
+    bool release_session_in_abort; /* drop the last session ref inside */
+    bool reset_then_open_in_abort; /* reentrant terminal + slot reuse */
+    wtq_stream_t *reused_in_abort;
 } app_t;
+
+/* How establish_client builds the events table:
+ *   EVENTS_LEGACY       only the legacy reset/stop events, as before;
+ *   EVENTS_ABORT        the full table with on_stream_abort set as well;
+ *   EVENTS_ABORT_UNCOVERED  on_stream_abort set, but the table stamped
+ *       with the extent that ends before it (a caller built against the
+ *       previous header), so the library must not read it. */
+enum { EVENTS_LEGACY, EVENTS_ABORT, EVENTS_ABORT_UNCOVERED };
+static int g_events_mode = EVENTS_LEGACY;
+/* When nonzero, establish_client runs on the fake driver's ops with this
+ * capability word instead (the abort observation facts under test). */
+static uint32_t g_driver_caps;
+static wtq_driver_ops_t g_driver_ops;
 
 static void on_stream_opened(wtq_session_t *s, wtq_stream_t *st,
                              bool bidi, void *user)
@@ -148,6 +168,24 @@ static void on_stream_stop(wtq_session_t *s, wtq_stream_t *st,
         (void)wtq_session_open_bidi(wtq_stream_session(st),
                                     &a->reused_in_stop);
     }
+}
+
+static void on_stream_abort(wtq_session_t *s, wtq_stream_t *st,
+                            const wtq_stream_abort_t *rec, void *user)
+{
+    app_t *a = user;
+
+    a->abort_events++;
+    a->last_abort = *rec;
+    a->abort_stream = st;
+    if (a->reset_then_open_in_abort) {
+        (void)wtq_stream_stop_sending(st, 7);
+        (void)wtq_session_open_bidi(s, &a->reused_in_abort);
+    }
+    if (a->close_session_in_abort)
+        (void)wtq_session_close(s, 9, NULL, 0);
+    if (a->release_session_in_abort)
+        wtq_session_release(s);
 }
 
 static void on_stream_closed(wtq_session_t *s, wtq_stream_t *st,
@@ -277,7 +315,15 @@ static void establish_client(rig_t *r, int *fp)
     r->sess_es = NULL;
     fake_driver_init(&r->drv, true);
 
-    wtq_session_events_init(&ev);
+    if (g_events_mode == EVENTS_ABORT_UNCOVERED) {
+        memset(&ev, 0xa5, sizeof(ev));
+        wtq_session_events_init_ex(&ev,
+            offsetof(wtq_session_events_t, on_stream_abort));
+    } else {
+        wtq_session_events_init(&ev);
+    }
+    if (g_events_mode != EVENTS_LEGACY)
+        ev.on_stream_abort = on_stream_abort;
     ev.on_stream_opened = on_stream_opened;
     ev.on_stream_data = on_stream_data;
     ev.on_stream_reset = on_stream_reset;
@@ -295,6 +341,11 @@ static void establish_client(rig_t *r, int *fp)
         .drv = &r->drv,
         .ops = fake_driver_ops(),
     };
+    if (g_driver_caps != 0) {
+        g_driver_ops = *fake_driver_ops();
+        g_driver_ops.caps = g_driver_caps;
+        cfg.ops = &g_driver_ops;
+    }
     WTQ_TEST_CHECK(wtq_api_session_create(&cfg, &r->s) == WTQ_OK);
     if (r->s == NULL) {
         *fp += failures + 1;
@@ -617,6 +668,287 @@ static void test_peer_stop_event(int *fp)
     WTQ_TEST_CHECK(wtq_stream_send(st, &span, 1, 0, NULL) == WTQ_OK);
     (void)fake_driver_complete_sends(&r.drv, wtq_api_session_conn(r.s));
     rig_down(&r, fp);
+    *fp += failures;
+}
+
+/* --- classified aborts ---------------------------------------------------- */
+
+/* A local uni stream's engine handle: the 5th local (control, qpack x2,
+ * CONNECT, then this). */
+static wtq_estream_t *local_uni_es(rig_t *r)
+{
+    struct wtq_dstream *uni = fake_driver_local(&r->drv, 4);
+    return uni != NULL ? uni->ectx : NULL;
+}
+
+/* With on_stream_abort set, a peer reset reaches it classified, and the
+ * legacy on_stream_reset is not called for it. The receive direction
+ * still closes, so a uni stream still gets its one terminal. */
+static void test_abort_replaces_reset(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    g_events_mode = EVENTS_ABORT;
+    establish_client(&r, fp);
+    wtq_estream_t *es = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    WTQ_TEST_CHECK(r.app.opened_events == 1);
+    (void)wtq_conn_on_stream_reset(wtq_api_session_conn(r.s), es,
+                                   wtq_app_error_to_h3(0), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.app.reset_events, 0);
+    WTQ_TEST_CHECK_EQ_INT((int)r.app.last_abort.direction,
+                          (int)WTQ_STREAM_ABORT_RESET);
+    WTQ_TEST_CHECK_EQ_INT((int)r.app.last_abort.origin,
+                          (int)WTQ_STREAM_ABORT_ORIGIN_APPLICATION);
+    WTQ_TEST_CHECK_EQ_HEX(r.app.last_abort.app_code, 0);
+    WTQ_TEST_CHECK(r.app.abort_stream == r.app.opened);
+    WTQ_TEST_CHECK(r.app.closed_events == 1);
+    rig_down(&r, fp);
+    g_events_mode = EVENTS_LEGACY;
+    *fp += failures;
+}
+
+/* The same for a peer STOP_SENDING: on_stream_stop is not called, the
+ * stream stays usable, and WT_SESSION_GONE is reported as itself. */
+static void test_abort_replaces_stop(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    g_events_mode = EVENTS_ABORT;
+    establish_client(&r, fp);
+    wtq_stream_t *st = NULL;
+    WTQ_TEST_CHECK(wtq_session_open_uni(r.s, &st) == WTQ_OK);
+    wtq_estream_t *les = local_uni_es(&r);
+    WTQ_TEST_CHECK(les != NULL);
+    if (les == NULL) {
+        rig_down(&r, fp);
+        g_events_mode = EVENTS_LEGACY;
+        *fp += failures + 1;
+        return;
+    }
+    (void)wtq_conn_on_stop_sending(wtq_api_session_conn(r.s), les,
+                                   UINT64_C(0x170d7b68), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.app.stop_events, 0);
+    WTQ_TEST_CHECK_EQ_INT((int)r.app.last_abort.direction,
+                          (int)WTQ_STREAM_ABORT_STOP);
+    WTQ_TEST_CHECK_EQ_INT((int)r.app.last_abort.origin,
+                          (int)WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE);
+    WTQ_TEST_CHECK_EQ_HEX(r.app.last_abort.wire_code, UINT64_C(0x170d7b68));
+    WTQ_TEST_CHECK(r.app.abort_stream == st);
+    wtq_span_t span = { (const uint8_t *)"x", 1 };
+    WTQ_TEST_CHECK(wtq_stream_send(st, &span, 1, 0, NULL) == WTQ_OK);
+    (void)fake_driver_complete_sends(&r.drv, wtq_api_session_conn(r.s));
+    rig_down(&r, fp);
+    g_events_mode = EVENTS_LEGACY;
+    *fp += failures;
+}
+
+/* A table stamped with the extent that ends before on_stream_abort (a
+ * caller built against the previous header) keeps the legacy events
+ * exactly as before, even though the member's bytes hold a pointer. */
+static void test_abort_uncovered_keeps_legacy(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    g_events_mode = EVENTS_ABORT_UNCOVERED;
+    establish_client(&r, fp);
+    wtq_estream_t *es = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    (void)wtq_conn_on_stream_reset(wtq_api_session_conn(r.s), es,
+                                   wtq_app_error_to_h3(1234), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 0);
+    WTQ_TEST_CHECK_EQ_INT(r.app.reset_events, 1);
+    WTQ_TEST_CHECK(r.app.reset_code == 1234);
+    WTQ_TEST_CHECK(r.app.closed_events == 1);
+    rig_down(&r, fp);
+    g_events_mode = EVENTS_LEGACY;
+    *fp += failures;
+}
+
+/* The capability handshake: the sized initializer stamps the extent this
+ * library knows, never more, and WTQ_SESSION_EVENTS_COVERS reads it.
+ * A caller's tail past that extent is left untouched (canary), and a
+ * smaller caller is stamped at its own size. */
+static void test_abort_capability(int *fp)
+{
+    int failures = 0;
+    union {
+        wtq_session_events_t ev;
+        unsigned char bytes[sizeof(wtq_session_events_t) + 32];
+    } box;
+    const size_t abort_end =
+        offsetof(wtq_session_events_t, on_stream_abort) +
+        sizeof(box.ev.on_stream_abort);
+
+    memset(&box, 0xa5, sizeof(box));
+    wtq_session_events_init_ex(&box.ev, sizeof(box));
+    WTQ_TEST_CHECK_EQ_SIZE((size_t)box.ev.struct_size,
+                           sizeof(wtq_session_events_t));
+    WTQ_TEST_CHECK(WTQ_SESSION_EVENTS_COVERS(&box.ev, on_stream_abort));
+    WTQ_TEST_CHECK(box.ev.on_stream_abort == NULL);
+    WTQ_TEST_CHECK(box.bytes[sizeof(wtq_session_events_t)] == 0xa5);
+    WTQ_TEST_CHECK(box.bytes[sizeof(box) - 1] == 0xa5);
+
+    memset(&box, 0xa5, sizeof(box));
+    wtq_session_events_init_ex(&box.ev, abort_end - 1);
+    WTQ_TEST_CHECK_EQ_SIZE((size_t)box.ev.struct_size, abort_end - 1);
+    WTQ_TEST_CHECK(!WTQ_SESSION_EVENTS_COVERS(&box.ev, on_stream_abort));
+    WTQ_TEST_CHECK(box.bytes[abort_end - 1] == 0xa5);
+
+    /* the bare symbol keeps its frozen first extent */
+    memset(&box, 0xa5, sizeof(box));
+    (wtq_session_events_init)(&box.ev);
+    WTQ_TEST_CHECK(!WTQ_SESSION_EVENTS_COVERS(&box.ev, on_stream_abort));
+    WTQ_TEST_CHECK(!WTQ_SESSION_EVENTS_COVERS(&box.ev,
+                                              on_stream_send_committed));
+    WTQ_TEST_CHECK(WTQ_SESSION_EVENTS_COVERS(&box.ev, on_stream_writable));
+
+    /* the record's frozen layout, in this build's data model */
+    WTQ_TEST_CHECK_EQ_SIZE(sizeof(wtq_stream_abort_t), 24);
+    WTQ_TEST_CHECK_EQ_SIZE(WTQ_STREAM_ABORT_V0_SIZE, 24);
+    {
+        struct u64_member { char c; uint64_t v; };
+        WTQ_TEST_CHECK_EQ_SIZE(_Alignof(wtq_stream_abort_t),
+                               offsetof(struct u64_member, v));
+    }
+    WTQ_TEST_CHECK_EQ_SIZE(offsetof(wtq_stream_abort_t, wire_code), 16);
+    *fp += failures;
+}
+
+/* Reentrancy inside on_stream_abort: a stop that terminals the stream
+ * and an open that may reuse its slot; a session close; and dropping the
+ * last session reference, whose destroy is deferred until the callback
+ * returns. */
+static void test_abort_reentrant(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    g_events_mode = EVENTS_ABORT;
+
+    establish_client(&r, fp);
+    r.app.reset_then_open_in_abort = true;
+    wtq_estream_t *es = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    (void)wtq_conn_on_stream_reset(wtq_api_session_conn(r.s), es,
+                                   wtq_app_error_to_h3(5), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 1);
+    WTQ_TEST_CHECK(r.app.closed_events == 1);
+    WTQ_TEST_CHECK(r.app.reused_in_abort != NULL);
+    rig_down(&r, fp);
+
+    establish_client(&r, fp);
+    r.app.close_session_in_abort = true;
+    es = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    (void)wtq_conn_on_stream_reset(wtq_api_session_conn(r.s), es,
+                                   wtq_app_error_to_h3(5), 3100);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.app.reset_events, 0);
+    rig_down(&r, fp);
+
+    /* The callback drops the only session reference. As a backend does,
+     * the input runs inside wtq_api_session_enter/leave: the destroy waits
+     * for the outer leave, which reports it; the session and its engine
+     * are not touched after that. */
+    establish_client(&r, fp);
+    r.app.release_session_in_abort = true;
+    es = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    {
+        wtq_session_t *s = r.s;
+        wtq_conn_t *conn = wtq_api_session_conn(s);
+
+        wtq_api_session_enter(s);
+        (void)wtq_conn_on_stream_reset(conn, es, wtq_app_error_to_h3(5), 3100);
+        WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 1);
+        WTQ_TEST_CHECK(r.ca.frees < r.ca.allocs); /* not destroyed yet */
+        WTQ_TEST_CHECK(wtq_api_session_leave(s)); /* the destroying leave */
+        WTQ_TEST_CHECK_EQ_INT(r.ca.frees, r.ca.allocs);
+    }
+    r.s = NULL; /* gone: rig_down only checks the allocator */
+    rig_down(&r, fp);
+
+    g_events_mode = EVENTS_LEGACY;
+    *fp += failures;
+}
+
+/* No abort follows the session's terminal event, whatever the engine
+ * still reports for its streams. */
+static void test_no_abort_after_closed(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+
+    g_events_mode = EVENTS_ABORT;
+    establish_client(&r, fp);
+    wtq_stream_t *st = NULL;
+    WTQ_TEST_CHECK(wtq_session_open_uni(r.s, &st) == WTQ_OK);
+    wtq_stream_add_ref(st);
+    wtq_estream_t *les = local_uni_es(&r);
+    wtq_estream_t *pes = feed_peer_stream(&r, false, 7, NULL, 0, false, fp);
+    WTQ_TEST_CHECK(wtq_session_close(r.s, 0, NULL, 0) == WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(r.app.session_closed_events, 1);
+    if (les != NULL)
+        (void)wtq_conn_on_stop_sending(wtq_api_session_conn(r.s), les,
+                                       wtq_app_error_to_h3(1), 3100);
+    if (pes != NULL)
+        (void)wtq_conn_on_stream_reset(wtq_api_session_conn(r.s), pes,
+                                       wtq_app_error_to_h3(1), 3200);
+    WTQ_TEST_CHECK_EQ_INT(r.app.abort_events, 0);
+    WTQ_TEST_CHECK_EQ_INT(r.app.reset_events, 0);
+    WTQ_TEST_CHECK_EQ_INT(r.app.stop_events, 0);
+    wtq_stream_release(st);
+    rig_down(&r, fp);
+    g_events_mode = EVENTS_LEGACY;
+    *fp += failures;
+}
+
+/* The observation guarantees come from the driver's facts, fixed at
+ * creation, and stay readable on a retained handle after the session
+ * ended. A STOP code without the STOP event is not advertised. */
+static void test_abort_observability(int *fp)
+{
+    int failures = 0;
+    rig_t r;
+    static const struct {
+        uint32_t caps;
+        uint32_t bits;
+    } rows[] = {
+        { 0, 0 }, /* the fake driver's own word: no abort fact */
+        { WTQ_DCAP_ABORT_RESET_CODE, WTQ_ABORT_OBSERVES_RESET_CODE },
+        { WTQ_DCAP_ABORT_STOP_EVENT, WTQ_ABORT_OBSERVES_STOP_EVENT },
+        { WTQ_DCAP_ABORT_STOP_EVENT | WTQ_DCAP_ABORT_STOP_CODE,
+          WTQ_ABORT_OBSERVES_STOP_EVENT | WTQ_ABORT_OBSERVES_STOP_CODE },
+        { WTQ_DCAP_ABORT_STOP_CODE, 0 },
+        { WTQ_DCAP_ABORT_RESET_CODE | WTQ_DCAP_ABORT_STOP_EVENT |
+              WTQ_DCAP_ABORT_STOP_CODE,
+          WTQ_ABORT_OBSERVES_RESET_CODE | WTQ_ABORT_OBSERVES_STOP_EVENT |
+              WTQ_ABORT_OBSERVES_STOP_CODE },
+    };
+
+    WTQ_TEST_CHECK_EQ_HEX(wtq_session_abort_observability(NULL), 0);
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        /* the fake driver's own capability bits stay in every row, so
+         * only the abort facts differ */
+        g_driver_caps = rows[i].caps | (fake_driver_ops()->caps);
+        establish_client(&r, fp);
+        if (r.s == NULL) {
+            g_driver_caps = 0;
+            *fp += failures + 1;
+            return;
+        }
+        WTQ_TEST_CHECK_EQ_HEX(wtq_session_abort_observability(r.s),
+                              rows[i].bits);
+        wtq_session_add_ref(r.s);
+        WTQ_TEST_CHECK(wtq_session_close(r.s, 0, NULL, 0) == WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(r.app.session_closed_events, 1);
+        WTQ_TEST_CHECK_EQ_HEX(wtq_session_abort_observability(r.s),
+                              rows[i].bits); /* after the terminal */
+        wtq_session_release(r.s);
+        rig_down(&r, fp);
+        g_driver_caps = 0;
+    }
     *fp += failures;
 }
 
@@ -1169,6 +1501,13 @@ int main(void)
     test_stream_reset_stop_paths(&failures);
     test_peer_reset_event(&failures);
     test_peer_stop_event(&failures);
+    test_abort_replaces_reset(&failures);
+    test_abort_replaces_stop(&failures);
+    test_abort_uncovered_keeps_legacy(&failures);
+    test_abort_capability(&failures);
+    test_abort_reentrant(&failures);
+    test_no_abort_after_closed(&failures);
+    test_abort_observability(&failures);
     test_send_completion_teardown(&failures);
     test_release_unretained_noop(&failures);
     test_local_bidi_pool_exhaustion(&failures);

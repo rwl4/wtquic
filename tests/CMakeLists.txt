@@ -244,6 +244,34 @@ if(CMAKE_CXX_COMPILER)
     add_test(NAME consumer_header_cxx17 COMMAND consumer_header_cxx17)
 endif()
 
+# The Network backend's public header consumed exactly as shipped: strict C99
+# and C++17 translation units with no backend-internal includes. They link
+# only the Network backend and need neither MsQuic nor bash.
+if(WTQ_BUILD_NETWORK)
+    add_executable(consumer_network_header_c99
+        consumer/network_header/use_header.c)
+    target_link_libraries(consumer_network_header_c99 PRIVATE
+        wtq::network)
+    set_target_properties(consumer_network_header_c99 PROPERTIES
+        C_STANDARD 99 C_STANDARD_REQUIRED ON)
+    add_test(NAME consumer_network_header_c99
+        COMMAND consumer_network_header_c99)
+    set_tests_properties(consumer_network_header_c99 PROPERTIES
+        LABELS network)
+    if(CMAKE_CXX_COMPILER)
+        add_executable(consumer_network_header_cxx
+            consumer/network_header/use_header.cpp)
+        target_link_libraries(consumer_network_header_cxx PRIVATE
+            wtq::network)
+        set_target_properties(consumer_network_header_cxx PROPERTIES
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+        add_test(NAME consumer_network_header_cxx
+            COMMAND consumer_network_header_cxx)
+        set_tests_properties(consumer_network_header_cxx PROPERTIES
+            LABELS network)
+    endif()
+endif()
+
 # --- Boundary + symbol policy ------------------------------------------------
 
 find_program(WTQ_BASH bash)
@@ -381,6 +409,7 @@ if(WTQ_MSQUIC_ENABLED)
     set_tests_properties(send_commit_native PROPERTIES FIXTURES_REQUIRED certs LABELS msquic TIMEOUT 90)
     add_test(NAME admission_resume_failure COMMAND test_msquic_ops --admission-resume-failure)
     add_test(NAME admission_fifo COMMAND test_msquic_ops --admission-fifo)
+    add_test(NAME msquic_abort_records COMMAND test_msquic_ops --abort-records)
     add_test(NAME admission_bidi_reset COMMAND test_msquic_ops --admission-bidi-reset)
     add_test(NAME stream_budget_control COMMAND test_msquic_ops --stream-budget-control)
     add_test(NAME stream_budget_progress COMMAND test_msquic_ops --stream-budget-progress)
@@ -640,28 +669,6 @@ if(WTQ_MSQUIC_ENABLED)
             LABELS "network;loopback"
             TIMEOUT 600)
 
-        # The public header consumed exactly as shipped: strict C99 and
-        # C++17 translation units with no backend-internal includes.
-        add_executable(consumer_network_header_c99
-            consumer/network_header/use_header.c)
-        target_link_libraries(consumer_network_header_c99 PRIVATE
-            wtq::network)
-        set_target_properties(consumer_network_header_c99 PROPERTIES
-            C_STANDARD 99 C_STANDARD_REQUIRED ON)
-        add_test(NAME consumer_network_header_c99
-            COMMAND consumer_network_header_c99)
-        set_tests_properties(consumer_network_header_c99 PROPERTIES
-            LABELS network)
-        add_executable(consumer_network_header_cxx
-            consumer/network_header/use_header.cpp)
-        target_link_libraries(consumer_network_header_cxx PRIVATE
-            wtq::network)
-        set_target_properties(consumer_network_header_cxx PROPERTIES
-            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-        add_test(NAME consumer_network_header_cxx
-            COMMAND consumer_network_header_cxx)
-        set_tests_properties(consumer_network_header_cxx PROPERTIES
-            LABELS network)
 
         # Backend export surface: a LEAN shared build (no WTQ_NW_TESTING)
         # must export exactly the pinned wtq_nw_* allowlist. Only

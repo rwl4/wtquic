@@ -32,6 +32,8 @@
 #include "../proto/preamble.h"
 #include "stream_budget.h"
 
+struct wtq_stream_abort; /* <wtquic/session.h> */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -133,6 +135,13 @@ wtq_dstream_t *wtq_estream_driver_stream(const wtq_estream_t *es);
 #define WTQ_WT_BUFFERED_STREAM_REJECTED UINT64_C(0x3994bd84)
 #define WTQ_WT_SESSION_GONE UINT64_C(0x170d7b68)
 
+/* A backend passes this as the quic_err of wtq_conn_on_stream_reset or
+ * wtq_conn_on_stop_sending when the transport did not report the peer's
+ * code. A QUIC error code is a variable-length integer below 2^62, so this
+ * value never comes from the wire. The abort is then classified
+ * WTQ_STREAM_ABORT_ORIGIN_UNKNOWN; the legacy app_code is 0 as before. */
+#define WTQ_QUIC_ERR_UNREADABLE UINT64_MAX
+
 /* Session lifecycle states (one WT session per connection in v1).
  * ESTABLISHED -> DRAINING is advisory (draft-15 s4.7: streams may still
  * open); CLOSED is terminal and is entered exactly once, always
@@ -196,6 +205,18 @@ typedef enum wtq_driver_cap {
     /* Opt-in local UNI ACK-through-FIN plus operational post-FIN reset.
      * Requires the versioned generation/commit ingress below. */
     WTQ_DCAP_SEND_COMMIT_ACK_FIN = 1u << 4,
+    /* Abort observation guarantees, surfaced publicly by
+     * wtq_session_abort_observability(). A backend sets each ONLY when it
+     * delivers that fact for every attributable WT stream abort, stored and
+     * replayed ingress included:
+     *   ABORT_RESET_CODE  every peer RESET_STREAM reaches
+     *                     wtq_conn_on_stream_reset with the peer's code;
+     *   ABORT_STOP_EVENT  every peer STOP_SENDING reaches
+     *                     wtq_conn_on_stop_sending;
+     *   ABORT_STOP_CODE   ... with the peer's code (requires STOP_EVENT). */
+    WTQ_DCAP_ABORT_RESET_CODE = 1u << 5,
+    WTQ_DCAP_ABORT_STOP_EVENT = 1u << 6,
+    WTQ_DCAP_ABORT_STOP_CODE  = 1u << 7,
 } wtq_driver_cap_t;
 
 typedef struct wtq_driver_ops {
@@ -379,18 +400,23 @@ typedef struct wtq_conn_callbacks {
                               void *ctx);
     /* Peer reset a WT stream. app_code is the mapped WT application
      * error, 0 when the wire code is outside the WT range (draft-15
-     * s4.4: delivered as "no application error code"). A reset closes
-     * the RECEIVE side only: es stays valid through the callback, and
-     * a bidi stream's send side keeps working; es is released once its
-     * last direction closes (immediately after the callback for a
-     * receive-only stream). */
+     * s4.4: delivered as "no application error code"). rec is the
+     * same reset classified (direction RESET; see wtq_stream_abort_t),
+     * borrowed for the callback. A reset closes the RECEIVE side only:
+     * es stays valid through the callback, and a bidi stream's send side
+     * keeps working; es is released once its last direction closes
+     * (immediately after the callback for a receive-only stream). */
     void (*on_wt_stream_reset)(wtq_conn_t *conn, wtq_estream_t *es,
-                               uint32_t app_code, void *ctx);
+                               uint32_t app_code,
+                               const struct wtq_stream_abort *rec,
+                               void *ctx);
     /* Peer sent STOP_SENDING for a WT stream we write to (same code
-     * mapping as on_wt_stream_reset). The stream stays usable until
-     * reset/FIN. */
+     * mapping as on_wt_stream_reset; rec has direction STOP). The
+     * stream stays usable until reset/FIN. */
     void (*on_wt_stream_stop)(wtq_conn_t *conn, wtq_estream_t *es,
-                              uint32_t app_code, void *ctx);
+                              uint32_t app_code,
+                              const struct wtq_stream_abort *rec,
+                              void *ctx);
     /* A send_gather completion: the cookie's data buffers are released
      * back to the app. Fires exactly once per accepted send, including
      * after session/connection teardown (canceled=true). */
@@ -534,7 +560,8 @@ WTQ_SPI wtq_result_t wtq_conn_on_stream_bytes_accounted(
     wtq_conn_t *conn, wtq_estream_t *es, const uint8_t *data, size_t len,
     bool fin, uint64_t now_us, size_t *consumed);
 
-/* Peer reset one of its uni streams. */
+/* Peer reset one of its uni streams. quic_err is the peer's code, or
+ * WTQ_QUIC_ERR_UNREADABLE when the transport did not report it. */
 WTQ_SPI wtq_result_t wtq_conn_on_stream_reset(wtq_conn_t *conn,
                                       wtq_estream_t *es,
                                       uint64_t quic_err, uint64_t now_us);
@@ -901,7 +928,8 @@ WTQ_SPI void wtq_conn_on_stream_native_id(wtq_conn_t *conn,
 WTQ_SPI void wtq_conn_on_send_complete(wtq_conn_t *conn, void *cookie,
                                        bool canceled);
 
-/* Peer STOP_SENDING observed on a stream we write to. */
+/* Peer STOP_SENDING observed on a stream we write to. quic_err as for
+ * wtq_conn_on_stream_reset. */
 WTQ_SPI wtq_result_t wtq_conn_on_stop_sending(wtq_conn_t *conn, wtq_estream_t *es,
                                       uint64_t quic_err, uint64_t now_us);
 

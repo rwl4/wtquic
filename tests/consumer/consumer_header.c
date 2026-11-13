@@ -61,6 +61,32 @@ int main(void)
     if (events.on_established != 0)
         return 1;
 
+    /* the classified abort: its record, its event and the capability test */
+    {
+        wtq_session_events_t ev;
+        wtq_stream_abort_t abort_rec = { 0, 0, 0, 0, 0 };
+        wtq_session_events_init_ex(&ev, sizeof(ev));
+        if (!WTQ_SESSION_EVENTS_COVERS(&ev, on_stream_abort) ||
+            ev.on_stream_abort != 0)
+            return 1;
+        wtq_session_events_init_ex(&ev,
+            offsetof(wtq_session_events_t, on_stream_abort));
+        if (WTQ_SESSION_EVENTS_COVERS(&ev, on_stream_abort))
+            return 1;
+        if (WTQ_STREAM_ABORT_V0_SIZE != sizeof(abort_rec) ||
+            WTQ_STREAM_ABORT_ORIGIN_UNKNOWN != 0u ||
+            WTQ_STREAM_ABORT_RESET == WTQ_STREAM_ABORT_STOP)
+            return 1;
+        (void)abort_rec;
+#if !defined(WTQ_HAVE_SESSION_ABORT_OBSERVABILITY)
+#error "the header must declare wtq_session_abort_observability"
+#endif
+        if (wtq_session_abort_observability(0) != 0u ||
+            (WTQ_ABORT_OBSERVES_RESET_CODE | WTQ_ABORT_OBSERVES_STOP_EVENT |
+             WTQ_ABORT_OBSERVES_STOP_CODE) != 7u)
+            return 1;
+    }
+
     /* the WebTransport profile field + both init entry points */
     connect_cfg.webtransport_profile =
         WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT;

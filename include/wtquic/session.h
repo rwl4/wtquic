@@ -147,6 +147,58 @@ typedef struct wtq_guard {
 } wtq_guard_t;
 
 /*
+ * A peer's abort of one direction of a WebTransport stream: RESET_STREAM on
+ * the direction the peer sends, or STOP_SENDING on the one we send.
+ *
+ * The library classifies the received QUIC error code and nothing else; it
+ * never infers why the peer chose it. Classification (draft-ietf-webtrans-
+ * http3-16 section 4.4, "Resetting Data Streams", and section 6, "Session
+ * Termination"; the same code points in drafts -13 to -15):
+ *
+ *   WTQ_STREAM_ABORT_ORIGIN_APPLICATION  the code lies in the range reserved
+ *       for WT_APPLICATION_ERROR and is not one of its skipped codepoints;
+ *       app_code is the 32-bit application error code, 0 included.
+ *   WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE the code is exactly WT_SESSION_GONE
+ *       (0x170d7b68): a protocol-level code saying the reset was caused by
+ *       session termination. The library does not end the session on it and
+ *       does not promise that a session terminal follows.
+ *   WTQ_STREAM_ABORT_ORIGIN_PROTOCOL     any other code the transport
+ *       reported. The stream is still reset, with no application error code.
+ *   WTQ_STREAM_ABORT_ORIGIN_UNKNOWN      the transport did not report a code
+ *       for this abort. Nothing about its cause is known.
+ *
+ * Every field the library stamps is written: app_code is 0 unless origin is
+ * APPLICATION, and wire_code is 0 when origin is UNKNOWN. Values outside the
+ * listed sets may be added; a consumer that does not know a value treats it
+ * as UNKNOWN.
+ *
+ * BORROWED: the record is valid only for the duration of the callback.
+ * Read a field only when struct_size covers it whole; later fields are
+ * appended. The size and alignment follow the platform's uint64_t: 24
+ * bytes in every supported data model, aligned to 8 or, where uint64_t is
+ * 4-aligned inside a struct (i686), to 4.
+ */
+#define WTQ_STREAM_ABORT_RESET 1u /* peer ended its sending direction */
+#define WTQ_STREAM_ABORT_STOP  2u /* peer refused our sending direction */
+
+#define WTQ_STREAM_ABORT_ORIGIN_UNKNOWN      0u
+#define WTQ_STREAM_ABORT_ORIGIN_APPLICATION  1u
+#define WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE 2u
+#define WTQ_STREAM_ABORT_ORIGIN_PROTOCOL     3u
+
+typedef struct wtq_stream_abort {
+    uint32_t struct_size; /* bytes the library filled */
+    uint32_t direction;   /* WTQ_STREAM_ABORT_RESET or _STOP */
+    uint32_t origin;      /* WTQ_STREAM_ABORT_ORIGIN_* */
+    uint32_t app_code;    /* the application code when origin is APPLICATION */
+    uint64_t wire_code;   /* the code as received; 0 when origin is UNKNOWN */
+} wtq_stream_abort_t;
+
+/* The frozen first layout, through wire_code. */
+#define WTQ_STREAM_ABORT_V0_SIZE \
+    (offsetof(wtq_stream_abort_t, wire_code) + sizeof(uint64_t))
+
+/*
  * Typed event callbacks. Set struct_size (use WTQ_SESSION_EVENTS_INIT)
  * so the struct can grow without breaking old callers; NULL members are
  * skipped. `user` is the pointer given at session creation.
@@ -198,8 +250,9 @@ typedef struct wtq_session_events {
                            void *user);
     /* The peer abruptly ended the stream's incoming direction.
      * app_code is the peer's application error code (0 when it did not
-     * carry one). A bidirectional stream's outgoing direction remains
-     * usable. */
+     * carry one, so 0 alone does not tell those apart; on_stream_abort
+     * does). A bidirectional stream's outgoing direction remains usable.
+     * Not called for an abort delivered through on_stream_abort. */
     void (*on_stream_reset)(wtq_session_t *session, wtq_stream_t *stream,
                             uint32_t app_code, void *user);
     /* The peer asked us to stop sending on this stream. The stream
@@ -207,7 +260,9 @@ typedef struct wtq_session_events {
      * wtq_stream_reset() — or wtq_stream_abort() on transports where an
      * exact single-half reset of a fully-open bidi is unsupported
      * (wtq_stream_reset returns WTQ_ERR_UNSUPPORTED there). An opted-in send
-     * commit stream instead closes without commit after this notification. */
+     * commit stream instead closes without commit after this notification.
+     * app_code is as for on_stream_reset. Not called for an abort delivered
+     * through on_stream_abort. */
     void (*on_stream_stop)(wtq_session_t *session, wtq_stream_t *stream,
                            uint32_t app_code, void *user);
     /* THE terminal event for a stream: both directions are done (or
@@ -243,11 +298,39 @@ typedef struct wtq_session_events {
      * callback and the session terminal callback wait until it returns. */
     void (*on_stream_send_committed)(wtq_session_t *session,
                                      wtq_stream_t *stream, void *user);
+
+    /* The peer aborted one direction of a stream, classified (see
+     * wtq_stream_abort_t). When this member is set and the table's
+     * struct_size covers it, it is called INSTEAD of on_stream_reset or
+     * on_stream_stop for that abort: never both, never in addition. The
+     * stream-state effects are those of the replaced event: a RESET closes
+     * the receive direction, a STOP on an opted-in send commit stream
+     * closes it without commit, and the stream otherwise stays usable.
+     * Reentrant reset, close, release and session close are legal.
+     *
+     * Never delivered after the session's terminal event, and never for the
+     * CONNECT stream: its end is the session terminal.
+     *
+     * Detecting support: initialize the table with
+     * wtq_session_events_init_ex(), then test
+     * WTQ_SESSION_EVENTS_COVERS(&events, on_stream_abort) before setting
+     * this member. A library without it stamps a smaller struct_size; do
+     * not raise it. WTQ_SESSION_EVENTS_INIT stamps this header's size and so
+     * cannot detect an older library. */
+    void (*on_stream_abort)(wtq_session_t *session, wtq_stream_t *stream,
+                            const wtq_stream_abort_t *rec, void *user);
 } wtq_session_events_t;
 
 #define WTQ_SESSION_EVENTS_INIT \
     { (uint32_t)sizeof(wtq_session_events_t), 0, 0, 0, 0, 0, \
-      0, 0, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+/* True when a table initialized by wtq_session_events_init_ex() covers
+ * `member` whole, so the library reads it. */
+#define WTQ_SESSION_EVENTS_COVERS(events, member)                         \
+    ((size_t)(events)->struct_size >=                                     \
+     offsetof(wtq_session_events_t, member) +                             \
+         sizeof(((const wtq_session_events_t *)0)->member))
 
 /* Bare symbol preserves the frozen v1 extent through on_stream_writable.
  * The sized entry initializes min(caller_size, current_size), stamps bytes
@@ -257,6 +340,43 @@ WTQ_API void wtq_session_events_init_ex(wtq_session_events_t *events,
                                        size_t caller_size);
 #define wtq_session_events_init(events) \
     wtq_session_events_init_ex((events), sizeof(wtq_session_events_t))
+
+/*
+ * What this session's transport backend guarantees to observe of a peer's
+ * stream aborts. Each bit is a guarantee for EVERY attributable WebTransport
+ * stream abort on this session, not a peer feature, a negotiated result, a
+ * stream's state or a past success:
+ *
+ *   WTQ_ABORT_OBSERVES_RESET_CODE  every peer RESET_STREAM is reported with
+ *       the peer's code (an abort record's origin is never UNKNOWN for a
+ *       reset).
+ *   WTQ_ABORT_OBSERVES_STOP_EVENT  every peer STOP_SENDING is reported.
+ *   WTQ_ABORT_OBSERVES_STOP_CODE   ... with the peer's code. Implies
+ *       WTQ_ABORT_OBSERVES_STOP_EVENT.
+ *
+ * Without a bit, that fact may be missing for some or all aborts: an abort
+ * that is reported without its code says WTQ_STREAM_ABORT_ORIGIN_UNKNOWN,
+ * never a fabricated 0. Fixed when the session is created; readable on a
+ * retained handle after the session ended; no allocation, callback, I/O or
+ * locking. NULL, and a backend that states nothing, return 0. Consumers
+ * ignore bits they do not know.
+ *
+ * Two different compatibility boundaries:
+ *   - on_stream_abort is detected at run time through the extent
+ *     wtq_session_events_init_ex() stamps, so a consumer built against this
+ *     header still works on an older library (it gets the legacy events);
+ *   - this function is a new exported symbol. A consumer that calls it
+ *     needs this library or newer at build, link and load time; there is no
+ *     weak or looked-up fallback. WTQ_HAVE_SESSION_ABORT_OBSERVABILITY marks
+ *     a header that declares it.
+ */
+#define WTQ_HAVE_SESSION_ABORT_OBSERVABILITY 1
+
+#define WTQ_ABORT_OBSERVES_RESET_CODE 1u
+#define WTQ_ABORT_OBSERVES_STOP_EVENT 2u
+#define WTQ_ABORT_OBSERVES_STOP_CODE  4u
+
+WTQ_API uint32_t wtq_session_abort_observability(const wtq_session_t *session);
 
 typedef enum wtq_send_commit_mode {
     WTQ_SEND_COMMIT_UNSUPPORTED = 0,

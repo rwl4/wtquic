@@ -24,6 +24,15 @@ int main()
     if (wtq_session_send_commit_mode(nullptr) != WTQ_SEND_COMMIT_UNSUPPORTED ||
         wtq_stream_enable_send_commit(nullptr) != WTQ_ERR_INVALID_ARG) return 1;
     wtq_session_events_init_ex(nullptr, 99);
+    {
+        wtq_session_events_t ev;
+        wtq_session_events_init_ex(&ev, sizeof(ev));
+        if (!WTQ_SESSION_EVENTS_COVERS(&ev, on_stream_abort)) return 1;
+        wtq_stream_abort_t abort_rec{};
+        if (abort_rec.struct_size != 0 ||
+            WTQ_STREAM_ABORT_V0_SIZE != sizeof(abort_rec)) return 1;
+        if (wtq_session_abort_observability(nullptr) != 0u) return 1;
+    }
     wtq_connect_request_metadata_t metadata = WTQ_CONNECT_REQUEST_METADATA_INIT;
     if (metadata.struct_size != sizeof(metadata) || metadata.reserved0 != 0 ||
         metadata.authority.data != nullptr || metadata.path.len != 0 ||

@@ -22,6 +22,7 @@ set(ALLOWED_SYMBOLS
     wtq_session_events_init
     wtq_session_events_init_ex
     wtq_session_send_commit_mode
+    wtq_session_abort_observability
     wtq_connect_config_init
     wtq_connect_config_init_ex
     wtq_serve_config_init
