@@ -1439,7 +1439,10 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
 }
 
 /* RFC 9204 s3.2.3 forbids encoder instructions when maximum capacity is zero.
- * Reject them with the encoder-stream error as this receiver's policy.
+ * Reject them with the encoder-stream error as this receiver's policy, except
+ * Set Dynamic Table Capacity 0 (0x20): it is a no-op at our limit of 0, and
+ * Chrome/quiche always sends it after SETTINGS (s4.3.1 only requires an error
+ * for a capacity above the limit).
  * Our encoder never inserts/references dynamic entries,
  * so decoder acknowledgments/increments are errors; cancellations are
  * harmless but their prefixed integer must be parsed across deliveries. */
@@ -1448,6 +1451,8 @@ static void qpack_bytes(wtq_conn_t *conn, struct wtq_estream *es,
 {
     for (size_t i = 0; i < len; i++) {
         if (es->qpack_type == 0x02) {
+            if (data[i] == 0x20)
+                continue;
             conn_fatal(conn, WTQ_QPACK_ENCODER_STREAM_ERROR);
             return;
         }

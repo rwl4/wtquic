@@ -739,7 +739,9 @@ static void test_qpack_instruction_validation(int *fp)
         uint64_t error;
     } cases[] = {
         { { 2 }, 1, 0 },           /* empty encoder stream */
-        { { 2, 0x20 }, 2, 0x201 }, /* no instructions at capacity zero */
+        { { 2, 0x20 }, 2, 0 },     /* capacity zero: no-op (Chrome sends it) */
+        { { 2, 0x20, 0x20 }, 3, 0 },
+        { { 2, 0x20, 0x21 }, 3, 0x201 },
         { { 2, 0x21 }, 2, 0x201 },  /* capacity exceeds SETTINGS */
         { { 2, 0x40 }, 2, 0x201 },  /* insert cannot fit capacity zero */
         { { 2, 0xc0 }, 2, 0x201 },
